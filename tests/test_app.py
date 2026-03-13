@@ -234,6 +234,27 @@ def test_explore_creates_task(client):
     assert "eid" in r.json()
 
 
+def test_explore_rejects_invalid_url(client):
+    r = client.post("/explore", json={"url": "ftp://example.com"})
+    assert "error" in r.json()
+    assert "无效" in r.json()["error"]
+
+
+def test_explore_rejects_localhost(client):
+    r = client.post("/explore", json={"url": "http://localhost:8080"})
+    assert "error" in r.json()
+
+
+def test_explore_rejects_empty_url(client):
+    r = client.post("/explore", json={"url": ""})
+    assert "error" in r.json()
+
+
+def test_explore_rejects_private_ip(client):
+    r = client.post("/explore", json={"url": "http://192.168.1.1"})
+    assert "error" in r.json()
+
+
 def test_explore_task_stored(client):
     from app import EXPLORE_TASKS
     with patch("app._run_explore_task"):
@@ -484,3 +505,98 @@ def test_edit_persists_to_db(client, task_with_generated):
             "field": "ai_page.hero.headline", "value": "持久化测试"
         })
     mock_save.assert_called_once()
+
+
+# ── DELETE /tasks/{id} ────────────────────────────────────────────────────────
+
+def test_delete_task_not_found(client):
+    r = client.delete("/tasks/missing")
+    assert r.status_code == 404
+
+
+def test_delete_task_removes_from_store(client, done_task):
+    from app import TASKS
+    assert done_task in TASKS
+    r = client.delete(f"/tasks/{done_task}")
+    assert r.status_code == 200
+    assert done_task not in TASKS
+
+
+def test_delete_task_returns_info(client, done_task):
+    r = client.delete(f"/tasks/{done_task}")
+    data = r.json()
+    assert data["deleted"] == done_task
+    assert "task" in data
+
+
+def test_delete_task_removes_screenshots(client, done_task):
+    shot_dir = Path(f"screenshots/{done_task}")
+    assert shot_dir.exists()
+    client.delete(f"/tasks/{done_task}")
+    assert not shot_dir.exists()
+
+
+# ── DELETE /explore/{eid} ─────────────────────────────────────────────────────
+
+def test_delete_explore_not_found(client):
+    r = client.delete("/explore/missing")
+    assert r.status_code == 404
+
+
+def test_delete_explore_removes_from_store(client, done_explore):
+    from app import EXPLORE_TASKS
+    assert done_explore in EXPLORE_TASKS
+    r = client.delete(f"/explore/{done_explore}")
+    assert r.status_code == 200
+    assert done_explore not in EXPLORE_TASKS
+
+
+def test_delete_explore_removes_screenshots(client, done_explore):
+    shot_dir = Path(f"screenshots/explore_{done_explore}")
+    assert shot_dir.exists()
+    client.delete(f"/explore/{done_explore}")
+    assert not shot_dir.exists()
+
+
+# ── POST /cleanup ─────────────────────────────────────────────────────────────
+
+def test_cleanup_empty_store(client):
+    r = client.post("/cleanup?keep_last=10")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["deleted_tasks"] == 0
+    assert data["deleted_explores"] == 0
+
+
+def test_cleanup_keeps_recent_tasks(client):
+    from app import TASKS
+    # Add 5 done tasks
+    for i in range(5):
+        tid = f"clean{i:04d}"
+        TASKS[tid] = {"id": tid, "task": f"task {i}", "status": "done",
+                       "logs": [], "screenshots": [], "created_at": f"2024-01-0{i+1}"}
+    r = client.post("/cleanup?keep_last=3")
+    assert r.json()["deleted_tasks"] == 2
+    # 3 most recent should remain
+    remaining = [t for t in TASKS.values() if t["id"].startswith("clean")]
+    assert len(remaining) == 3
+
+
+def test_cleanup_skips_running_tasks(client):
+    from app import TASKS
+    TASKS["running1"] = {"id": "running1", "task": "x", "status": "running",
+                          "logs": [], "screenshots": [], "created_at": "2024-01-01"}
+    r = client.post("/cleanup?keep_last=0")
+    # running task should NOT be deleted
+    assert "running1" in TASKS
+
+
+def test_cleanup_returns_deleted_ids(client):
+    from app import TASKS
+    for i in range(3):
+        tid = f"del{i:04d}"
+        TASKS[tid] = {"id": tid, "task": "x", "status": "done",
+                       "logs": [], "screenshots": [], "created_at": f"2024-01-0{i+1}"}
+    r = client.post("/cleanup?keep_last=0")
+    data = r.json()
+    assert len(data["ids"]) == 3

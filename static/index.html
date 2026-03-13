@@ -452,6 +452,7 @@ function refreshDetail(id) {
         <a href="/export/task/${id}/json" download class="export-btn">↓ JSON</a>
         <a href="/export/task/${id}/zip" download class="export-btn export-btn-zip">↓ ZIP</a>
         ` : ''}
+        <button onclick="deleteTask('task','${id}')" class="export-btn" style="background:#3a1a1a;color:#f87171;border-color:#7f1d1d;" title="删除任务">🗑</button>
       </div>
       <div class="tabs">
         <button class="tab-btn active" onclick="switchTab('${id}','logs',this)">日志</button>
@@ -684,6 +685,7 @@ function refreshExploreDetail(eid) {
         <a href="/export/explore/${eid}/json" download class="export-btn">↓ JSON</a>
         <a href="/export/explore/${eid}/zip" download class="export-btn export-btn-zip">↓ ZIP</a>
         ` : ''}
+        <button onclick="deleteTask('explore','${eid}')" class="export-btn" style="background:#3a1a1a;color:#f87171;border-color:#7f1d1d;" title="删除任务">🗑</button>
       </div>
       <div class="tabs">
         <button class="tab-btn active" onclick="switchExploreTab('${eid}','logs',this)">日志</button>

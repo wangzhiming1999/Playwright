@@ -19,7 +19,7 @@ htmlcov/
 .env.local
 *.log
 
-# 会话/运行时生成
+# 会话/运行时生成（如 cookies_2c77321a.json）
 cookies*.json
 
 # 截图/测试产出（可重新生成）

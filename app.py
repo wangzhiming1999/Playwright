@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 load_dotenv()
 from pathlib import Path
 
-from fastapi import BackgroundTasks, FastAPI
+from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -648,3 +648,94 @@ def export_zip(source: str, source_id: str):
         media_type="application/zip",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+# ── Delete / cleanup endpoints ────────────────────────────────────────────────
+
+import shutil
+
+
+@app.delete("/tasks/{task_id}")
+async def delete_task(task_id: str):
+    if task_id not in TASKS:
+        raise HTTPException(status_code=404, detail="task not found")
+    t = TASKS.pop(task_id)
+    # Remove from DB
+    import sqlite3
+    from db import DB_PATH
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+    # Remove screenshots dir
+    shot_dir = Path(f"screenshots/{task_id}")
+    if shot_dir.exists():
+        shutil.rmtree(shot_dir)
+    return {"deleted": task_id, "task": t.get("task", "")}
+
+
+@app.delete("/explore/{eid}")
+async def delete_explore(eid: str):
+    if eid not in EXPLORE_TASKS:
+        raise HTTPException(status_code=404, detail="explore task not found")
+    EXPLORE_TASKS.pop(eid)
+    import sqlite3
+    from db import DB_PATH
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("DELETE FROM explore_tasks WHERE id=?", (eid,))
+    shot_dir = Path(f"screenshots/explore_{eid}")
+    if shot_dir.exists():
+        shutil.rmtree(shot_dir)
+    return {"deleted": eid}
+
+
+@app.post("/cleanup")
+async def cleanup_old_tasks(keep_last: int = 20):
+    """
+    Delete oldest completed tasks beyond keep_last, freeing disk space.
+    Returns counts of deleted tasks and freed screenshot dirs.
+    """
+    done_tasks = sorted(
+        [t for t in TASKS.values() if t["status"] in ("done", "failed")],
+        key=lambda t: t.get("created_at", ""),
+    )
+    done_explores = sorted(
+        [t for t in EXPLORE_TASKS.values() if t["status"] in ("done", "failed")],
+        key=lambda t: t.get("created_at", ""),
+    )
+
+    deleted_tasks = []
+    to_delete_tasks = done_tasks if keep_last == 0 else done_tasks[:-keep_last] if len(done_tasks) > keep_last else []
+    for t in to_delete_tasks:
+        tid = t["id"]
+        TASKS.pop(tid, None)
+        shot_dir = Path(f"screenshots/{tid}")
+        if shot_dir.exists():
+            shutil.rmtree(shot_dir)
+        deleted_tasks.append(tid)
+
+    deleted_explores = []
+    to_delete_explores = done_explores if keep_last == 0 else done_explores[:-keep_last] if len(done_explores) > keep_last else []
+    for t in to_delete_explores:
+        eid = t["id"]
+        EXPLORE_TASKS.pop(eid, None)
+        shot_dir = Path(f"screenshots/explore_{eid}")
+        if shot_dir.exists():
+            shutil.rmtree(shot_dir)
+        deleted_explores.append(eid)
+
+    # Batch delete from DB
+    if deleted_tasks or deleted_explores:
+        import sqlite3
+        from db import DB_PATH
+        with sqlite3.connect(DB_PATH) as conn:
+            if deleted_tasks:
+                conn.executemany("DELETE FROM tasks WHERE id=?",
+                                 [(tid,) for tid in deleted_tasks])
+            if deleted_explores:
+                conn.executemany("DELETE FROM explore_tasks WHERE id=?",
+                                 [(eid,) for eid in deleted_explores])
+
+    return {
+        "deleted_tasks": len(deleted_tasks),
+        "deleted_explores": len(deleted_explores),
+        "ids": deleted_tasks + deleted_explores,
+    }
