@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.eggs/
+*.egg-info/
+*.egg
+
+# 测试与缓存
+.pytest_cache/
+.coverage
+htmlcov/
+*.cover
+
+# 环境与敏感信息
+.env
+.env.local
+*.log
+
+# 会话/运行时生成
+cookies*.json
+
+# 截图/测试产出（可重新生成）
+screenshots/
+
+# 编辑器/工具
+.claude/
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Node（若有前端）
+node_modules/
