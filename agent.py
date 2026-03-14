@@ -76,16 +76,17 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "type_text",
-            "description": "在输入框中输入文字。必须用 description 描述输入框（如'邮箱输入框'、'密码框'），系统会用 AI 视觉自动定位。不要猜测 selector。密码框必须设 is_password: true。",
+            "description": "在输入框中输入文字。优先用截图中的元素编号（index）直接定位，比 description 更准确。密码框必须设 is_password: true。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "description": {"type": "string", "description": "输入框的描述，如'邮箱输入框'、'密码框'、'搜索框'"},
+                    "index": {"type": "integer", "description": "截图中输入框的编号（红色数字标签），优先使用，比 description 更准确"},
+                    "description": {"type": "string", "description": "输入框的描述，如'邮箱输入框'、'密码框'、'搜索框'，当不确定 index 时使用"},
                     "text": {"type": "string", "description": "要输入的内容"},
                     "press_enter": {"type": "boolean", "description": "输入后是否按 Enter"},
                     "is_password": {"type": "boolean", "description": "是否为密码，设为 true 时日志中不显示内容"},
                 },
-                "required": ["description", "text"],
+                "required": ["text"],
             },
         },
     },
@@ -464,11 +465,7 @@ class BrowserAgent:
                 return json.dumps({"email": email, "password": password}, ensure_ascii=False)
 
             elif tool_name == "type_text":
-                description = args.get("description", "")
-                if not description:
-                    return "需要提供 description 描述输入框"
-
-                # 用 JS 获取页面所有可见 input 的真实 DOM 坐标，100% 准确
+                # 用 JS 获取页面所有可见 input/textarea 的真实 DOM 坐标
                 inputs_info = await page.evaluate("""() => {
                     const inputs = Array.from(document.querySelectorAll('input, textarea'));
                     return inputs
@@ -495,7 +492,65 @@ class BrowserAgent:
 
                 await self._log(f"  [DOM] 找到 {len(inputs_info)} 个输入框: {inputs_info}")
 
-                # GPT 根据描述选择正确的 input（给真实坐标，不靠猜）
+                # 优先用 index 直接定位（annotate_page 的元素编号对应所有可交互元素，
+                # 需要从中筛出 input/textarea 对应的那个）
+                annotation_index = args.get("index")
+                if annotation_index is not None:
+                    # annotate_page 的元素列表包含所有可交互元素，
+                    # 用坐标匹配找到对应的 input
+                    try:
+                        elements_info = await page.evaluate("""() => {
+                            const selectors = [
+                                'input:not([type="hidden"])', 'textarea', 'button',
+                                'a[href]', 'select', '[role="button"]', '[onclick]',
+                            ];
+                            const seen = new Set();
+                            const all = [];
+                            selectors.forEach(sel => {
+                                document.querySelectorAll(sel).forEach(el => {
+                                    if (!seen.has(el)) { seen.add(el); all.push(el); }
+                                });
+                            });
+                            return all
+                                .filter(el => {
+                                    const r = el.getBoundingClientRect();
+                                    return r.width > 0 && r.height > 0 &&
+                                           r.top >= 0 && r.top < window.innerHeight;
+                                })
+                                .map(el => {
+                                    const r = el.getBoundingClientRect();
+                                    return {
+                                        tag: el.tagName.toLowerCase(),
+                                        x: Math.round(r.left + r.width / 2),
+                                        y: Math.round(r.top + r.height / 2),
+                                    };
+                                });
+                        }""")
+                        if annotation_index < len(elements_info):
+                            el = elements_info[annotation_index]
+                            x, y = el["x"], el["y"]
+                            await self._log(f"  [index定位] #{annotation_index} → ({x}, {y}) tag={el['tag']}")
+                            await page.mouse.click(x, y)
+                            await asyncio.sleep(0.5)
+                            await page.keyboard.press("Control+a")
+                            await page.keyboard.press("Delete")
+                            await asyncio.sleep(0.2)
+                            await page.keyboard.type(args["text"], delay=50)
+                            await asyncio.sleep(0.5)
+                            if args.get("press_enter"):
+                                await page.keyboard.press("Enter")
+                                await asyncio.sleep(1.0)
+                            if args.get("is_password"):
+                                return "已输入密码"
+                            return f"已输入: {args['text']}"
+                    except Exception as e:
+                        await self._log(f"  index定位失败: {e}，fallback 到 description")
+
+                # fallback：用 description + GPT 二次匹配
+                description = args.get("description", "")
+                if not description:
+                    return "需要提供 index 或 description 来定位输入框"
+
                 client = _get_client()
                 resp = client.chat.completions.create(
                     model="gpt-4o",
@@ -523,15 +578,15 @@ class BrowserAgent:
 
                 try:
                     await page.mouse.click(x, y)
-                    await asyncio.sleep(0.5)  # 等待聚焦
+                    await asyncio.sleep(0.5)
                     await page.keyboard.press("Control+a")
                     await page.keyboard.press("Delete")
                     await asyncio.sleep(0.2)
                     await page.keyboard.type(args["text"], delay=50)
-                    await asyncio.sleep(0.5)  # 等待输入完成
+                    await asyncio.sleep(0.5)
                     if args.get("press_enter"):
                         await page.keyboard.press("Enter")
-                        await asyncio.sleep(1.0)  # 等待提交响应
+                        await asyncio.sleep(1.0)
                     if args.get("is_password"):
                         return "已输入密码"
                     return f"已输入: {args['text']}"
@@ -663,11 +718,15 @@ async def run_agent(
                     "核心原则：优先用视觉理解页面，每步操作前仔细看截图确认当前状态。\n"
                     "规则：\n"
                     "1. 每次只调用一个工具\n"
-                    "2. type_text 必须用 description 描述输入框，不要用 selector\n"
-                    "3. click 优先用 text 参数描述按钮文字\n"
+                    "2. type_text 优先用截图中的 index 编号定位输入框，比 description 更准确可靠\n"
+                    "3. click 优先用截图中的 index 编号，其次用 text 参数\n"
                     "4. 任务完成后先截图，再调用 done\n"
                     "5. 如果连续3次操作失败，调用 done 并说明原因\n"
                     "6. 遇到 401、403、需要登录等情况，不要放弃，继续执行登录流程\n"
+                    "输入框操作（重要）：\n"
+                    "  - 截图中红色数字标签就是元素编号，直接用 index 参数传入\n"
+                    "  - 例如看到搜索框标注为 [1]，就用 type_text(index=1, text='...')\n"
+                    "  - 只有在看不清编号时才用 description 描述\n"
                     "登录流程（重要）：\n"
                     "  - 每次操作后观察截图，判断当前在哪一步\n"
                     "  - 有些网站是两步登录：先输邮箱点继续，再输密码点登录\n"
