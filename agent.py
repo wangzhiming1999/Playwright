@@ -381,6 +381,11 @@ class BrowserAgent:
         try:
             if tool_name == "navigate":
                 await page.goto(args["url"], wait_until="domcontentloaded", timeout=30000)
+                # 等待网络空闲，确保动态内容加载完
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=8000)
+                except Exception:
+                    pass
                 return f"已打开 {args['url']}"
 
             elif tool_name == "click":
@@ -423,6 +428,11 @@ class BrowserAgent:
                             await asyncio.sleep(1)
                             try:
                                 await page.wait_for_load_state("domcontentloaded", timeout=5000)
+                            except Exception:
+                                pass
+                            # 额外等待网络空闲，确保动态内容加载完
+                            try:
+                                await page.wait_for_load_state("networkidle", timeout=6000)
                             except Exception:
                                 pass
                             return "点击成功"
@@ -564,6 +574,15 @@ class BrowserAgent:
                 return f"已按下 {args['key']}"
 
             elif tool_name == "done":
+                # 任务结束前等待页面加载完成，再截一张最终截图
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=8000)
+                except Exception:
+                    pass
+                await asyncio.sleep(1.5)
+                final_path = self.screenshots_dir / "final_result.png"
+                await page.screenshot(path=str(final_path), full_page=True)
+                await self._log(f"  ✓ 最终截图: {final_path.name}")
                 return "__DONE__"
 
         except Exception as e:
