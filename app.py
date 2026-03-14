@@ -8,6 +8,8 @@ import concurrent.futures
 import io
 import json
 import sys
+import threading
+import time
 import uuid
 import zipfile
 from dotenv import load_dotenv
@@ -41,23 +43,44 @@ _agent_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_na
 # ── In-memory store (backed by SQLite) ────────────────────────────────────────
 
 TASKS: dict[str, dict] = load_all_tasks()
-# { id, task, status: pending|running|done|failed, logs: [], screenshots: [] }
+# { id, task, status: pending|running|done|failed|waiting_input, logs: [], screenshots: [] }
 
 EXPLORE_TASKS: dict[str, dict] = load_all_explore_tasks()
 
 # Per-client SSE queues for broadcast
 _SSE_CLIENTS: list[asyncio.Queue] = []
+_SSE_LOCK = asyncio.Lock()  # 保护 _SSE_CLIENTS 并发修改
+
+# 每个任务的"等待用户输入"状态
+_PENDING_QUESTIONS: dict[str, dict] = {}
+_PENDING_LOCK = threading.Lock()  # 保护 _PENDING_QUESTIONS 跨线程访问
 
 
 async def _broadcast(event: dict):
     data = json.dumps(event, ensure_ascii=False)
-    for q in _SSE_CLIENTS:
-        await q.put(data)
+    async with _SSE_LOCK:
+        clients = list(_SSE_CLIENTS)
+    for q in clients:
+        try:
+            await q.put(data)
+        except Exception:
+            pass
 
 
 async def _log_callback(task_id: str, message: str):
+    if task_id not in TASKS:
+        return
     TASKS[task_id]["logs"].append(message)
     await _broadcast({"type": "log", "task_id": task_id, "data": message})
+
+
+async def _screenshot_callback(task_id: str, filename: str):
+    """实时推送新截图给前端"""
+    if task_id not in TASKS:
+        return
+    if filename not in TASKS[task_id]["screenshots"]:
+        TASKS[task_id]["screenshots"].append(filename)
+    await _broadcast({"type": "new_screenshot", "task_id": task_id, "filename": filename})
 
 
 def _run_agent_in_thread(
@@ -66,8 +89,7 @@ def _run_agent_in_thread(
     main_loop: asyncio.AbstractEventLoop,
 ) -> tuple[bool, list[str] | str]:
     """
-    在独立线程中运行 run_agent，使用本线程的 ProactorEventLoop，避免 Windows 子进程 NotImplementedError。
-    返回 (成功?, 成功时为截图列表，失败时为错误信息字符串)。
+    在独立线程中运行 run_agent，使用本线程的 ProactorEventLoop。
     """
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
@@ -79,7 +101,40 @@ def _run_agent_in_thread(
         fut = asyncio.run_coroutine_threadsafe(_log_callback(tid, msg), main_loop)
         fut.result(timeout=30)
 
+    async def thread_safe_screenshot(tid: str, filename: str):
+        fut = asyncio.run_coroutine_threadsafe(_screenshot_callback(tid, filename), main_loop)
+        fut.result(timeout=10)
+
+    async def ask_user_callback(tid: str, question: str, reason: str) -> str:
+        ev = threading.Event()
+        with _PENDING_LOCK:
+            _PENDING_QUESTIONS[tid] = {"question": question, "reason": reason, "event": ev, "answer": None}
+
+        asyncio.run_coroutine_threadsafe(
+            _broadcast({"type": "waiting_input", "task_id": tid, "question": question, "reason": reason}),
+            main_loop,
+        ).result(timeout=5)
+        asyncio.run_coroutine_threadsafe(
+            _update_task_status(tid, "waiting_input"),
+            main_loop,
+        ).result(timeout=5)
+
+        answered = ev.wait(timeout=300)
+        with _PENDING_LOCK:
+            entry = _PENDING_QUESTIONS.pop(tid, {})
+
+        if not answered or not entry.get("answer"):
+            raise TimeoutError("用户未在5分钟内回答")
+
+        asyncio.run_coroutine_threadsafe(
+            _update_task_status(tid, "running"),
+            main_loop,
+        ).result(timeout=5)
+
+        return entry["answer"]
+
     try:
+        t = TASKS.get(task_id, {})
         loop.run_until_complete(
             run_agent(
                 task=task,
@@ -88,15 +143,34 @@ def _run_agent_in_thread(
                 log_callback=thread_safe_log,
                 cookies_path=f"cookies_{task_id}.json",
                 screenshots_dir=f"screenshots/{task_id}",
+                ask_user_callback=ask_user_callback,
+                screenshot_callback=thread_safe_screenshot,
+                browser_mode=t.get("browser_mode", "builtin"),
+                cdp_url=t.get("cdp_url", "http://localhost:9222"),
+                chrome_profile=t.get("chrome_profile", "Default"),
             )
         )
         shot_dir = Path(f"screenshots/{task_id}")
-        screenshots = [f.name for f in sorted(shot_dir.glob("*.png"))] if shot_dir.exists() else []
+        screenshots = []
+        if shot_dir.exists():
+            # 收集所有 .png 和 .jpg 截图，按修改时间排序
+            screenshots = sorted(
+                [f.name for f in shot_dir.glob("*.png")] + [f.name for f in shot_dir.glob("*.jpg")],
+                key=lambda n: (shot_dir / n).stat().st_mtime
+            )
         return (True, screenshots)
     except Exception as e:
         return (False, str(e))
     finally:
         loop.close()
+
+
+async def _update_task_status(task_id: str, status: str):
+    if task_id not in TASKS:
+        return
+    TASKS[task_id]["status"] = status
+    save_task(TASKS[task_id])
+    await _broadcast({"type": "status", "task_id": task_id, "data": status})
 
 
 async def _run_task(task_id: str, task: str):
@@ -134,6 +208,9 @@ async def _run_task(task_id: str, task: str):
 
 class RunRequest(BaseModel):
     tasks: list[str]
+    browser_mode: str = "builtin"   # "builtin" | "user_chrome" | "cdp"
+    cdp_url: str = "http://localhost:9222"
+    chrome_profile: str = "Default"
 
 
 @app.get("/")
@@ -149,7 +226,14 @@ async def submit_tasks(req: RunRequest, background_tasks: BackgroundTasks):
         if not task_text.strip():
             continue
         tid = uuid.uuid4().hex[:8]
-        TASKS[tid] = {"id": tid, "task": task_text, "status": "pending", "logs": [], "screenshots": []}
+        TASKS[tid] = {
+            "id": tid, "task": task_text, "status": "pending",
+            "logs": [], "screenshots": [],
+            "browser_mode": req.browser_mode,
+            "cdp_url": req.cdp_url,
+            "chrome_profile": req.chrome_profile,
+            "created_at": time.time(),
+        }
         save_task(TASKS[tid])
         ids.append(tid)
         task_texts.append(task_text)
@@ -208,6 +292,21 @@ def get_logs(task_id: str):
     if task_id not in TASKS:
         return {"error": "not found"}
     return {"logs": TASKS[task_id]["logs"]}
+
+
+@app.post("/tasks/{task_id}/reply")
+async def reply_to_task(task_id: str, answer: str = ""):
+    """
+    用户回答 agent 的提问，唤醒等待中的 agent 线程。
+    """
+    if task_id not in _PENDING_QUESTIONS:
+        return {"error": "no pending question for this task"}
+
+    entry = _PENDING_QUESTIONS[task_id]
+    entry["answer"] = answer
+    entry["event"].set()  # 唤醒 agent 线程
+
+    return {"ok": True, "answer": answer}
 
 
 # ── Curation endpoint ─────────────────────────────────────────────────────────
@@ -355,6 +454,7 @@ async def start_explore(req: ExploreRequest, background_tasks: BackgroundTasks):
     EXPLORE_TASKS[eid] = {
         "id": eid, "url": req.url, "product_context": req.product_context,
         "status": "pending", "logs": [], "screenshots": [], "result": None,
+        "created_at": time.time(),
     }
     save_explore_task(EXPLORE_TASKS[eid])
     background_tasks.add_task(
