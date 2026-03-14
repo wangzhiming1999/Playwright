@@ -1,14 +1,33 @@
 """
-Shared utilities: OpenAI retry wrapper, URL validation.
+Shared utilities: OpenAI retry wrapper, URL validation, shared OpenAI client factory.
 """
 
 import asyncio
 import functools
 import logging
+import os
 import time
 from typing import Callable, TypeVar
 
 logger = logging.getLogger(__name__)
+
+
+# ── Shared OpenAI client factory ──────────────────────────────────────────────
+
+def get_openai_client():
+    """
+    Create an OpenAI client with optional proxy support and a 60s timeout.
+    Reads OPENAI_API_KEY and USE_PROXY from environment.
+    """
+    import httpx
+    from openai import OpenAI
+
+    proxy = os.getenv("USE_PROXY") and "http://127.0.0.1:7897"
+    http_client = httpx.Client(proxy=proxy, timeout=60.0) if proxy else httpx.Client(timeout=60.0)
+    return OpenAI(
+        api_key=os.getenv("OPENAI_API_KEY"),
+        http_client=http_client,
+    )
 
 T = TypeVar("T")
 

@@ -12,15 +12,7 @@ from pathlib import Path
 
 from openai import OpenAI
 
-from utils import llm_call
-
-
-def _get_client():
-    proxy = os.getenv("USE_PROXY") and "http://127.0.0.1:7897"
-    return OpenAI(
-        api_key=os.getenv("OPENAI_API_KEY"),
-        http_client=__import__("httpx").Client(proxy=proxy) if proxy else None,
-    )
+from utils import llm_call, get_openai_client
 
 
 # ── DOM summarizer ────────────────────────────────────────────────────────────
@@ -90,7 +82,7 @@ def analyze_site(
     Analyze a website's homepage to build a site understanding graph.
     Returns structured dict with nav, candidate pages, and exploration strategy.
     """
-    client = _get_client()
+    client = get_openai_client()
 
     nav_summary = extract_nav_summary(html)
     page_text = extract_page_text(html)
@@ -155,7 +147,7 @@ Respond ONLY with valid JSON, no markdown fences."""
 
 def score_page(url: str, html: str, screenshot_b64: str, product_context: str = "") -> dict:
     """Score a visited page for marketing value during exploration."""
-    client = _get_client()
+    client = get_openai_client()
 
     page_text = extract_page_text(html, max_chars=1500)
     prompt = f"URL: {url}\n"

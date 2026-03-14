@@ -23,6 +23,7 @@ if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
 from dotenv import load_dotenv
 from openai import OpenAI
 from playwright.async_api import async_playwright, Page
+from utils import get_openai_client
 
 load_dotenv()
 
@@ -30,11 +31,7 @@ load_dotenv()
 # ── AI-native page helpers (Skyvern-style interface) ──────────────────────────
 
 def _get_client():
-    proxy = os.getenv("USE_PROXY") and "http://127.0.0.1:7897"
-    return OpenAI(
-        api_key=os.getenv("OPENAI_API_KEY"),
-        http_client=__import__("httpx").Client(proxy=proxy) if proxy else None,
-    )
+    return get_openai_client()
 
 
 async def _screenshot_b64(page: Page) -> str:

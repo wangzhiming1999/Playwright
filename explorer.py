@@ -27,6 +27,7 @@ from playwright.async_api import async_playwright, Page, BrowserContext
 load_dotenv()
 
 from site_understanding import analyze_site
+from utils import get_openai_client
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -99,13 +100,7 @@ async def _close_popups(page: Page):
         try:
             data = await page.screenshot(type="jpeg", quality=50)
             img_b64 = base64.b64encode(data).decode()
-            from openai import OpenAI
-            import os as _os
-            proxy = _os.getenv("USE_PROXY") and "http://127.0.0.1:7897"
-            client = OpenAI(
-                api_key=_os.getenv("OPENAI_API_KEY"),
-                http_client=__import__("httpx").Client(proxy=proxy) if proxy else None,
-            )
+            client = get_openai_client()
             resp = client.chat.completions.create(
                 model="gpt-4o",
                 messages=[{
@@ -123,10 +118,10 @@ async def _close_popups(page: Page):
                 try:
                     await page.click(result["selector"], timeout=3000)
                     await asyncio.sleep(0.5)
-                except Exception:
-                    pass
-        except Exception:
-            pass
+                except Exception as e:
+                    _safe_print(f"popup click error: {e}")
+        except Exception as e:
+            _safe_print(f"popup close fallback error: {e}")
 
 
 # ── Main exploration runner ───────────────────────────────────────────────────

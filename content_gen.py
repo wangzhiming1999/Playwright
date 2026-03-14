@@ -10,17 +10,7 @@ import json
 import os
 import re
 
-from openai import OpenAI
-
-from utils import llm_call
-
-
-def _get_client():
-    proxy = os.getenv("USE_PROXY") and "http://127.0.0.1:7897"
-    return OpenAI(
-        api_key=os.getenv("OPENAI_API_KEY"),
-        http_client=__import__("httpx").Client(proxy=proxy) if proxy else None,
-    )
+from utils import llm_call, get_openai_client
 
 
 # ── AI Page generation ────────────────────────────────────────────────────────
@@ -71,7 +61,7 @@ def generate_ai_page(
     language: str = "zh-CN",
     tone: str = "professional",
 ) -> dict:
-    client = _get_client()
+    client = get_openai_client()
     cards_summary = _build_cards_summary(cards)
     prompt = _PAGE_PROMPT.format(language=language, tone=tone)
     user_content = f"Product: {product_context}\n\nFeature cards:\n{cards_summary}\n\n{prompt}"
@@ -97,7 +87,7 @@ def generate_tweets(
     product_context: str = "",
     language: str = "zh-CN",
 ) -> dict:
-    client = _get_client()
+    client = get_openai_client()
     cards_summary = _build_cards_summary(cards)
     prompt = _TWEET_PROMPT.format(language=language)
     user_content = f"Product: {product_context}\n\nFeature cards:\n{cards_summary}\n\n{prompt}"
@@ -137,7 +127,7 @@ Respond ONLY with valid JSON, no markdown fences."""
 
 
 def review_copy(cards: list[dict], copy: dict) -> dict:
-    client = _get_client()
+    client = get_openai_client()
     cards_summary = _build_cards_summary(cards)
     copy_str = json.dumps(copy, ensure_ascii=False, indent=2)
     prompt = _REVIEW_PROMPT.format(cards_summary=cards_summary, copy=copy_str)

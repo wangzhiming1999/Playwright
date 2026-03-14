@@ -7,6 +7,9 @@ import asyncio
 import concurrent.futures
 import io
 import json
+import os
+import shutil
+import sqlite3
 import sys
 import threading
 import time
@@ -16,7 +19,8 @@ from dotenv import load_dotenv
 load_dotenv()
 from pathlib import Path
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -25,10 +29,33 @@ from agent import run_agent
 from curator import curate
 from explorer import run_exploration
 from content_gen import generate_all
-from db import init_db, save_task, load_all_tasks, save_explore_task, load_all_explore_tasks
+from db import init_db, save_task, load_all_tasks, save_explore_task, load_all_explore_tasks, DB_PATH
 from utils import validate_url
 
+# ── Configuration constants ───────────────────────────────────────────────────
+
+_AGENT_THREAD_WORKERS = 4
+_CALLBACK_TIMEOUT = 30      # seconds for cross-thread future.result()
+_BROADCAST_TIMEOUT = 5
+_USER_REPLY_TIMEOUT = 300   # 5 minutes
+
+API_KEY = os.getenv("API_KEY")  # Optional API key for authentication
+
 app = FastAPI()
+
+# CORS configuration
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:8000", "http://127.0.0.1:8000"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+async def _verify_api_key(x_api_key: str | None = Header(default=None)):
+    """Optional API key check. If API_KEY env var is not set, auth is skipped."""
+    if API_KEY and x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 Path("screenshots").mkdir(exist_ok=True)
 Path("static").mkdir(exist_ok=True)
@@ -38,7 +65,7 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 app.mount("/screenshots", StaticFiles(directory="screenshots"), name="screenshots")
 
 # 专用线程池：在独立线程里用 ProactorEventLoop 跑 Playwright，避免 Windows 上主循环的 NotImplementedError
-_agent_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="playwright_agent")
+_agent_executor = concurrent.futures.ThreadPoolExecutor(max_workers=_AGENT_THREAD_WORKERS, thread_name_prefix="playwright_agent")
 
 # ── In-memory store (backed by SQLite) ────────────────────────────────────────
 
@@ -98,12 +125,18 @@ def _run_agent_in_thread(
     asyncio.set_event_loop(loop)
 
     async def thread_safe_log(tid: str, msg: str):
-        fut = asyncio.run_coroutine_threadsafe(_log_callback(tid, msg), main_loop)
-        fut.result(timeout=30)
+        try:
+            fut = asyncio.run_coroutine_threadsafe(_log_callback(tid, msg), main_loop)
+            fut.result(timeout=_CALLBACK_TIMEOUT)
+        except Exception as e:
+            print(f"[warn] log callback error: {e}", file=sys.stderr)
 
     async def thread_safe_screenshot(tid: str, filename: str):
-        fut = asyncio.run_coroutine_threadsafe(_screenshot_callback(tid, filename), main_loop)
-        fut.result(timeout=10)
+        try:
+            fut = asyncio.run_coroutine_threadsafe(_screenshot_callback(tid, filename), main_loop)
+            fut.result(timeout=_CALLBACK_TIMEOUT)
+        except Exception as e:
+            print(f"[warn] screenshot callback error: {e}", file=sys.stderr)
 
     async def ask_user_callback(tid: str, question: str, reason: str) -> str:
         ev = threading.Event()
@@ -113,13 +146,13 @@ def _run_agent_in_thread(
         asyncio.run_coroutine_threadsafe(
             _broadcast({"type": "waiting_input", "task_id": tid, "question": question, "reason": reason}),
             main_loop,
-        ).result(timeout=5)
+        ).result(timeout=_BROADCAST_TIMEOUT)
         asyncio.run_coroutine_threadsafe(
             _update_task_status(tid, "waiting_input"),
             main_loop,
-        ).result(timeout=5)
+        ).result(timeout=_BROADCAST_TIMEOUT)
 
-        answered = ev.wait(timeout=300)
+        answered = ev.wait(timeout=_USER_REPLY_TIMEOUT)
         with _PENDING_LOCK:
             entry = _PENDING_QUESTIONS.pop(tid, {})
 
@@ -129,7 +162,7 @@ def _run_agent_in_thread(
         asyncio.run_coroutine_threadsafe(
             _update_task_status(tid, "running"),
             main_loop,
-        ).result(timeout=5)
+        ).result(timeout=_BROADCAST_TIMEOUT)
 
         return entry["answer"]
 
@@ -219,7 +252,7 @@ def index():
 
 
 @app.post("/run")
-async def submit_tasks(req: RunRequest, background_tasks: BackgroundTasks):
+async def submit_tasks(req: RunRequest, background_tasks: BackgroundTasks, _: None = Depends(_verify_api_key)):
     ids = []
     task_texts = []
     for task_text in req.tasks:
@@ -259,7 +292,8 @@ def list_tasks():
 @app.get("/tasks/stream")
 async def sse_stream():
     queue: asyncio.Queue = asyncio.Queue()
-    _SSE_CLIENTS.append(queue)
+    async with _SSE_LOCK:
+        _SSE_CLIENTS.append(queue)
 
     async def event_generator():
         try:
@@ -278,7 +312,11 @@ async def sse_stream():
                 data = await queue.get()
                 yield f"data: {data}\n\n"
         finally:
-            _SSE_CLIENTS.remove(queue)
+            async with _SSE_LOCK:
+                try:
+                    _SSE_CLIENTS.remove(queue)
+                except ValueError:
+                    pass
 
     return StreamingResponse(
         event_generator(),
@@ -290,7 +328,7 @@ async def sse_stream():
 @app.get("/tasks/{task_id}/logs")
 def get_logs(task_id: str):
     if task_id not in TASKS:
-        return {"error": "not found"}
+        raise HTTPException(status_code=404, detail="task not found")
     return {"logs": TASKS[task_id]["logs"]}
 
 
@@ -299,10 +337,11 @@ async def reply_to_task(task_id: str, answer: str = ""):
     """
     用户回答 agent 的提问，唤醒等待中的 agent 线程。
     """
-    if task_id not in _PENDING_QUESTIONS:
-        return {"error": "no pending question for this task"}
+    with _PENDING_LOCK:
+        entry = _PENDING_QUESTIONS.get(task_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="no pending question for this task")
 
-    entry = _PENDING_QUESTIONS[task_id]
     entry["answer"] = answer
     entry["event"].set()  # 唤醒 agent 线程
 
@@ -319,17 +358,17 @@ class CurateRequest(BaseModel):
 
 
 @app.post("/curate")
-async def curate_task(req: CurateRequest):
+async def curate_task(req: CurateRequest, _: None = Depends(_verify_api_key)):
     if req.task_id not in TASKS:
-        return {"error": "task not found"}
+        raise HTTPException(status_code=404, detail="task not found")
 
     task = TASKS[req.task_id]
     if task["status"] != "done":
-        return {"error": f"task status is '{task['status']}', must be 'done'"}
+        raise HTTPException(status_code=400, detail=f"task status is '{task['status']}', must be 'done'")
 
     shot_dir = Path(f"screenshots/{req.task_id}")
     if not shot_dir.exists():
-        return {"error": "screenshots directory not found"}
+        raise HTTPException(status_code=400, detail="screenshots directory not found")
 
     # Run curation in thread pool to avoid blocking the event loop
     loop = asyncio.get_running_loop()
@@ -392,7 +431,7 @@ def _run_exploration_in_thread(
             _broadcast({"type": "explore_log", "eid": eid, "data": msg}),
             main_loop,
         )
-        fut.result(timeout=30)
+        fut.result(timeout=_CALLBACK_TIMEOUT)
 
     try:
         result = loop.run_until_complete(
@@ -445,10 +484,10 @@ async def _run_explore_task(eid: str, url: str, product_context: str, max_pages:
 
 
 @app.post("/explore")
-async def start_explore(req: ExploreRequest, background_tasks: BackgroundTasks):
+async def start_explore(req: ExploreRequest, background_tasks: BackgroundTasks, _: None = Depends(_verify_api_key)):
     valid, err = validate_url(req.url)
     if not valid:
-        return {"error": f"无效 URL: {err}"}
+        raise HTTPException(status_code=400, detail=f"无效 URL: {err}")
 
     eid = uuid.uuid4().hex[:8]
     EXPLORE_TASKS[eid] = {
@@ -467,21 +506,21 @@ async def start_explore(req: ExploreRequest, background_tasks: BackgroundTasks):
 @app.get("/explore/{eid}")
 def get_explore(eid: str):
     if eid not in EXPLORE_TASKS:
-        return {"error": "not found"}
+        raise HTTPException(status_code=404, detail="explore task not found")
     return EXPLORE_TASKS[eid]
 
 
 @app.post("/explore/{eid}/curate")
-async def curate_explore(eid: str, req: CurateRequest):
+async def curate_explore(eid: str, req: CurateRequest, _: None = Depends(_verify_api_key)):
     if eid not in EXPLORE_TASKS:
-        return {"error": "not found"}
+        raise HTTPException(status_code=404, detail="explore task not found")
     et = EXPLORE_TASKS[eid]
     if et["status"] != "done":
-        return {"error": f"explore status is '{et['status']}', must be 'done'"}
+        raise HTTPException(status_code=400, detail=f"explore status is '{et['status']}', must be 'done'")
 
     shot_dir = Path(f"screenshots/explore_{eid}")
     if not shot_dir.exists():
-        return {"error": "screenshots directory not found"}
+        raise HTTPException(status_code=400, detail="screenshots directory not found")
 
     loop = asyncio.get_running_loop()
     result = await loop.run_in_executor(
@@ -510,22 +549,22 @@ class GenerateRequest(BaseModel):
 
 
 @app.post("/generate")
-async def generate_content(req: GenerateRequest):
+async def generate_content(req: GenerateRequest, _: None = Depends(_verify_api_key)):
     # Resolve curation cards from the right store
     if req.source == "task":
         store = TASKS
     elif req.source == "explore":
         store = EXPLORE_TASKS
     else:
-        return {"error": "source must be 'task' or 'explore'"}
+        raise HTTPException(status_code=400, detail="source must be 'task' or 'explore'")
 
     if req.source_id not in store:
-        return {"error": "source not found"}
+        raise HTTPException(status_code=404, detail="source not found")
 
     item = store[req.source_id]
     curation = item.get("curation")
     if not curation or not curation.get("cards"):
-        return {"error": "no curated cards found — run curation first"}
+        raise HTTPException(status_code=400, detail="no curated cards found — run curation first")
 
     cards = curation["cards"]
     product_context = item.get("product_context") or item.get("task", "")
@@ -553,14 +592,14 @@ async def generate_content(req: GenerateRequest):
 @app.get("/tasks/{task_id}/generated")
 def get_generated_task(task_id: str):
     if task_id not in TASKS:
-        return {"error": "not found"}
+        raise HTTPException(status_code=404, detail="task not found")
     return TASKS[task_id].get("generated") or {"error": "not generated yet"}
 
 
 @app.get("/explore/{eid}/generated")
 def get_generated_explore(eid: str):
     if eid not in EXPLORE_TASKS:
-        return {"error": "not found"}
+        raise HTTPException(status_code=404, detail="explore task not found")
     return EXPLORE_TASKS[eid].get("generated") or {"error": "not generated yet"}
 
 
@@ -597,15 +636,15 @@ def _set_nested(obj, path: str, value: str):
 
 
 @app.patch("/generate/edit")
-async def edit_generated(req: EditGeneratedRequest):
+async def edit_generated(req: EditGeneratedRequest, _: None = Depends(_verify_api_key)):
     store = TASKS if req.source == "task" else EXPLORE_TASKS
     if req.source_id not in store:
-        return {"error": "not found"}
+        raise HTTPException(status_code=404, detail="source not found")
 
     item = store[req.source_id]
     generated = item.get("generated")
     if not generated:
-        return {"error": "no generated content to edit"}
+        raise HTTPException(status_code=400, detail="no generated content to edit")
 
     _set_nested(generated, req.field, req.value)
     item["generated"] = generated
@@ -752,17 +791,13 @@ def export_zip(source: str, source_id: str):
 
 # ── Delete / cleanup endpoints ────────────────────────────────────────────────
 
-import shutil
-
 
 @app.delete("/tasks/{task_id}")
-async def delete_task(task_id: str):
+async def delete_task(task_id: str, _: None = Depends(_verify_api_key)):
     if task_id not in TASKS:
         raise HTTPException(status_code=404, detail="task not found")
     t = TASKS.pop(task_id)
     # Remove from DB
-    import sqlite3
-    from db import DB_PATH
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("DELETE FROM tasks WHERE id=?", (task_id,))
     # Remove screenshots dir
@@ -773,12 +808,10 @@ async def delete_task(task_id: str):
 
 
 @app.delete("/explore/{eid}")
-async def delete_explore(eid: str):
+async def delete_explore(eid: str, _: None = Depends(_verify_api_key)):
     if eid not in EXPLORE_TASKS:
         raise HTTPException(status_code=404, detail="explore task not found")
     EXPLORE_TASKS.pop(eid)
-    import sqlite3
-    from db import DB_PATH
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("DELETE FROM explore_tasks WHERE id=?", (eid,))
     shot_dir = Path(f"screenshots/explore_{eid}")
@@ -788,7 +821,7 @@ async def delete_explore(eid: str):
 
 
 @app.post("/cleanup")
-async def cleanup_old_tasks(keep_last: int = 20):
+async def cleanup_old_tasks(keep_last: int = 20, _: None = Depends(_verify_api_key)):
     """
     Delete oldest completed tasks beyond keep_last, freeing disk space.
     Returns counts of deleted tasks and freed screenshot dirs.
@@ -824,8 +857,6 @@ async def cleanup_old_tasks(keep_last: int = 20):
 
     # Batch delete from DB
     if deleted_tasks or deleted_explores:
-        import sqlite3
-        from db import DB_PATH
         with sqlite3.connect(DB_PATH) as conn:
             if deleted_tasks:
                 conn.executemany("DELETE FROM tasks WHERE id=?",

@@ -14,17 +14,8 @@ from pathlib import Path
 
 import imagehash
 from PIL import Image, ImageFilter
-from openai import OpenAI
 
-from utils import llm_call
-
-
-def _get_client():
-    proxy = os.getenv("USE_PROXY") and "http://127.0.0.1:7897"
-    return OpenAI(
-        api_key=os.getenv("OPENAI_API_KEY"),
-        http_client=__import__("httpx").Client(proxy=proxy) if proxy else None,
-    )
+from utils import llm_call, get_openai_client
 
 
 # ── Sensitive info patterns ───────────────────────────────────────────────────
@@ -120,7 +111,7 @@ Respond ONLY with valid JSON, no markdown fences."""
 
 def score_screenshot(image_path: Path, product_context: str = "") -> dict:
     """Call VLM to score and generate asset card for a single screenshot."""
-    client = _get_client()
+    client = get_openai_client()
 
     with open(image_path, "rb") as f:
         b64 = base64.b64encode(f.read()).decode()

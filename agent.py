@@ -33,15 +33,12 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from playwright.async_api import async_playwright, Page
 from page_annotator import annotate_page, get_element_coords
+from utils import get_openai_client
 
 load_dotenv()
 
 def _get_client():
-    proxy = os.getenv("USE_PROXY") and "http://127.0.0.1:7897"
-    return OpenAI(
-        api_key=os.getenv("OPENAI_API_KEY"),
-        http_client=__import__("httpx").Client(proxy=proxy) if proxy else None,
-    )
+    return get_openai_client()
 
 # ── 工具定义（GPT 可调用的操作） ──────────────────────────────────────────────
 
@@ -552,8 +549,13 @@ class BrowserAgent:
                     try:
                         el_info = await get_element_coords(page, annotation_index)
                         if el_info:
+                            # 验证目标是可输入元素，不是 button/link
+                            tag = el_info.get("tag", "").lower()
+                            if tag not in ("input", "textarea", "div", "span", "[contenteditable]"):
+                                await self._log(f"  ⚠ index #{annotation_index} 是 {tag}，不是输入框，拒绝输入")
+                                return f"操作失败: index={annotation_index} 是 {tag} 不是输入框，请找正确的输入框 index 重试"
                             x, y = el_info["x"], el_info["y"]
-                            await self._log(f"  [skyvern-id输入] #{annotation_index} → ({x}, {y}) tag={el_info['tag']}")
+                            await self._log(f"  [skyvern-id输入] #{annotation_index} → ({x}, {y}) tag={tag}")
                             await page.mouse.click(x, y)
                             await asyncio.sleep(0.4)
                             await page.keyboard.press("Control+a")
@@ -1036,6 +1038,9 @@ async def run_agent(
                     "  - 点击提交/搜索/发送按钮后，如果任务要求等待生成结果，必须调用 wait(wait_for_content_change=true, timeout=120)\n"
                     "  - wait 会自动等待内容开始出现，再等内容停止变化，完成后再截图\n"
                     "  - 普通页面跳转（登录、导航）不需要调用 wait，系统已自动处理\n"
+                    "提交规则（重要）：\n"
+                    "  - 在输入框输入内容后，必须点击提交/发送/搜索按钮，或者用 press_enter=true 提交，不能直接 done\n"
+                    "  - 提交后才能等待生成结果\n"
                     "登录规则：\n"
                     "  - 看到邮箱框填邮箱，看到密码框填密码，看到按钮就点\n"
                     "  - 两步登录（先邮箱后密码）：点继续后等新截图再填密码\n"
@@ -1052,6 +1057,8 @@ async def run_agent(
         await _log(f"\n🚀 开始执行任务: {task}\n")
         max_steps = 35
         fail_count = 0
+        last_tool_name = None
+        last_tool_pressed_enter = False
 
         # ── 任务分解 ──────────────────────────────────────────────────────────
         await _log("  [任务分解] 正在拆解任务步骤...")
@@ -1091,8 +1098,9 @@ async def run_agent(
         agent._active_requests = active_requests  # 注入到 agent，供 wait 工具使用
 
         for step in range(max_steps):
-            # 每步都检查弹窗，确保不被遮挡
-            await agent.dismiss_overlay()
+            # 只在第一步和 navigate 后检查弹窗，避免干扰正常操作
+            if step == 0:
+                await agent.dismiss_overlay()
 
             # 用标注截图：给所有可交互元素打红框+编号
             img_b64, elements = await annotate_page(agent.page)
@@ -1150,6 +1158,18 @@ async def run_agent(
             tool_args = json.loads(tool_call.function.arguments)
 
             await _log(f"\n>>> step={step+1} tool={tool_name} args={json.dumps(tool_args, ensure_ascii=False)}")
+
+            # 拦截：上一步是 type_text 且没有 press_enter，GPT 就直接 done 了——说明忘记提交
+            if tool_name == "done" and last_tool_name == "type_text" and not last_tool_pressed_enter:
+                await _log("  [拦截] 检测到输入后未提交就 done，强制要求先提交")
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": "操作被拦截：你刚刚输入了内容但还没有提交。请先点击提交/发送按钮（或用 press_enter=true），再等待生成完成，最后才能 done。",
+                })
+                for tc in msg.tool_calls[1:]:
+                    messages.append({"role": "tool", "tool_call_id": tc.id, "content": "skipped"})
+                continue
 
             # done/screenshot 前强制等待内容稳定（主循环层面兜底，日志走主循环的 _log）
             if tool_name in ("done", "screenshot"):
@@ -1238,6 +1258,12 @@ async def run_agent(
                     await _log(f"  [失败计数] 已重置（上次={fail_count}）")
                 fail_count = 0
 
+            # 记录上一步工具信息，供下一步拦截判断
+            last_tool_name = tool_name
+            last_tool_pressed_enter = (
+                tool_name == "type_text" and bool(tool_args.get("press_enter"))
+            )
+
             messages.append({
                 "role": "tool",
                 "tool_call_id": tool_call.id,
@@ -1269,8 +1295,7 @@ async def run_agent(
             await _log("  [CDP] 保持浏览器运行，不关闭")
         elif browser_mode == "user_chrome":
             await context.close()
-        elif browser:  # builtin 模式
-            await browser.close()
+        # builtin 模式暂时不关闭，保持浏览器可见
 
 
 # ── 入口 ──────────────────────────────────────────────────────────────────────
