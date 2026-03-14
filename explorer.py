@@ -26,7 +26,7 @@ from playwright.async_api import async_playwright, Page, BrowserContext
 
 load_dotenv()
 
-from site_understanding import analyze_site, score_page
+from site_understanding import analyze_site
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -74,7 +74,7 @@ async def _get_html(page: Page) -> str:
 
 
 async def _close_popups(page: Page):
-    """Best-effort: close common cookie banners and modals."""
+    """先用 selector 快速尝试，失败则 fallback 到 AI 视觉识别。"""
     selectors = [
         "button[aria-label*='close' i]",
         "button[aria-label*='dismiss' i]",
@@ -83,12 +83,48 @@ async def _close_popups(page: Page):
         "[class*='modal'] button[class*='close' i]",
         "[class*='banner'] button",
     ]
+    closed = False
     for sel in selectors:
         try:
             el = page.locator(sel).first
             if await el.is_visible(timeout=500):
                 await el.click(timeout=500)
                 await asyncio.sleep(0.3)
+                closed = True
+        except Exception:
+            pass
+
+    if not closed:
+        # fallback：AI 视觉判断是否有弹窗
+        try:
+            data = await page.screenshot(type="jpeg", quality=50)
+            img_b64 = base64.b64encode(data).decode()
+            from openai import OpenAI
+            import os as _os
+            proxy = _os.getenv("USE_PROXY") and "http://127.0.0.1:7897"
+            client = OpenAI(
+                api_key=_os.getenv("OPENAI_API_KEY"),
+                http_client=__import__("httpx").Client(proxy=proxy) if proxy else None,
+            )
+            resp = client.chat.completions.create(
+                model="gpt-4o",
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": '页面上是否有 cookie 横幅、弹窗或遮罩层需要关闭？返回 JSON: {"has_popup": true/false, "selector": "关闭按钮的 CSS selector 或 null"}'},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}", "detail": "low"}},
+                    ],
+                }],
+                response_format={"type": "json_object"},
+                max_tokens=100,
+            )
+            result = json.loads(resp.choices[0].message.content)
+            if result.get("has_popup") and result.get("selector"):
+                try:
+                    await page.click(result["selector"], timeout=3000)
+                    await asyncio.sleep(0.5)
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -133,7 +169,7 @@ async def run_exploration(
             proxy={"server": "http://127.0.0.1:7897"} if os.environ.get("USE_PROXY") else None,
         )
         context: BrowserContext = await browser.new_context(
-            viewport={"width": 1280, "height": 800},
+            viewport={"width": 1920, "height": 1080},
             locale="zh-CN",
         )
 
@@ -226,40 +262,29 @@ async def run_exploration(
                 await log(f"    ✗ 加载失败: {e}")
                 continue
 
-            html = await _get_html(page)
-            b64 = await _screenshot_b64(page)
             title = await page.title()
 
-            # Score this page
-            page_score_result = score_page(target_url, html, b64, product_context)
-            score = page_score_result.get("marketing_score", 0)
-            page_type = page_score_result.get("page_type", "unknown")
-            worth = page_score_result.get("is_worth_screenshot", False)
-
-            await log(f"    → 评分: {score:.1f} | 类型: {page_type} | 值得截图: {worth}")
-
+            # 不再用 AI 判断是否截图，每页都直接保存，由用户自己筛选
+            filename = f"{page_counter:02d}_page.png"
+            shot_path = out_dir / filename
+            await page.screenshot(path=str(shot_path), full_page=False)
+            screenshots.append({
+                "filename": filename,
+                "url": target_url,
+                "title": title,
+                "score": None,
+                "page_type": "page",
+                "source": "exploration",
+            })
             visited_pages.append({
                 "url": target_url,
                 "title": title,
-                "score": score,
-                "page_type": page_type,
-                "worth_screenshot": worth,
+                "score": None,
+                "page_type": "page",
+                "worth_screenshot": True,
             })
-
-            if worth and score >= min_page_score:
-                filename = f"{page_counter:02d}_{page_type}_{score:.0f}.png"
-                shot_path = out_dir / filename
-                await page.screenshot(path=str(shot_path), full_page=False)
-                screenshots.append({
-                    "filename": filename,
-                    "url": target_url,
-                    "title": title,
-                    "score": score,
-                    "page_type": page_type,
-                    "source": "exploration",
-                })
-                page_counter += 1
-                await log(f"    ✓ 截图保存: {filename}")
+            page_counter += 1
+            await log(f"    ✓ 截图保存: {filename}")
 
             # Enqueue sub-pages if depth allows
             if depth < max_depth:

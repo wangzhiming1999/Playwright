@@ -83,7 +83,7 @@ def _run_agent_in_thread(
         loop.run_until_complete(
             run_agent(
                 task=task,
-                headless=True,
+                headless=False,
                 task_id=task_id,
                 log_callback=thread_safe_log,
                 cookies_path=f"cookies_{task_id}.json",
@@ -303,7 +303,7 @@ def _run_exploration_in_thread(
                 screenshots_dir=f"screenshots/explore_{eid}",
                 cookies_path=cookies_path or None,
                 max_pages=max_pages,
-                headless=True,
+                headless=False,
                 log_fn=thread_safe_log,
             )
         )
