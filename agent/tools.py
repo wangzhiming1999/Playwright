@@ -258,4 +258,40 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "solve_captcha",
+            "description": (
+                "识别并输入图形验证码（CAPTCHA）。截图发给 AI 识别验证码文字，自动填入指定输入框。"
+                "适用于简单的文字/数字验证码。复杂验证码（滑块、拼图）请用 ask_user 让用户手动处理。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "input_index": {"type": "integer", "description": "验证码输入框的元素编号"},
+                    "captcha_index": {"type": "integer", "description": "验证码图片的元素编号（可选，不填则从整个页面截图识别）"},
+                },
+                "required": ["input_index"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_totp_code",
+            "description": (
+                "生成 TOTP 两步验证码（Google Authenticator 等）。"
+                "从环境变量读取站点的 TOTP secret，本地计算当前验证码。"
+                "环境变量格式：{SITE_KEY}_TOTP_SECRET，如 GITHUB_TOTP_SECRET。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "site_key": {"type": "string", "description": "站点标识，如 github、google，对应环境变量 GITHUB_TOTP_SECRET"},
+                },
+                "required": ["site_key"],
+            },
+        },
+    },
 ]

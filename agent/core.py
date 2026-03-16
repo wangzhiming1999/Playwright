@@ -854,6 +854,97 @@ class BrowserAgent:
                 except Exception as e:
                     return f"操作失败: 拖拽失败 — {e}"
 
+            elif tool_name == "solve_captcha":
+                input_index = args.get("input_index")
+                captcha_index = args.get("captcha_index")
+
+                if input_index is None:
+                    return "操作失败: 需要提供 input_index 参数"
+
+                # 截取验证码图片区域（如果指定了 captcha_index）
+                captcha_img = None
+                if captcha_index is not None:
+                    try:
+                        el_info = await get_element_coords(page, captcha_index)
+                        if el_info:
+                            # 截取验证码元素区域
+                            selector = f'[data-skyvern-id="{captcha_index}"]'
+                            try:
+                                el = page.locator(selector)
+                                screenshot_bytes = await el.screenshot(type="jpeg", quality=90, timeout=5000)
+                                captcha_img = base64.b64encode(screenshot_bytes).decode()
+                                await self._log(f"  [验证码] 已截取元素 #{captcha_index} 区域")
+                            except Exception:
+                                await self._log(f"  [验证码] 元素截图失败，使用全页截图")
+                    except Exception as e:
+                        await self._log(f"  [验证码] 定位验证码元素失败: {e}")
+
+                # 如果没有截取到局部图，用全页截图
+                if not captcha_img:
+                    captcha_img = await self.screenshot_base64(quality=90)
+                    if not captcha_img:
+                        return "操作失败: 截图失败"
+
+                # 用 GPT 识别验证码
+                client = self._client or _get_client()
+                try:
+                    resp = client.chat.completions.create(
+                        model="gpt-4o",
+                        messages=[{
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": (
+                                        "图片中有一个验证码（CAPTCHA），请识别其中的文字或数字。\n"
+                                        "只返回验证码内容本身，不要加任何解释。\n"
+                                        "如果看不清或无法识别，返回 UNKNOWN。"
+                                    ),
+                                },
+                                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{captcha_img}", "detail": "high"}},
+                            ],
+                        }],
+                        max_tokens=50,
+                    )
+                    if not resp.choices:
+                        return "操作失败: AI 识别验证码失败（空响应）"
+                    captcha_text = resp.choices[0].message.content.strip()
+                    await self._log(f"  [验证码] AI 识别结果: {captcha_text}")
+
+                    if captcha_text == "UNKNOWN" or not captcha_text:
+                        return "操作失败: 无法识别验证码，请用 ask_user 让用户手动输入"
+
+                    # 点击输入框并输入验证码
+                    el_info = await get_element_coords(page, input_index)
+                    if not el_info:
+                        return f"操作失败: input_index={input_index} 定位失败"
+                    x, y = el_info["x"], el_info["y"]
+                    await self._click_and_wait(x, y, check_navigation=False)
+                    await self._type_into_focused(captcha_text)
+                    return f"已输入验证码: {captcha_text}"
+
+                except Exception as e:
+                    return f"操作失败: 验证码识别失败 — {e}"
+
+            elif tool_name == "get_totp_code":
+                site_key = (args.get("site_key") or "").strip().upper().replace("-", "_")
+                if not site_key:
+                    return "操作失败: site_key 不能为空"
+
+                secret_var = f"{site_key}_TOTP_SECRET"
+                secret = os.environ.get(secret_var, "").strip()
+                if not secret:
+                    return f"未配置 TOTP 密钥：请设置环境变量 {secret_var}"
+
+                try:
+                    import pyotp
+                    totp = pyotp.TOTP(secret)
+                    code = totp.now()
+                    await self._log(f"  [TOTP] 已生成 {site_key} 验证码")
+                    return json.dumps({"code": code}, ensure_ascii=False)
+                except Exception as e:
+                    return f"操作失败: TOTP 生成失败 — {e}"
+
         except Exception as e:
             return f"操作失败: {e}"
 
