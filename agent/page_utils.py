@@ -1,5 +1,7 @@
 import asyncio
+import json as _json
 import sys
+import time
 
 # Windows 控制台默认 GBK，打印 emoji/中文易报错，统一用 UTF-8
 if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
@@ -7,6 +9,77 @@ if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
     except Exception:
         pass
+
+
+# ── 结构化日志 ────────────────────────────────────────────────────────────────
+
+# 全局开关：True 输出 JSON 行，False 输出可读文本（默认）
+STRUCTURED_LOG = False
+
+# 日志文件路径（设置后同时写文件，JSON 格式）
+LOG_FILE_PATH: str | None = None
+_log_file = None
+
+
+def _get_log_file():
+    global _log_file
+    if LOG_FILE_PATH and _log_file is None:
+        try:
+            _log_file = open(LOG_FILE_PATH, "a", encoding="utf-8")
+        except Exception:
+            pass
+    return _log_file
+
+
+def structured_log(event: str, level: str = "info", task_id: str = None, **data) -> dict:
+    """
+    生成结构化日志条目。
+
+    返回 dict 格式：
+    {
+        "ts": "2026-03-16T14:30:00.123",
+        "level": "info",
+        "event": "step_start",
+        "task_id": "abc123",
+        "data": { ... }
+    }
+
+    同时：
+    - 控制台输出（STRUCTURED_LOG=True 时输出 JSON 行，否则输出可读文本）
+    - 如果设置了 LOG_FILE_PATH，追加写入 JSON 行到文件
+    """
+    entry = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
+        "level": level,
+        "event": event,
+    }
+    if task_id:
+        entry["task_id"] = task_id
+    if data:
+        entry["data"] = data
+
+    # 写文件（始终 JSON）
+    f = _get_log_file()
+    if f:
+        try:
+            f.write(_json.dumps(entry, ensure_ascii=False) + "\n")
+            f.flush()
+        except Exception:
+            pass
+
+    # 控制台输出
+    if STRUCTURED_LOG:
+        _safe_print(_json.dumps(entry, ensure_ascii=False))
+    else:
+        # 可读格式：拼接 event + data 中的关键信息
+        msg = data.get("msg") or data.get("message") or ""
+        if not msg:
+            parts = [f"{k}={v}" for k, v in data.items() if k not in ("msg", "message")]
+            msg = " ".join(parts)
+        if msg:
+            _safe_print(f"  [{event}] {msg}")
+
+    return entry
 
 
 def _safe_print(msg: str) -> None:

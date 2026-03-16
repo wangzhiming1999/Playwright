@@ -14,5 +14,6 @@ from .runner import run_agent, SYSTEM_PROMPT_STATIC
 from .tools import TOOLS
 from .core import BrowserAgent
 from .llm_helpers import robust_json_loads, trim_elements
+from .page_utils import structured_log
 
-__all__ = ["run_agent", "TOOLS", "BrowserAgent", "robust_json_loads", "trim_elements", "SYSTEM_PROMPT_STATIC"]
+__all__ = ["run_agent", "TOOLS", "BrowserAgent", "robust_json_loads", "trim_elements", "SYSTEM_PROMPT_STATIC", "structured_log"]
