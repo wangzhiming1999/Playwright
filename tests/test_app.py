@@ -134,7 +134,8 @@ def test_run_multiple_tasks(client):
 
 def test_get_logs_not_found(client):
     r = client.get("/tasks/nonexistent/logs")
-    assert r.json()["error"] == "not found"
+    assert r.status_code == 404
+    assert r.json()["detail"] == "task not found"
 
 
 def test_get_logs_returns_list(client, done_task):
@@ -148,7 +149,8 @@ def test_get_logs_returns_list(client, done_task):
 
 def test_curate_task_not_found(client):
     r = client.post("/curate", json={"task_id": "missing"})
-    assert r.json()["error"] == "task not found"
+    assert r.status_code == 404
+    assert r.json()["detail"] == "task not found"
 
 
 def test_curate_task_not_done(client):
@@ -156,7 +158,8 @@ def test_curate_task_not_done(client):
     TASKS["running1"] = {"id": "running1", "task": "x", "status": "running",
                           "logs": [], "screenshots": []}
     r = client.post("/curate", json={"task_id": "running1"})
-    assert "must be 'done'" in r.json()["error"]
+    assert r.status_code == 400
+    assert "must be 'done'" in r.json()["detail"]
 
 
 def test_curate_no_screenshots_dir(client):
@@ -164,7 +167,8 @@ def test_curate_no_screenshots_dir(client):
     TASKS["nodirx1"] = {"id": "nodirx1", "task": "x", "status": "done",
                          "logs": [], "screenshots": []}
     r = client.post("/curate", json={"task_id": "nodirx1"})
-    assert "screenshots directory not found" in r.json()["error"]
+    assert r.status_code == 400
+    assert "screenshots directory not found" in r.json()["detail"]
 
 
 _MOCK_CURATE_RESULT = {
@@ -236,23 +240,26 @@ def test_explore_creates_task(client):
 
 def test_explore_rejects_invalid_url(client):
     r = client.post("/explore", json={"url": "ftp://example.com"})
-    assert "error" in r.json()
-    assert "无效" in r.json()["error"]
+    assert r.status_code == 400
+    assert "无效" in r.json()["detail"]
 
 
 def test_explore_rejects_localhost(client):
     r = client.post("/explore", json={"url": "http://localhost:8080"})
-    assert "error" in r.json()
+    assert r.status_code == 400
+    assert "detail" in r.json()
 
 
 def test_explore_rejects_empty_url(client):
     r = client.post("/explore", json={"url": ""})
-    assert "error" in r.json()
+    assert r.status_code == 400
+    assert "detail" in r.json()
 
 
 def test_explore_rejects_private_ip(client):
     r = client.post("/explore", json={"url": "http://192.168.1.1"})
-    assert "error" in r.json()
+    assert r.status_code == 400
+    assert "detail" in r.json()
 
 
 def test_explore_task_stored(client):
@@ -272,7 +279,8 @@ def test_explore_task_stored(client):
 
 def test_get_explore_not_found(client):
     r = client.get("/explore/missing")
-    assert r.json()["error"] == "not found"
+    assert r.status_code == 404
+    assert r.json()["detail"] == "explore task not found"
 
 
 def test_get_explore_returns_task(client, done_explore):
@@ -286,7 +294,8 @@ def test_get_explore_returns_task(client, done_explore):
 
 def test_explore_curate_not_found(client):
     r = client.post("/explore/missing/curate", json={"task_id": "missing"})
-    assert r.json()["error"] == "not found"
+    assert r.status_code == 404
+    assert r.json()["detail"] == "explore task not found"
 
 
 def test_explore_curate_not_done(client):
@@ -294,7 +303,8 @@ def test_explore_curate_not_done(client):
     EXPLORE_TASKS["epend1"] = {"id": "epend1", "url": "x", "product_context": "",
                                 "status": "running", "logs": [], "screenshots": []}
     r = client.post("/explore/epend1/curate", json={"task_id": "epend1"})
-    assert "must be 'done'" in r.json()["error"]
+    assert r.status_code == 400
+    assert "must be 'done'" in r.json()["detail"]
 
 
 def test_explore_curate_success(client, done_explore):
@@ -324,17 +334,20 @@ _MOCK_GENERATED = {
 
 def test_generate_bad_source(client):
     r = client.post("/generate", json={"source": "invalid", "source_id": "x"})
-    assert "source must be" in r.json()["error"]
+    assert r.status_code == 400
+    assert "source must be" in r.json()["detail"]
 
 
 def test_generate_source_not_found(client):
     r = client.post("/generate", json={"source": "task", "source_id": "missing"})
-    assert r.json()["error"] == "source not found"
+    assert r.status_code == 404
+    assert r.json()["detail"] == "source not found"
 
 
 def test_generate_no_curation(client, done_task):
     r = client.post("/generate", json={"source": "task", "source_id": done_task})
-    assert "run curation first" in r.json()["error"]
+    assert r.status_code == 400
+    assert "run curation first" in r.json()["detail"]
 
 
 def test_generate_success(client, done_task):
@@ -374,7 +387,8 @@ def test_generate_explore_source(client, done_explore):
 
 def test_get_generated_not_found(client):
     r = client.get("/tasks/missing/generated")
-    assert r.json()["error"] == "not found"
+    assert r.status_code == 404
+    assert r.json()["detail"] == "task not found"
 
 
 def test_get_generated_not_yet(client, done_task):
@@ -417,7 +431,8 @@ def test_edit_bad_source(client):
         "source": "invalid", "source_id": "x",
         "field": "ai_page.hero.headline", "value": "new"
     })
-    assert r.json()["error"] == "not found"
+    assert r.status_code == 404
+    assert r.json()["detail"] == "source not found"
 
 
 def test_edit_source_not_found(client):
@@ -425,7 +440,8 @@ def test_edit_source_not_found(client):
         "source": "task", "source_id": "missing",
         "field": "ai_page.hero.headline", "value": "new"
     })
-    assert r.json()["error"] == "not found"
+    assert r.status_code == 404
+    assert r.json()["detail"] == "source not found"
 
 
 def test_edit_no_generated(client, done_task):
@@ -433,7 +449,8 @@ def test_edit_no_generated(client, done_task):
         "source": "task", "source_id": done_task,
         "field": "ai_page.hero.headline", "value": "new"
     })
-    assert "no generated content" in r.json()["error"]
+    assert r.status_code == 400
+    assert "no generated content" in r.json()["detail"]
 
 
 def test_edit_headline(client, task_with_generated):

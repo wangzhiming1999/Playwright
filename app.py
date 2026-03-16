@@ -40,13 +40,21 @@ _BROADCAST_TIMEOUT = 5
 _USER_REPLY_TIMEOUT = 300   # 5 minutes
 
 API_KEY = os.getenv("API_KEY")  # Optional API key for authentication
+MAX_QUEUE_SIZE = int(os.getenv("MAX_QUEUE_SIZE", "20"))
+MAX_TASKS_KEEP = int(os.getenv("MAX_TASKS_KEEP", "50"))
 
 app = FastAPI()
 
 # CORS configuration
+_cors_origins_env = os.getenv("CORS_ORIGINS", "")
+_cors_origins = (
+    [o.strip() for o in _cors_origins_env.split(",") if o.strip()]
+    if _cors_origins_env
+    else ["http://localhost:8000", "http://127.0.0.1:8000"]
+)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:8000", "http://127.0.0.1:8000"],
+    allow_origins=_cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -62,7 +70,6 @@ Path("static").mkdir(exist_ok=True)
 init_db()
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
-app.mount("/screenshots", StaticFiles(directory="screenshots"), name="screenshots")
 
 # 专用线程池：在独立线程里用 ProactorEventLoop 跑 Playwright，避免 Windows 上主循环的 NotImplementedError
 _agent_executor = concurrent.futures.ThreadPoolExecutor(max_workers=_AGENT_THREAD_WORKERS, thread_name_prefix="playwright_agent")
@@ -73,6 +80,18 @@ TASKS: dict[str, dict] = load_all_tasks()
 # { id, task, status: pending|running|done|failed|waiting_input, logs: [], screenshots: [] }
 
 EXPLORE_TASKS: dict[str, dict] = load_all_explore_tasks()
+
+
+def _startup_cleanup():
+    for store in (TASKS, EXPLORE_TASKS):
+        done = sorted(
+            [t for t in store.values() if t["status"] in ("done", "failed")],
+            key=lambda t: t.get("created_at", ""),
+        )
+        for t in (done[:-MAX_TASKS_KEEP] if len(done) > MAX_TASKS_KEEP else []):
+            store.pop(t["id"], None)
+
+_startup_cleanup()
 
 # Per-client SSE queues for broadcast
 _SSE_CLIENTS: list[asyncio.Queue] = []
@@ -168,7 +187,7 @@ def _run_agent_in_thread(
 
     try:
         t = TASKS.get(task_id, {})
-        loop.run_until_complete(
+        agent_result = loop.run_until_complete(
             run_agent(
                 task=task,
                 headless=False,
@@ -183,15 +202,16 @@ def _run_agent_in_thread(
                 chrome_profile=t.get("chrome_profile", "Default"),
             )
         )
+        # agent_result: {"success": bool, "reason": str, "steps": int}
+        task_succeeded = agent_result.get("success", False) if isinstance(agent_result, dict) else True
         shot_dir = Path(f"screenshots/{task_id}")
         screenshots = []
         if shot_dir.exists():
-            # 收集所有 .png 和 .jpg 截图，按修改时间排序
             screenshots = sorted(
                 [f.name for f in shot_dir.glob("*.png")] + [f.name for f in shot_dir.glob("*.jpg")],
                 key=lambda n: (shot_dir / n).stat().st_mtime
             )
-        return (True, screenshots)
+        return (task_succeeded, screenshots)
     except Exception as e:
         return (False, str(e))
     finally:
@@ -251,8 +271,26 @@ def index():
     return FileResponse("static/index.html")
 
 
+@app.get("/health")
+def health_check():
+    return {"status": "ok", "tasks": len(TASKS), "explore_tasks": len(EXPLORE_TASKS)}
+
+
+@app.get("/screenshots/{task_id}/{filename}")
+async def serve_screenshot(task_id: str, filename: str, _: None = Depends(_verify_api_key)):
+    if ".." in task_id or ".." in filename or "/" in filename or "\\" in filename:
+        raise HTTPException(status_code=400, detail="invalid path")
+    path = Path("screenshots") / task_id / filename
+    if not path.exists() or not path.is_file():
+        raise HTTPException(status_code=404, detail="screenshot not found")
+    return FileResponse(str(path))
+
+
 @app.post("/run")
 async def submit_tasks(req: RunRequest, background_tasks: BackgroundTasks, _: None = Depends(_verify_api_key)):
+    active_count = sum(1 for t in TASKS.values() if t["status"] in ("pending", "running"))
+    if active_count >= MAX_QUEUE_SIZE:
+        raise HTTPException(status_code=429, detail=f"queue full ({active_count}/{MAX_QUEUE_SIZE} active tasks)")
     ids = []
     task_texts = []
     for task_text in req.tasks:
@@ -426,12 +464,15 @@ def _run_exploration_in_thread(
     asyncio.set_event_loop(loop)
 
     async def thread_safe_log(msg: str):
-        EXPLORE_TASKS[eid]["logs"].append(msg)
-        fut = asyncio.run_coroutine_threadsafe(
-            _broadcast({"type": "explore_log", "eid": eid, "data": msg}),
-            main_loop,
-        )
-        fut.result(timeout=_CALLBACK_TIMEOUT)
+        async def _append_and_broadcast():
+            if eid in EXPLORE_TASKS:
+                EXPLORE_TASKS[eid]["logs"].append(msg)
+            await _broadcast({"type": "explore_log", "eid": eid, "data": msg})
+        fut = asyncio.run_coroutine_threadsafe(_append_and_broadcast(), main_loop)
+        try:
+            fut.result(timeout=_CALLBACK_TIMEOUT)
+        except Exception as e:
+            print(f"[warn] explore log callback error: {e}", file=sys.stderr)
 
     try:
         result = loop.run_until_complete(

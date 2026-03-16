@@ -215,86 +215,112 @@ TOOLS = [
 
 # ── 执行器 ────────────────────────────────────────────────────────────────────
 
-async def _wait_for_navigation(page, timeout: int = 8000):
+async def _wait_for_page_ready(page, log_fn=None, timeout_ms: int = 15000, check_network: bool = True, active_requests: set = None) -> str:
     """
-    点击后等待页面稳定。
-    策略：先等 domcontentloaded（快），再尝试 networkidle（有长轮询的页面会超时，忽略）。
-    比直接用 networkidle 更可靠，不会被 WebSocket/SSE 卡住。
-    """
-    await asyncio.sleep(0.8)
-    try:
-        await page.wait_for_load_state("domcontentloaded", timeout=5000)
-    except Exception:
-        pass
-    try:
-        await page.wait_for_load_state("networkidle", timeout=timeout)
-    except Exception:
-        pass  # 有长轮询/SSE 的页面永远不会 idle，忽略超时
+    统一的页面就绪等待函数，替代所有硬编码 sleep。
 
+    等待策略（按顺序）：
+    1. 等待执行上下文可用（页面导航完成）
+    2. 等待 DOM 加载完成（domcontentloaded）
+    3. 如果 check_network=True，等待网络请求结束
+    4. 等待页面内容稳定（innerText 不再变化）
 
-async def _wait_for_content_stable(page, log_fn=None, max_secs: int = 120, active_requests: set = None) -> str:
-    """
-    等待页面内容生成完成。
-    双重判断：
-    1. 网络层：监听活跃请求数（由外部传入），请求全部结束后再等 2 秒确认
-    2. 内容层：innerText 长度连续 3 秒不变作为兜底
-    如果页面本来就静止（无网络请求、无内容变化），快速返回。
+    智能判断：
+    - 如果有活跃网络请求，说明页面在加载，耐心等
+    - 如果内容在持续变化，说明在渲染，耐心等
+    - 只有网络空闲 + 内容稳定同时满足才返回
+
+    返回：状态描述字符串
     """
     async def _log(msg):
         if log_fn:
             await log_fn(msg)
 
-    if active_requests is None:
-        active_requests = set()
+    start_time = asyncio.get_event_loop().time()
+    poll_interval = 0.1  # 100ms 轮询
 
-    await asyncio.sleep(1.0)  # 等提交后的请求开始发出
+    # 1. 等待执行上下文可用（页面导航完成）
+    max_polls = int(timeout_ms / 100)
+    for i in range(max_polls):
+        try:
+            await page.evaluate("() => document.readyState")
+            break
+        except Exception:
+            if i % 10 == 0:
+                await _log(f"  [wait] 等待页面上下文恢复... ({i*0.1:.1f}s)")
+            await asyncio.sleep(poll_interval)
+    else:
+        return f"超时：页面上下文未恢复 ({timeout_ms}ms)"
 
-    initial_len = await page.evaluate("() => document.body.innerText.length")
-    active = len(active_requests)
-    await _log(f"  [wait_stable] 开始监听，初始长度={initial_len}，活跃请求={active}")
+    # 2. 等待 DOM 加载
+    try:
+        await page.wait_for_load_state("domcontentloaded", timeout=5000)
+    except Exception:
+        pass
 
-    poll = 0.5
-    max_polls = int(max_secs / poll)
-    prev_len = initial_len
-    content_stable_count = 0
-    network_idle_count = 0
-    total = 0
+    # 3+4. 同时监测网络和内容，双条件满足才返回
+    try:
+        prev_len = await page.evaluate("() => document.body?.innerText?.length || 0")
+    except Exception:
+        prev_len = 0
 
-    for _ in range(max_polls):
-        await asyncio.sleep(poll)
-        total += 1
-        curr_len = await page.evaluate("() => document.body.innerText.length")
-        delta = abs(curr_len - prev_len)
-        active = len(active_requests)
+    network_idle_count = 0   # 网络空闲连续计数
+    content_stable_count = 0  # 内容稳定连续计数
+    has_seen_activity = False  # 是否观察到过网络活动或内容变化
 
-        # 内容稳定计数
-        if delta < 20:
-            content_stable_count += 1
-        else:
-            content_stable_count = 0
+    remaining_ms = timeout_ms - int((asyncio.get_event_loop().time() - start_time) * 1000)
+    max_checks = int(remaining_ms / 100)
 
-        # 网络空闲计数
+    for i in range(max_checks):
+        await asyncio.sleep(poll_interval)
+
+        # 检查网络
+        active = len(active_requests) if active_requests is not None else 0
         if active == 0:
             network_idle_count += 1
         else:
             network_idle_count = 0
+            has_seen_activity = True
 
-        if total % 10 == 0:
-            await _log(f"  [wait_stable] {total*poll:.0f}s: 长度={curr_len} delta={delta} 活跃请求={active}")
+        # 检查内容
+        try:
+            curr_len = await page.evaluate("() => document.body?.innerText?.length || 0")
+        except Exception:
+            # 页面正在导航，重置一切
+            curr_len = prev_len
+            network_idle_count = 0
+            content_stable_count = 0
+            has_seen_activity = True
+            continue
+
+        delta = abs(curr_len - prev_len)
+        if delta < 10:
+            content_stable_count += 1
+        else:
+            content_stable_count = 0
+            has_seen_activity = True
 
         prev_len = curr_len
 
-        # 网络空闲 2 秒 且 内容稳定 3 秒 → 完成
-        if network_idle_count >= 4 and content_stable_count >= 6:
-            # 如果从头到尾都没有变化，说明页面本来就是静态的
-            if curr_len == initial_len and total <= 10:
-                await _log("  [wait_stable] 页面静态，快速返回")
-                return "页面静态，无需等待"
-            await _log(f"  [wait_stable] ✓ 完成，长度={curr_len}，耗时{total*poll:.1f}s")
-            return f"内容已稳定，长度={curr_len}"
+        # 日志（每 2 秒打一次）
+        if i > 0 and i % 20 == 0:
+            elapsed = asyncio.get_event_loop().time() - start_time
+            await _log(f"  [wait] {elapsed:.1f}s: 内容长度={curr_len} delta={delta} 活跃请求={active} 网络空闲={network_idle_count} 内容稳定={content_stable_count}")
 
-    await _log(f"  [wait_stable] ⚠ 超时({max_secs}s)，长度={curr_len}")
-    return f"等待超时，长度={curr_len}"
+        # 判断就绪条件
+        # 如果从未观察到活动（页面本来就是静态的），快速返回
+        if not has_seen_activity and content_stable_count >= 3 and network_idle_count >= 3:
+            elapsed = asyncio.get_event_loop().time() - start_time
+            return f"页面就绪 ({elapsed:.1f}s)"
+
+        # 如果观察到过活动，需要更严格的稳定条件：
+        # 网络空闲 >= 1.5 秒 且 内容稳定 >= 2 秒
+        if has_seen_activity and network_idle_count >= 15 and content_stable_count >= 20:
+            elapsed = asyncio.get_event_loop().time() - start_time
+            return f"页面就绪 ({elapsed:.1f}s)"
+
+    elapsed = asyncio.get_event_loop().time() - start_time
+    return f"页面基本就绪 ({elapsed:.1f}s，内容可能仍在变化)"
 
 
 class BrowserAgent:
@@ -308,15 +334,74 @@ class BrowserAgent:
         self._task_id = task_id
         self._active_requests: set = set()  # 由外部主循环注入，供 wait 工具使用
 
-    async def screenshot_base64(self, quality: int = 92) -> str:
+    async def screenshot_base64(self, quality: int = 92, full_page: bool = False) -> str:
         """截当前页面，返回 base64 字符串供 GPT 分析"""
-        data = await self.page.screenshot(type="jpeg", quality=quality)
-        return base64.b64encode(data).decode()
+        try:
+            data = await self.page.screenshot(type="jpeg", quality=quality, full_page=full_page)
+            return base64.b64encode(data).decode()
+        except Exception as e:
+            await self._log(f"  ⚠ 截图失败: {e}")
+            return ""
 
     async def _log(self, msg: str):
         _safe_print(msg)
         if self._log_fn:
             await self._log_fn(msg)
+
+    async def _click_and_wait(self, x: int, y: int, check_navigation: bool = True) -> str:
+        """
+        点击坐标并等待页面就绪。
+        如果 check_navigation=True，检测 URL 变化并等待内容稳定。
+        """
+        url_before = self.page.url if check_navigation else None
+        await self.page.mouse.click(x, y)
+
+        result = await _wait_for_page_ready(
+            self.page,
+            log_fn=self._log,
+            timeout_ms=15000,
+            check_network=True,
+            active_requests=self._active_requests
+        )
+
+        if check_navigation and url_before and self.page.url != url_before:
+            await self._log(f"  [导航] URL 变化: {url_before} → {self.page.url}")
+
+        return result
+
+    async def _type_into_focused(self, text: str, press_enter: bool = False, is_password: bool = False) -> str:
+        """
+        在当前焦点元素输入文字（假设已经聚焦）。
+        清空现有内容，输入新内容，可选按 Enter。
+        如果按 Enter 触发导航，自动等待页面就绪。
+        """
+        # 清空现有内容
+        await self.page.keyboard.press("Control+a")
+        await self.page.keyboard.press("Delete")
+
+        # 输入新内容
+        await self.page.keyboard.type(text, delay=50)
+
+        # 可选：按 Enter 提交
+        if press_enter:
+            url_before = self.page.url
+            await self.page.keyboard.press("Enter")
+
+            # 等待页面就绪
+            await _wait_for_page_ready(
+                self.page,
+                log_fn=self._log,
+                timeout_ms=30000,  # Enter 提交可能触发长时间加载
+                check_network=True,
+                active_requests=self._active_requests
+            )
+
+            if self.page.url != url_before:
+                await self._log(f"  [导航] Enter 后 URL 变化: {url_before} → {self.page.url}")
+
+        if is_password:
+            return "已输入密码"
+        return f"已输入: {text}"
 
     async def dismiss_overlay(self):
         """每步操作前调用，自动关闭弹窗/遮罩/cookie 横幅。先试 selector，失败用 AI 视觉。"""
@@ -338,15 +423,15 @@ class BrowserAgent:
                 el = self.page.locator(sel).first
                 if await el.is_visible(timeout=300):
                     await el.click(timeout=500)
-                    await asyncio.sleep(0.4)
+                    await _wait_for_page_ready(self.page, log_fn=self._log, timeout_ms=3000, check_network=False)
                     await self._log("  [弹窗] selector 关闭成功")
                     return
             except Exception:
-                pass
-
-        # fallback：AI 视觉判断
+                pass  # selector 不存在或不可见，继续尝试下一个
         try:
             img = await self.screenshot_base64(quality=70)
+            if not img:
+                return
             client = self._client or _get_client()
             resp = client.chat.completions.create(
                 model="gpt-4o",
@@ -368,21 +453,26 @@ class BrowserAgent:
                 response_format={"type": "json_object"},
                 max_tokens=150,
             )
+            if not resp.choices:
+                return
             data = json.loads(resp.choices[0].message.content)
             if data.get("has_overlay") and data.get("x") is not None and data.get("y") is not None:
                 await self._log(f"  [弹窗] AI识别: {data.get('reasoning', '')} → ({data['x']}, {data['y']})")
                 try:
                     await self.page.mouse.click(data["x"], data["y"])
-                    await asyncio.sleep(0.5)
+                    await _wait_for_page_ready(self.page, log_fn=self._log, timeout_ms=3000, check_network=False)
                     await self._log("  [弹窗] AI 关闭成功")
                 except Exception as e:
                     await self._log(f"  [弹窗] AI 关闭失败: {e}")
-        except Exception:
-            pass
+        except Exception as e:
+            await self._log(f"  [弹窗] AI fallback 失败: {e}")
 
     async def _ai_validate(self, prompt: str) -> bool:
         """视觉验证：截图 + GPT 判断页面状态"""
         img = await self.screenshot_base64()
+        if not img:
+            await self._log("  [AI验证] 截图失败，跳过验证")
+            return False
         client = self._client or _get_client()
         try:
             resp = client.chat.completions.create(
@@ -397,6 +487,8 @@ class BrowserAgent:
                 response_format={"type": "json_object"},
                 max_tokens=150,
             )
+            if not resp.choices:
+                return False
             data = json.loads(resp.choices[0].message.content)
             await self._log(f"  [AI验证] {data.get('reason', '')} → {data.get('result')}")
             return bool(data.get("result"))
@@ -407,10 +499,14 @@ class BrowserAgent:
     async def _ai_act(self, prompt: str, input_text: str = None) -> str:
         """视觉操作：截图 + GPT 决定如何操作（基于坐标，不依赖 selector）"""
         img = await self.screenshot_base64()
+        if not img:
+            return "AI操作失败: 截图失败"
 
         # 视口 CSS 像素尺寸（mouse.click 用的是这个坐标系）
         viewport = self.page.viewport_size
-        width, height = viewport['width'], viewport['height']
+        if not viewport:
+            return "AI操作失败: 无法获取视口尺寸"
+        width, height = viewport.get('width', 1280), viewport.get('height', 800)
 
         client = self._client or _get_client()
         try:
@@ -443,7 +539,12 @@ class BrowserAgent:
                 response_format={"type": "json_object"},
                 max_tokens=300,
             )
-            result = json.loads(resp.choices[0].message.content)
+            if not resp.choices:
+                return "AI操作失败: 空响应"
+            try:
+                result = json.loads(resp.choices[0].message.content)
+            except json.JSONDecodeError as e:
+                return f"AI操作失败: JSON 解析错误 — {e}"
             await self._log(f"  [AI决策] {result.get('reasoning', '')} → {result.get('action')} at ({result.get('x')}, {result.get('y')})")
 
             action = result.get("action")
@@ -452,19 +553,12 @@ class BrowserAgent:
             text = result.get("text") or input_text
 
             if action == "click" and x is not None and y is not None:
-                await self.page.mouse.click(x, y)
-                await asyncio.sleep(0.5)
+                await self._click_and_wait(x, y)
                 return f"AI执行: 点击坐标 ({x}, {y})"
 
             elif action == "type" and x is not None and y is not None and text:
-                # 先点击输入框聚焦
-                await self.page.mouse.click(x, y)
-                await asyncio.sleep(0.3)
-                # 清空并输入
-                await self.page.keyboard.press("Control+a")
-                await self.page.keyboard.press("Delete")
-                await self.page.keyboard.type(text, delay=30)
-                await asyncio.sleep(0.5)
+                await self._click_and_wait(x, y, check_navigation=False)
+                await self._type_into_focused(text)
                 return f"AI执行: 在 ({x}, {y}) 输入文字"
 
             else:
@@ -488,23 +582,28 @@ class BrowserAgent:
 
         try:
             if tool_name == "navigate":
-                await page.goto(args["url"], wait_until="domcontentloaded", timeout=30000)
-                await _wait_for_navigation(page)
-                return f"已打开 {args['url']}"
+                url = args.get("url", "")
+                if not url:
+                    return "操作失败: url 参数不能为空"
+                try:
+                    await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                    await _wait_for_page_ready(page, log_fn=self._log, timeout_ms=15000, check_network=True, active_requests=self._active_requests)
+                    return f"已打开 {url}"
+                except Exception as e:
+                    return f"操作失败: 导航到 {url} 失败 — {e}"
 
             elif tool_name == "click":
                 index = args.get("index")
                 text = args.get("text")
 
-                # 优先用 data-skyvern-id 精确定位（annotate_page 已打好标记）
+                # 优先用 data-skyvern-id 精确定位
                 if index is not None:
                     try:
                         el_info = await get_element_coords(page, index)
                         if el_info:
                             x, y = el_info["x"], el_info["y"]
                             await self._log(f"  [skyvern-id点击] #{index} → ({x}, {y}) tag={el_info['tag']}")
-                            await page.mouse.click(x, y)
-                            await _wait_for_navigation(page)
+                            await self._click_and_wait(x, y)
                             return "点击成功"
                         else:
                             await self._log(f"  skyvern-id #{index} 不存在或不可见，fallback 到文字")
@@ -518,8 +617,15 @@ class BrowserAgent:
                 # fallback：用文字定位
                 if text:
                     try:
-                        await page.get_by_text(text, exact=False).first.click(force=True, timeout=10000)
-                        await _wait_for_navigation(page)
+                        el = page.get_by_text(text, exact=False).first
+                        bbox = await el.bounding_box(timeout=10000)
+                        if bbox:
+                            x = int(bbox["x"] + bbox["width"] / 2)
+                            y = int(bbox["y"] + bbox["height"] / 2)
+                            await self._click_and_wait(x, y)
+                        else:
+                            await el.click(force=True, timeout=10000)
+                            await _wait_for_page_ready(page, log_fn=self._log, timeout_ms=15000, check_network=True, active_requests=self._active_requests)
                         return "点击成功"
                     except Exception as e:
                         await self._log(f"  文字点击失败 ({e})，尝试 AI 视觉...")
@@ -543,65 +649,76 @@ class BrowserAgent:
 
             elif tool_name == "type_text":
                 annotation_index = args.get("index")
+                text_to_type = args.get("text", "")
+                press_enter = args.get("press_enter", False)
+                is_password = args.get("is_password", False)
 
-                # 优先路径：用 data-skyvern-id 精确定位，零歧义
+                if not text_to_type:
+                    return "操作失败: text 参数不能为空"
+
+                # 优先路径：用 data-skyvern-id 精确定位
                 if annotation_index is not None:
                     try:
                         el_info = await get_element_coords(page, annotation_index)
                         if el_info:
-                            # 验证目标是可输入元素，不是 button/link
                             tag = el_info.get("tag", "").lower()
-                            if tag not in ("input", "textarea", "div", "span", "[contenteditable]"):
-                                await self._log(f"  ⚠ index #{annotation_index} 是 {tag}，不是输入框，拒绝输入")
-                                return f"操作失败: index={annotation_index} 是 {tag} 不是输入框，请找正确的输入框 index 重试"
                             x, y = el_info["x"], el_info["y"]
-                            await self._log(f"  [skyvern-id输入] #{annotation_index} → ({x}, {y}) tag={tag}")
-                            await page.mouse.click(x, y)
-                            await asyncio.sleep(0.4)
-                            await page.keyboard.press("Control+a")
-                            await page.keyboard.press("Delete")
-                            await asyncio.sleep(0.2)
-                            await page.keyboard.type(args["text"], delay=50)
-                            await asyncio.sleep(0.4)
-                            if args.get("press_enter"):
-                                await page.keyboard.press("Enter")
-                                await asyncio.sleep(1.0)
-                            if args.get("is_password"):
-                                return "已输入密码"
-                            return f"已输入: {args['text']}"
+
+                            # 如果目标不是可输入元素，先点击检查焦点
+                            if tag not in ("input", "textarea", "div", "span"):
+                                await self._log(f"  ⚠ index #{annotation_index} 是 {tag}，尝试点击后检查焦点")
+                                await self._click_and_wait(x, y, check_navigation=False)
+                                focused_tag = await page.evaluate("() => document.activeElement?.tagName?.toLowerCase() || ''")
+                                focused_editable = await page.evaluate("() => document.activeElement?.isContentEditable || false")
+                                if focused_tag in ("input", "textarea") or focused_editable:
+                                    await self._log(f"  ✓ 点击后焦点落在 {focused_tag} 上，继续输入")
+                                    return await self._type_into_focused(text_to_type, press_enter, is_password)
+                                else:
+                                    await self._log(f"  ⚠ 点击后焦点在 {focused_tag}，不是输入框，fallback 到 DOM 扫描")
+                            else:
+                                await self._log(f"  [skyvern-id输入] #{annotation_index} → ({x}, {y}) tag={tag}")
+                                await self._click_and_wait(x, y, check_navigation=False)
+                                return await self._type_into_focused(text_to_type, press_enter, is_password)
                         else:
-                            await self._log(f"  skyvern-id #{annotation_index} 不存在，fallback 到 description")
+                            await self._log(f"  skyvern-id #{annotation_index} 不存在，fallback 到 DOM 扫描")
                     except Exception as e:
-                        await self._log(f"  index定位失败: {e}，fallback 到 description")
+                        await self._log(f"  index定位失败: {e}，fallback 到 DOM 扫描")
 
                 # fallback：用 description + DOM 列表 + GPT 匹配
-                description = args.get("description", "")
-                if not description:
-                    return "需要提供 index 或 description 来定位输入框"
+                description = args.get("description", "") or f"用于输入 '{text_to_type}' 的搜索框或输入框"
 
-                inputs_info = await page.evaluate("""() => {
-                    const inputs = Array.from(document.querySelectorAll('input, textarea'));
-                    return inputs
-                        .filter(el => {
-                            const r = el.getBoundingClientRect();
-                            return r.width > 0 && r.height > 0 && r.top >= 0 && r.top < window.innerHeight;
-                        })
-                        .map(el => {
-                            const r = el.getBoundingClientRect();
-                            return {
-                                type: el.type || 'text',
-                                placeholder: el.placeholder || '',
-                                name: el.name || '',
-                                id: el.id || '',
-                                label: el.getAttribute('aria-label') || '',
-                                x: Math.round(r.left + r.width / 2),
-                                y: Math.round(r.top + r.height / 2),
-                            };
-                        });
-                }""")
+                try:
+                    inputs_info = await page.evaluate("""() => {
+                        const inputs = Array.from(document.querySelectorAll(
+                            'input, textarea, [contenteditable="true"], [contenteditable=""]'
+                        ));
+                        return inputs
+                            .filter(el => {
+                                const r = el.getBoundingClientRect();
+                                return r.width > 0 && r.height > 0 && r.top >= 0 && r.top < window.innerHeight;
+                            })
+                            .map(el => {
+                                const r = el.getBoundingClientRect();
+                                return {
+                                    type: el.type || el.tagName.toLowerCase(),
+                                    placeholder: el.placeholder || el.getAttribute('data-placeholder') || '',
+                                    name: el.name || '',
+                                    id: el.id || '',
+                                    label: el.getAttribute('aria-label') || el.getAttribute('aria-placeholder') || '',
+                                    x: Math.round(r.left + r.width / 2),
+                                    y: Math.round(r.top + r.height / 2),
+                                };
+                            });
+                    }""")
+                except Exception as e:
+                    return f"操作失败: 获取输入框列表失败 — {e}"
 
                 if not inputs_info:
-                    return "页面上没有找到可见的输入框"
+                    await self._log("  [DOM] 未找到输入框，fallback 到 AI 视觉")
+                    action_desc = f"点击搜索框并输入 '{text_to_type}'"
+                    if press_enter:
+                        action_desc += "，然后按 Enter 提交"
+                    return await self._ai_act(action_desc)
 
                 await self._log(f"  [DOM] 找到 {len(inputs_info)} 个输入框")
 
@@ -620,94 +737,164 @@ class BrowserAgent:
                     response_format={"type": "json_object"},
                     max_tokens=100,
                 )
-                result = json.loads(resp.choices[0].message.content)
-                idx = int(result.get("index", 0))
+                if not resp.choices:
+                    return "操作失败: AI 定位输入框失败（空响应）"
+                try:
+                    result = json.loads(resp.choices[0].message.content)
+                except json.JSONDecodeError as e:
+                    return f"操作失败: AI 返回无效 JSON — {e}"
+                try:
+                    idx = int(result.get("index", 0))
+                except (ValueError, TypeError):
+                    idx = 0
                 await self._log(f"  [DOM定位] {result.get('reasoning', '')} → index={idx}")
 
-                if idx >= len(inputs_info):
+                if idx < 0 or idx >= len(inputs_info):
                     idx = 0
                 target = inputs_info[idx]
-                x, y = target["x"], target["y"]
-                await self._log(f"  [真实坐标] ({x}, {y}) type={target['type']} placeholder={target['placeholder']}")
+                x = target.get("x", 0)
+                y = target.get("y", 0)
+                await self._log(f"  [真实坐标] ({x}, {y}) type={target.get('type','')} placeholder={target.get('placeholder','')}")
 
                 try:
-                    await page.mouse.click(x, y)
-                    await asyncio.sleep(0.4)
-                    await page.keyboard.press("Control+a")
-                    await page.keyboard.press("Delete")
-                    await asyncio.sleep(0.2)
-                    await page.keyboard.type(args["text"], delay=50)
-                    await asyncio.sleep(0.4)
-                    if args.get("press_enter"):
-                        await page.keyboard.press("Enter")
-                        await asyncio.sleep(1.0)
-                    if args.get("is_password"):
-                        return "已输入密码"
-                    return f"已输入: {args['text']}"
+                    await self._click_and_wait(x, y, check_navigation=False)
+                    return await self._type_into_focused(text_to_type, press_enter, is_password)
                 except Exception as e:
                     await self._log(f"  输入失败: {e}")
                     return f"输入失败: {e}"
 
             elif tool_name == "scroll":
-                amount = args.get("amount", 500)
-                direction = 1 if args["direction"] == "down" else -1
-                await page.evaluate(f"window.scrollBy(0, {direction * amount})")
-                return f"已向{args['direction']}滚动 {amount}px"
+                try:
+                    amount = max(0, min(int(float(args.get("amount", 500))), 5000))
+                except (ValueError, TypeError):
+                    amount = 500
+                direction_str = args.get("direction", "down")
+                direction = 1 if direction_str == "down" else -1
+                try:
+                    await page.evaluate("(px) => window.scrollBy(0, px)", direction * amount)
+                    return f"已向{direction_str}滚动 {amount}px"
+                except Exception as e:
+                    return f"操作失败: 滚动失败 — {e}"
 
             elif tool_name == "wait":
                 if args.get("wait_for_content_change"):
                     timeout_secs = args.get("timeout", 120)
                     await self._log(f"  [智能等待] 等待内容稳定（最多 {timeout_secs}s）...")
-                    result_msg = await _wait_for_content_stable(page, log_fn=self._log, max_secs=timeout_secs, active_requests=self._active_requests)
+                    result_msg = await _wait_for_page_ready(page, log_fn=self._log, timeout_ms=timeout_secs * 1000, check_network=True, active_requests=self._active_requests)
                     return result_msg
                 elif args.get("selector"):
                     seconds = args.get("seconds", 10)
-                    await page.wait_for_selector(args["selector"], timeout=seconds * 1000)
-                    return "元素已出现"
+                    selector = args.get("selector", "")
+                    try:
+                        await page.wait_for_selector(selector, timeout=seconds * 1000)
+                        return "元素已出现"
+                    except Exception as e:
+                        return f"操作失败: 等待元素 {selector} 超时 — {e}"
                 else:
-                    await asyncio.sleep(args.get("seconds", 2))
+                    seconds = args.get("seconds", 2)
+                    await _wait_for_page_ready(page, log_fn=self._log, timeout_ms=seconds * 1000, check_network=True, active_requests=self._active_requests)
                     return "等待完成"
 
             elif tool_name == "screenshot":
-                path = self.screenshots_dir / args["filename"]
+                filename = args.get("filename", "screenshot.png")
+                # 防止路径遍历攻击
+                if ".." in filename or filename.startswith("/") or "\\" in filename:
+                    return "操作失败: 文件名不合法"
+                path = self.screenshots_dir / filename
                 full = args.get("full_page", False)
-                await page.screenshot(path=str(path), full_page=full)
-                await self._log(f"  ✓ 截图已保存: {path}")
-                if self._screenshot_callback and self._task_id:
-                    try:
-                        await self._screenshot_callback(self._task_id, args["filename"])
-                    except Exception:
-                        pass
-                return f"截图保存至 {path}"
+                try:
+                    await page.screenshot(path=str(path), full_page=full)
+                    await self._log(f"  ✓ 截图已保存: {path}")
+                    if self._screenshot_callback and self._task_id:
+                        try:
+                            await self._screenshot_callback(self._task_id, filename)
+                        except Exception as e:
+                            await self._log(f"  ⚠ 截图回调失败: {e}")
+                    return f"截图保存至 {path}。如果任务要求的截图已完成，请立即调用 done 结束任务。"
+                except Exception as e:
+                    return f"操作失败: 截图失败 — {e}"
 
             elif tool_name == "get_page_html":
                 selector = args.get("selector")
-                if selector:
-                    html = await page.eval_on_selector(selector, "el => el.outerHTML")
-                    return f"元素 HTML（已截取前2000字符）:\n{html[:2000]}"
-                else:
-                    html = await page.evaluate("() => document.body.innerHTML")
-                    return f"页面 body HTML（已截取前3000字符）:\n{html[:3000]}"
+                try:
+                    if selector:
+                        html = await page.eval_on_selector(selector, "el => el.outerHTML")
+                        return f"元素 HTML（已截取前2000字符）:\n{html[:2000]}"
+                    else:
+                        html = await page.evaluate("() => document.body.innerHTML")
+                        return f"页面 body HTML（已截取前3000字符）:\n{html[:3000]}"
+                except Exception as e:
+                    return f"操作失败: 获取 HTML 失败 — {e}"
 
             elif tool_name == "press_key":
-                await page.keyboard.press(args["key"])
-                return f"已按下 {args['key']}"
+                key = args.get("key", "")
+                if not key:
+                    return "操作失败: key 参数不能为空"
+                try:
+                    await page.keyboard.press(key)
+                    return f"已按下 {key}"
+                except Exception as e:
+                    return f"操作失败: 按键 {key} 失败 — {e}"
 
             elif tool_name == "done":
-                await _wait_for_navigation(page)
+                # 主循环已在 done 前调用了 _wait_for_page_ready
+                # 直接截图，避免重复等待导致超时
                 final_path = self.screenshots_dir / "final_result.png"
-                await page.screenshot(path=str(final_path), full_page=True)
-                await self._log(f"  ✓ 最终截图: {final_path.name}")
-                if self._screenshot_callback and self._task_id:
-                    try:
-                        await self._screenshot_callback(self._task_id, final_path.name)
-                    except Exception:
-                        pass
+                try:
+                    # 增加重试机制，防止页面正在跳转时截图失败
+                    max_retries = 3
+                    for attempt in range(max_retries):
+                        try:
+                            await page.screenshot(path=str(final_path), full_page=True, timeout=10000)
+                            await self._log(f"  ✓ 最终截图: {final_path.name}")
+                            if self._screenshot_callback and self._task_id:
+                                try:
+                                    await self._screenshot_callback(self._task_id, final_path.name)
+                                except Exception as e:
+                                    await self._log(f"  ⚠ 截图回调失败: {e}")
+                            break
+                        except Exception as e:
+                            if attempt < max_retries - 1:
+                                await self._log(f"  ⚠ 最终截图失败 (尝试 {attempt+1}/{max_retries}): {e}，1秒后重试...")
+                                await asyncio.sleep(1)
+                            else:
+                                await self._log(f"  ⚠ 最终截图失败 (已重试{max_retries}次): {e}")
+                except Exception as e:
+                    await self._log(f"  ⚠ 最终截图异常: {e}")
+
+                # 长页面分段截图，确保用户能看到完整内容
+                try:
+                    scroll_height = await page.evaluate("() => document.body.scrollHeight")
+                    vp_h = page.viewport_size.get("height", 1080) if page.viewport_size else 1080
+                    if scroll_height > vp_h * 1.5:
+                        parts_count = min(int(scroll_height / vp_h) + 1, 5)
+                        await self._log(f"  📄 长页面检测: {scroll_height}px，分 {parts_count} 段截图")
+                        for i in range(parts_count):
+                            y = i * vp_h
+                            await page.evaluate(f"window.scrollTo(0, {y})")
+                            await asyncio.sleep(0.3)
+                            part_path = self.screenshots_dir / f"final_part_{i+1}.png"
+                            try:
+                                await page.screenshot(path=str(part_path), timeout=10000)
+                                if self._screenshot_callback and self._task_id:
+                                    try:
+                                        await self._screenshot_callback(self._task_id, part_path.name)
+                                    except Exception:
+                                        pass
+                            except Exception as e:
+                                await self._log(f"  ⚠ 分段截图 {i+1} 失败: {e}")
+                        await page.evaluate("window.scrollTo(0, 0)")
+                except Exception as e:
+                    await self._log(f"  ⚠ 分段截图异常: {e}")
+
                 return "__DONE__"
 
             elif tool_name == "ask_user":
-                # 返回特殊标记，主循环负责暂停并等待用户回答
-                return f"__ASK_USER__:{args['question']}::{args.get('reason', '')}"
+                question = args.get("question", "")
+                reason = args.get("reason", "")
+                if not question:
+                    return "操作失败: question 参数不能为空"
+                return f"__ASK_USER__:{question}::{reason}"
 
         except Exception as e:
             return f"操作失败: {e}"
@@ -752,10 +939,14 @@ def _decompose_task(client, task: str) -> list[dict]:
             response_format={"type": "json_object"},
             max_tokens=600,
         )
-        data = json.loads(resp.choices[0].message.content)
+        if not resp.choices:
+            return []
+        raw = resp.choices[0].message.content
+        data = json.loads(raw)
         steps = data if isinstance(data, list) else data.get("steps", [])
-        return steps
-    except Exception:
+        return steps if isinstance(steps, list) else []
+    except Exception as e:
+        _safe_print(f"  [任务分解] 失败: {e}")
         return []
 
 
@@ -789,7 +980,12 @@ async def _verify_step(client, page, expected: str, done_signal: str) -> tuple[b
             response_format={"type": "json_object"},
             max_tokens=200,
         )
-        result = json.loads(resp.choices[0].message.content)
+        if not resp.choices:
+            return False, "", "空响应"
+        try:
+            result = json.loads(resp.choices[0].message.content)
+        except json.JSONDecodeError as e:
+            return False, "", f"JSON 解析失败: {e}"
         return result.get("success", False), result.get("observation", ""), result.get("mismatch", "")
     except Exception as e:
         return False, "", str(e)
@@ -841,8 +1037,12 @@ def _compress_messages(messages: list, client, max_history: int = 16) -> list:
             }],
             max_tokens=200,
         )
-        summary = resp.choices[0].message.content.strip()
-    except Exception:
+        if resp.choices:
+            summary = resp.choices[0].message.content.strip()
+        else:
+            summary = f"已执行 {len(to_compress)//2} 步操作"
+    except Exception as e:
+        _safe_print(f"  [上下文压缩] 摘要生成失败: {e}")
         summary = f"已执行 {len(to_compress)//2} 步操作"
 
     summary_msg = {
@@ -874,8 +1074,11 @@ def _analyze_failure(client, tool_name: str, tool_args: dict, error_result: str)
             }],
             max_tokens=100,
         )
-        return resp.choices[0].message.content.strip()
-    except Exception:
+        if resp.choices:
+            return resp.choices[0].message.content.strip()
+        return ""
+    except Exception as e:
+        _safe_print(f"  [失败分析] 分析失败: {e}")
         return ""
 
 
@@ -922,8 +1125,15 @@ async def run_agent(
     browser_mode: str = "builtin",  # "builtin" | "user_chrome" | "cdp"
     cdp_url: str = "http://localhost:9222",  # browser_mode="cdp" 时使用
     chrome_profile: str = None,  # browser_mode="user_chrome" 时指定 profile 名，默认 "Default"
-):
+) -> dict:
+    """
+    运行 agent 执行任务。
+    返回: {"success": bool, "reason": str, "steps": int}
+    """
     screenshots_dir = Path(screenshots_dir)
+    task_success = False
+    task_reason = "未知"
+    steps_executed = 0
 
     async with async_playwright() as pw:
         # ── 三种浏览器模式 ────────────────────────────────────────────────────
@@ -933,7 +1143,10 @@ async def run_agent(
         if browser_mode == "cdp":
             # 连接用户正在运行的 Chrome（需要用 --remote-debugging-port=9222 启动）
             _safe_print(f"  [CDP] 连接 {cdp_url} ...")
-            browser = await pw.chromium.connect_over_cdp(cdp_url)
+            try:
+                browser = await pw.chromium.connect_over_cdp(cdp_url)
+            except Exception as e:
+                raise RuntimeError(f"CDP 连接失败 ({cdp_url}): {e}") from e
             # 复用已有的第一个 context（继承所有登录态）
             if browser.contexts:
                 context = browser.contexts[0]
@@ -977,9 +1190,15 @@ async def run_agent(
         # builtin 模式才需要手动加载 cookies
         if browser_mode == "builtin":
             if cookies_file.exists():
-                cookies = json.loads(cookies_file.read_text(encoding="utf-8"))
-                await context.add_cookies(cookies)
-                _safe_print("✓ 已加载登录态")
+                try:
+                    cookies = json.loads(cookies_file.read_text(encoding="utf-8"))
+                    if isinstance(cookies, list):
+                        await context.add_cookies(cookies)
+                        _safe_print("✓ 已加载登录态")
+                    else:
+                        _safe_print("⚠ cookies 文件格式错误，跳过加载")
+                except (json.JSONDecodeError, Exception) as e:
+                    _safe_print(f"⚠ 加载 cookies 失败: {e}，继续执行")
 
             # 注入环境变量中的站点 token
             _felo_token = os.environ.get("FELO_AI_TOKEN", "").strip()
@@ -1004,9 +1223,12 @@ async def run_agent(
 
         # 多 tab 支持：监听新页面，自动切换到最新打开的 tab
         async def _on_new_page(new_page):
-            await new_page.wait_for_load_state("domcontentloaded")
-            agent.page = new_page
-            await _log(f"  [新标签页] 已切换到: {new_page.url}")
+            try:
+                await new_page.wait_for_load_state("domcontentloaded", timeout=10000)
+                agent.page = new_page
+                await _log(f"  [新标签页] 已切换到: {new_page.url}")
+            except Exception as e:
+                await _log(f"  [新标签页] 切换失败: {e}")
 
         context.on("page", lambda p: asyncio.ensure_future(_on_new_page(p)))
 
@@ -1066,8 +1288,8 @@ async def run_agent(
         if task_steps:
             await _log(f"  [任务分解] 共 {len(task_steps)} 步：")
             for s in task_steps:
-                await _log(f"    步骤{s['step']}: {s['action']}")
-                await _log(f"           预期: {s['expected']}")
+                await _log(f"    步骤{s.get('step', '?')}: {s.get('action', '')}")
+                await _log(f"           预期: {s.get('expected', '')}")
         else:
             await _log("  [任务分解] 分解失败，使用自由模式执行")
 
@@ -1075,11 +1297,11 @@ async def run_agent(
         steps_hint = ""
         if task_steps:
             steps_hint = "【任务步骤参考】\n" + "\n".join(
-                f"  {s['step']}. {s['action']}（完成标志：{s['done_signal']}）"
+                f"  {s.get('step', '?')}. {s.get('action', '')}（完成标志：{s.get('done_signal', '')}）"
                 for s in task_steps
             ) + "\n按顺序完成以上步骤，每步完成后再进行下一步。\n"
 
-        # 全程监听网络请求，供 _wait_for_content_stable 使用
+        # 全程监听网络请求，供 _wait_for_page_ready 使用
         active_requests: set[str] = set()
 
         def _on_request(req):
@@ -1102,19 +1324,35 @@ async def run_agent(
             if step == 0:
                 await agent.dismiss_overlay()
 
+            # 截图前确保页面就绪（统一使用 _wait_for_page_ready）
+            await _wait_for_page_ready(agent.page, log_fn=_log, timeout_ms=10000, check_network=True, active_requests=active_requests)
+
             # 用标注截图：给所有可交互元素打红框+编号
-            img_b64, elements = await annotate_page(agent.page)
+            try:
+                img_b64, elements = await annotate_page(agent.page)
+            except Exception as e:
+                await _log(f"  ⚠ 页面标注失败: {e}，使用普通截图")
+                try:
+                    raw = await agent.page.screenshot(type="jpeg", quality=80)
+                    img_b64 = base64.b64encode(raw).decode()
+                    elements = []
+                except Exception as e2:
+                    await _log(f"  ❌ 截图也失败: {e2}，终止任务")
+                    break
             elements_summary = json.dumps(elements, ensure_ascii=False)
 
             # 保存标注截图，方便调试，并实时推送给前端
             debug_path = screenshots_dir / f"step_{step+1:02d}_annotated.jpg"
-            debug_path.write_bytes(base64.b64decode(img_b64))
+            try:
+                debug_path.write_bytes(base64.b64decode(img_b64))
+            except Exception as e:
+                await _log(f"  ⚠ 保存调试截图失败: {e}")
             await _log(f"  [截图] {debug_path.name}")
             if screenshot_callback and task_id:
                 try:
                     await screenshot_callback(task_id, debug_path.name)
-                except Exception:
-                    pass
+                except Exception as e:
+                    await _log(f"  ⚠ 截图回调失败: {e}")
 
             messages.append({
                 "role": "user",
@@ -1146,8 +1384,23 @@ async def run_agent(
                 max_tokens=1000,
             )
 
+            if not response.choices:
+                await _log("⚠️ OpenAI API 返回空 choices，终止任务")
+                break
+
             msg = response.choices[0].message
-            messages.append(msg)
+            # 转成 dict 存入 messages，避免 _compress_messages 中 .get() 报错
+            msg_dict = {"role": msg.role, "content": msg.content}
+            if msg.tool_calls:
+                msg_dict["tool_calls"] = [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                    }
+                    for tc in msg.tool_calls
+                ]
+            messages.append(msg_dict)
 
             if not msg.tool_calls:
                 await _log("GPT 没有返回工具调用，结束")
@@ -1155,7 +1408,20 @@ async def run_agent(
 
             tool_call = msg.tool_calls[0]
             tool_name = tool_call.function.name
-            tool_args = json.loads(tool_call.function.arguments)
+
+            try:
+                tool_args = json.loads(tool_call.function.arguments)
+            except json.JSONDecodeError as e:
+                await _log(f"❌ GPT 返回的 JSON 无效: {e}")
+                await _log(f"   原始内容: {tool_call.function.arguments[:200]}")
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": f"JSON 解析失败: {e}，请重新调用工具",
+                })
+                for tc in msg.tool_calls[1:]:
+                    messages.append({"role": "tool", "tool_call_id": tc.id, "content": "skipped"})
+                continue
 
             await _log(f"\n>>> step={step+1} tool={tool_name} args={json.dumps(tool_args, ensure_ascii=False)}")
 
@@ -1171,10 +1437,10 @@ async def run_agent(
                     messages.append({"role": "tool", "tool_call_id": tc.id, "content": "skipped"})
                 continue
 
-            # done/screenshot 前强制等待内容稳定（主循环层面兜底，日志走主循环的 _log）
+            # done/screenshot 前强制等待内容稳定（主循环层面兜底）
             if tool_name in ("done", "screenshot"):
                 await _log("  [wait_stable] 执行前等待内容稳定...")
-                wait_result = await _wait_for_content_stable(agent.page, log_fn=_log, max_secs=120, active_requests=active_requests)
+                wait_result = await _wait_for_page_ready(agent.page, log_fn=_log, timeout_ms=120000, check_network=True, active_requests=active_requests)
                 await _log(f"  [wait_stable] 结果: {wait_result}")
 
             result = await agent.execute(tool_name, tool_args)
@@ -1191,21 +1457,128 @@ async def run_agent(
                     cookies_file.write_text(
                         json.dumps(cookies, ensure_ascii=False, indent=2), encoding="utf-8"
                     )
-                except Exception:
-                    pass
+                except Exception as e:
+                    await _log(f"  ⚠ 保存 cookies 失败: {e}")
 
             if result == "__DONE__":
                 summary = tool_args.get("summary", "任务完成")
-                await _log(f"\n✅ {summary}")
-                for tc in msg.tool_calls[1:]:
-                    messages.append({"role": "tool", "tool_call_id": tc.id, "content": "skipped"})
-                break
+
+                # ── 完成前验证：截图 + GPT 判断是否真正满足用户需求 ──
+                # 每 15 秒检查一次，最多 3 次，防止页面还没渲染完就结束
+                done_verified = False
+                for check_round in range(1, 4):
+                    await _log(f"\n🔍 [完成验证] 第 {check_round}/3 次检查...")
+                    try:
+                        # full_page 截图，确保长页面内容完整可见
+                        check_img = await agent.screenshot_base64(quality=75, full_page=True)
+                        if not check_img:
+                            await _log(f"  ⚠ 截图为空，跳过本轮验证")
+                            if check_round < 3:
+                                await asyncio.sleep(15)
+                            continue
+
+                        # 额外截一张底部 viewport 截图，检测底部是否有 loading
+                        bottom_img = None
+                        try:
+                            scroll_h = await agent.page.evaluate("() => document.body.scrollHeight")
+                            vp_h = agent.page.viewport_size.get("height", 1080) if agent.page.viewport_size else 1080
+                            if scroll_h > vp_h * 1.2:
+                                await agent.page.evaluate(f"window.scrollTo(0, {scroll_h})")
+                                await asyncio.sleep(0.5)
+                                bottom_img = await agent.screenshot_base64(quality=60)
+                                await agent.page.evaluate("window.scrollTo(0, 0)")
+                        except Exception:
+                            pass
+
+                        # 构建验证图片列表
+                        image_parts = [
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{check_img}", "detail": "low"}},
+                        ]
+                        bottom_hint = ""
+                        if bottom_img:
+                            image_parts.append(
+                                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{bottom_img}", "detail": "low"}},
+                            )
+                            bottom_hint = "第一张是完整页面截图，第二张是页面底部截图。请同时检查底部是否有未完成的内容。\n"
+
+                        verify_resp = client.chat.completions.create(
+                            model="gpt-4o",
+                            messages=[{
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": (
+                                            f"用户任务：{task}\n"
+                                            f"Agent 认为已完成：{summary}\n\n"
+                                            f"{bottom_hint}"
+                                            "请观察截图，判断任务是否真正完成。注意：\n"
+                                            "1. 如果页面有 loading/spinner/骨架屏，说明内容还在加载，未完成\n"
+                                            "2. 如果是 AI 生成类任务，检查内容是否已经完整输出（不是只有开头几个字）\n"
+                                            "3. 如果页面显示错误信息，说明任务失败\n"
+                                            "4. 如果页面内容与任务目标明显不符，说明未完成\n"
+                                            "5. 检查页面底部是否有 '加载更多'、spinner、或未完成的内容区块\n"
+                                            "6. 如果是长内容页面，检查内容是否在中间截断（如只有标题没有正文）\n\n"
+                                            '返回 JSON：{"done": true/false, "reason": "1句话说明判断依据"}'
+                                        ),
+                                    },
+                                ] + image_parts,
+                            }],
+                            response_format={"type": "json_object"},
+                            max_tokens=150,
+                        )
+                        if not verify_resp.choices:
+                            await _log(f"  ⚠ 验证 API 返回空，视为通过")
+                            done_verified = True
+                            break
+
+                        try:
+                            verify_data = json.loads(verify_resp.choices[0].message.content)
+                        except json.JSONDecodeError:
+                            await _log(f"  ⚠ 验证结果 JSON 解析失败，视为通过")
+                            done_verified = True
+                            break
+
+                        is_done = verify_data.get("done", True)
+                        reason = verify_data.get("reason", "")
+                        await _log(f"  [完成验证] {'✅ 已完成' if is_done else '⏳ 未完成'} — {reason}")
+
+                        if is_done:
+                            done_verified = True
+                            break
+                        else:
+                            if check_round < 3:
+                                await _log(f"  等待 15 秒后重新检查...")
+                                await asyncio.sleep(15)
+
+                    except Exception as e:
+                        await _log(f"  ⚠ 验证异常: {e}，视为通过")
+                        done_verified = True
+                        break
+
+                if done_verified:
+                    await _log(f"\n✅ {summary}")
+                    task_success = True
+                    task_reason = summary
+                    steps_executed = step + 1
+                    for tc in msg.tool_calls[1:]:
+                        messages.append({"role": "tool", "tool_call_id": tc.id, "content": "skipped"})
+                    break
+                else:
+                    # 3 次验证都未通过，告诉 GPT 继续操作
+                    await _log(f"  ⚠ 3次验证均未通过，要求 agent 继续执行")
+                    result = (
+                        "任务尚未真正完成。页面内容仍在加载或结果不符合预期。"
+                        "请等待页面加载完成，或检查当前页面状态后继续操作。不要急于调用 done。"
+                    )
 
             # ── 处理 ask_user：暂停并等待用户回答 ──────────────────────────
             if result.startswith("__ASK_USER__:"):
                 parts = result.split("::", 1)
-                question = parts[0].replace("__ASK_USER__:", "")
-                reason = parts[1] if len(parts) > 1 else ""
+                question = parts[0].replace("__ASK_USER__:", "").strip()
+                reason = parts[1].strip() if len(parts) > 1 else ""
+                if not question:
+                    question = "需要您的输入"
 
                 await _log(f"\n❓ [等待用户输入] {question}")
                 if reason:
@@ -1276,9 +1649,13 @@ async def run_agent(
 
             if fail_count >= 5:
                 await _log("\n⚠️  连续5次失败，终止任务")
+                task_reason = "连续5次操作失败"
+                steps_executed = step + 1
                 break
         else:
             await _log("\n⚠️  达到最大步数限制")
+            task_reason = f"达到最大步数限制({max_steps}步)"
+            steps_executed = max_steps
 
         # builtin 模式保存 cookies；user_chrome/cdp 模式不需要（浏览器本身保存）
         if browser_mode == "builtin":
@@ -1287,15 +1664,43 @@ async def run_agent(
                 cookies_file = Path(cookies_path)
                 cookies_file.write_text(json.dumps(cookies, ensure_ascii=False, indent=2), encoding="utf-8")
                 await _log(f"✓ 登录态已保存至 {cookies_path}")
-            except Exception:
-                pass
+            except Exception as e:
+                await _log(f"⚠ 保存 cookies 失败: {e}")
 
-        # 关闭浏览器：CDP 模式不关闭（用户还在用），其他模式关闭
+        # 关闭浏览器：保留浏览器供用户查看结果，仅在非 headless 模式下保持打开
+        # CDP 模式不关闭（用户还在用），builtin headless 模式关闭（无界面无意义）
         if browser_mode == "cdp":
             await _log("  [CDP] 保持浏览器运行，不关闭")
         elif browser_mode == "user_chrome":
-            await context.close()
-        # builtin 模式暂时不关闭，保持浏览器可见
+            await _log("  [user_chrome] 保持浏览器运行，用户可查看结果")
+        elif browser_mode == "builtin" and browser:
+            if headless:
+                try:
+                    await browser.close()
+                except Exception as e:
+                    await _log(f"⚠ 关闭浏览器失败: {e}")
+            else:
+                await _log("  🌐 浏览器保持打开，可手动查看结果。关闭浏览器窗口即可释放资源。")
+
+        # 兜底：如果 AI 没调 done 但截图目录里有非调试截图，也算成功
+        if not task_success:
+            user_screenshots = [
+                f for f in screenshots_dir.glob("*.*")
+                if f.suffix.lower() in (".png", ".jpg", ".jpeg")
+                and not f.stem.endswith("_annotated")
+                and not f.stem.startswith("step_")
+            ]
+            if user_screenshots:
+                await _log(f"  [兜底] AI 未调用 done，但发现 {len(user_screenshots)} 张用户截图，标记为成功")
+                task_success = True
+                if task_reason == "未知":
+                    task_reason = "任务已完成（截图已保存）"
+
+        return {
+            "success": task_success,
+            "reason": task_reason,
+            "steps": steps_executed,
+        }
 
 
 # ── 入口 ──────────────────────────────────────────────────────────────────────
