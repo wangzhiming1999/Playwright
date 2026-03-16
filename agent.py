@@ -33,7 +33,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from playwright.async_api import async_playwright, Page
 from page_annotator import annotate_page, get_element_coords
-from utils import get_openai_client
+from utils import get_openai_client, llm_call
 
 load_dotenv()
 
@@ -343,6 +343,20 @@ class BrowserAgent:
             await self._log(f"  ⚠ 截图失败: {e}")
             return ""
 
+    async def _safe_evaluate(self, expression: str, timeout_ms: int = 5000, default=None):
+        """带超时的 page.evaluate，防止页面卡死时挂起"""
+        try:
+            return await asyncio.wait_for(
+                self.page.evaluate(expression),
+                timeout=timeout_ms / 1000
+            )
+        except asyncio.TimeoutError:
+            await self._log(f"  ⚠ evaluate 超时 ({timeout_ms}ms): {expression[:80]}")
+            return default
+        except Exception as e:
+            await self._log(f"  ⚠ evaluate 失败: {e}")
+            return default
+
     async def _log(self, msg: str):
         _safe_print(msg)
         if self._log_fn:
@@ -585,12 +599,19 @@ class BrowserAgent:
                 url = args.get("url", "")
                 if not url:
                     return "操作失败: url 参数不能为空"
-                try:
-                    await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                    await _wait_for_page_ready(page, log_fn=self._log, timeout_ms=15000, check_network=True, active_requests=self._active_requests)
-                    return f"已打开 {url}"
-                except Exception as e:
-                    return f"操作失败: 导航到 {url} 失败 — {e}"
+                max_nav_retries = 3
+                for nav_attempt in range(max_nav_retries):
+                    try:
+                        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                        self._active_requests.clear()  # 清除旧页面的残留请求
+                        await _wait_for_page_ready(page, log_fn=self._log, timeout_ms=15000, check_network=True, active_requests=self._active_requests)
+                        return f"已打开 {url}"
+                    except Exception as e:
+                        if nav_attempt < max_nav_retries - 1:
+                            await self._log(f"  ⚠ 导航失败 (尝试 {nav_attempt+1}/{max_nav_retries}): {e}，1秒后重试...")
+                            await asyncio.sleep(1)
+                        else:
+                            return f"操作失败: 导航到 {url} 失败（已重试{max_nav_retries}次）— {e}"
 
             elif tool_name == "click":
                 index = args.get("index")
@@ -864,14 +885,14 @@ class BrowserAgent:
 
                 # 长页面分段截图，确保用户能看到完整内容
                 try:
-                    scroll_height = await page.evaluate("() => document.body.scrollHeight")
+                    scroll_height = await self._safe_evaluate("() => document.body.scrollHeight", default=0)
                     vp_h = page.viewport_size.get("height", 1080) if page.viewport_size else 1080
-                    if scroll_height > vp_h * 1.5:
+                    if scroll_height and scroll_height > vp_h * 1.5:
                         parts_count = min(int(scroll_height / vp_h) + 1, 5)
                         await self._log(f"  📄 长页面检测: {scroll_height}px，分 {parts_count} 段截图")
                         for i in range(parts_count):
                             y = i * vp_h
-                            await page.evaluate(f"window.scrollTo(0, {y})")
+                            await self._safe_evaluate(f"window.scrollTo(0, {y})")
                             await asyncio.sleep(0.3)
                             part_path = self.screenshots_dir / f"final_part_{i+1}.png"
                             try:
@@ -883,7 +904,7 @@ class BrowserAgent:
                                         pass
                             except Exception as e:
                                 await self._log(f"  ⚠ 分段截图 {i+1} 失败: {e}")
-                        await page.evaluate("window.scrollTo(0, 0)")
+                        await self._safe_evaluate("window.scrollTo(0, 0)")
                 except Exception as e:
                     await self._log(f"  ⚠ 分段截图异常: {e}")
 
@@ -914,7 +935,8 @@ def _decompose_task(client, task: str) -> list[dict]:
       - done_signal: 判断这步完成的关键特征（页面上能看到什么）
     """
     try:
-        resp = client.chat.completions.create(
+        resp = llm_call(
+            client.chat.completions.create,
             model="gpt-4o",
             messages=[{
                 "role": "user",
@@ -1305,14 +1327,23 @@ async def run_agent(
         active_requests: set[str] = set()
 
         def _on_request(req):
-            if req.resource_type in ("fetch", "xhr", "websocket"):
-                active_requests.add(req.url)
+            try:
+                if req.resource_type in ("fetch", "xhr", "websocket"):
+                    active_requests.add(req.url)
+            except Exception:
+                pass
 
         def _on_response(resp):
-            active_requests.discard(resp.url)
+            try:
+                active_requests.discard(resp.url)
+            except Exception:
+                pass
 
         def _on_request_failed(req):
-            active_requests.discard(req.url)
+            try:
+                active_requests.discard(req.url)
+            except Exception:
+                pass
 
         agent.page.on("request", _on_request)
         agent.page.on("response", _on_response)
@@ -1320,6 +1351,14 @@ async def run_agent(
         agent._active_requests = active_requests  # 注入到 agent，供 wait 工具使用
 
         for step in range(max_steps):
+            # 步数预警：80% 时提醒 GPT 加速收尾
+            if step == int(max_steps * 0.8):
+                await _log(f"  ⚠ [预警] 已执行 {step+1}/{max_steps} 步，即将达到上限")
+                messages.append({
+                    "role": "user",
+                    "content": "⚠️ 注意：你已使用了大部分步数，请尽快完成任务。如果核心目标已达成，请截图并调用 done。"
+                })
+
             # 只在第一步和 navigate 后检查弹窗，避免干扰正常操作
             if step == 0:
                 await agent.dismiss_overlay()
@@ -1371,12 +1410,18 @@ async def run_agent(
                 ],
             })
 
-            # 上下文压缩：超过 24 条时压缩中间历史为摘要，保留最近 16 条
+            # 上下文压缩：硬上限 60 条防止压缩失败时无限增长
+            if len(messages) > 60:
+                await _log(f"  ⚠ [上下文] 消息数 {len(messages)} 超过硬上限，强制截断")
+                messages = [messages[0]] + messages[-20:]
+
+            # 正常压缩：超过 24 条时压缩中间历史为摘要，保留最近 16 条
             if len(messages) > 24:
                 messages = _compress_messages(messages, client, max_history=16)
                 await _log(f"  [上下文] 已压缩历史，当前 {len(messages)} 条消息")
 
-            response = client.chat.completions.create(
+            response = llm_call(
+                client.chat.completions.create,
                 model="gpt-4o",
                 messages=messages,
                 tools=TOOLS,
@@ -1501,7 +1546,8 @@ async def run_agent(
                             )
                             bottom_hint = "第一张是完整页面截图，第二张是页面底部截图。请同时检查底部是否有未完成的内容。\n"
 
-                        verify_resp = client.chat.completions.create(
+                        verify_resp = llm_call(
+                            client.chat.completions.create,
                             model="gpt-4o",
                             messages=[{
                                 "role": "user",
