@@ -60,15 +60,69 @@ async def run_agent(
     browser_mode: str = "builtin",  # "builtin" | "user_chrome" | "cdp"
     cdp_url: str = "http://localhost:9222",
     chrome_profile: str = None,
+    checkpoint_dir: str = None,  # 检查点目录，设置后启用断点续跑
 ) -> dict:
     """
     运行 agent 执行任务。
     返回: {"success": bool, "reason": str, "steps": int}
+
+    断点续跑：设置 checkpoint_dir 后，每步执行完保存检查点。
+    下次用相同 checkpoint_dir 调用时自动从上次中断处恢复。
     """
     screenshots_dir = Path(screenshots_dir)
     task_success = False
     task_reason = "未知"
     steps_executed = 0
+
+    # ── 断点续跑：加载检查点 ──
+    checkpoint_file = None
+    resume_step = 0
+    resume_messages = None
+    resume_url = None
+
+    if checkpoint_dir:
+        cp_dir = Path(checkpoint_dir)
+        cp_dir.mkdir(parents=True, exist_ok=True)
+        checkpoint_file = cp_dir / "checkpoint.json"
+        if checkpoint_file.exists():
+            try:
+                cp_data = json.loads(checkpoint_file.read_text(encoding="utf-8"))
+                resume_step = cp_data.get("step", 0)
+                resume_url = cp_data.get("url", "")
+                # 恢复消息历史（去掉图片内容，只保留文本）
+                resume_messages = cp_data.get("messages", [])
+                _safe_print(f"  [断点续跑] 从第 {resume_step + 1} 步恢复，URL: {resume_url}")
+            except Exception as e:
+                _safe_print(f"  [断点续跑] 加载检查点失败: {e}，从头开始")
+
+    def _save_checkpoint(step: int, messages: list, current_url: str):
+        """保存检查点（去掉图片 base64 以减小体积）"""
+        if not checkpoint_file:
+            return
+        try:
+            # 深拷贝消息，去掉图片内容
+            clean_msgs = []
+            for m in messages:
+                content = m.get("content", "")
+                if isinstance(content, list):
+                    # 多模态消息：只保留文本部分
+                    text_parts = [p for p in content if isinstance(p, dict) and p.get("type") == "text"]
+                    clean_msgs.append({**m, "content": text_parts or ""})
+                else:
+                    clean_msgs.append(m)
+            cp_data = {
+                "step": step,
+                "url": current_url,
+                "messages": clean_msgs[-20:],  # 只保留最近 20 条
+                "task": task,
+                "saved_at": __import__("time").strftime("%Y-%m-%dT%H:%M:%S"),
+            }
+            checkpoint_file.write_text(
+                json.dumps(cp_data, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as e:
+            _safe_print(f"  [断点续跑] 保存检查点失败: {e}")
 
     async with async_playwright() as pw:
         browser = None
@@ -186,6 +240,18 @@ async def run_agent(
         last_tool_name = None
         last_tool_pressed_enter = False
 
+        # 断点续跑：恢复消息历史和导航到上次 URL
+        if resume_messages and resume_url:
+            messages = resume_messages
+            await _log(f"  [断点续跑] 恢复 {len(messages)} 条消息历史")
+            try:
+                await page.goto(resume_url, wait_until="domcontentloaded", timeout=30000)
+                await _wait_for_page_ready(page, log_fn=_log, timeout_ms=10000, check_network=True, active_requests=set())
+                await _log(f"  [断点续跑] 已导航到: {resume_url}")
+            except Exception as e:
+                await _log(f"  [断点续跑] 导航失败: {e}，从头开始")
+                resume_step = 0
+
         # 任务分解
         await _log("  [任务分解] 正在拆解任务步骤...")
         task_steps = _decompose_task(client, task)
@@ -231,7 +297,7 @@ async def run_agent(
         agent.page.on("requestfailed", _on_request_failed)
         agent._active_requests = active_requests
 
-        for step in range(max_steps):
+        for step in range(resume_step, max_steps):
             if step == int(max_steps * 0.8):
                 await _log(f"  ⚠ [预警] 已执行 {step+1}/{max_steps} 步，即将达到上限")
                 messages.append({
@@ -556,6 +622,9 @@ async def run_agent(
             for tc in msg.tool_calls[1:]:
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": "skipped"})
 
+            # 断点续跑：每步保存检查点
+            _save_checkpoint(step + 1, messages, agent.page.url)
+
             if fail_count >= 5:
                 await _log("\n⚠️  连续5次失败，终止任务")
                 task_reason = "连续5次操作失败"
@@ -603,6 +672,14 @@ async def run_agent(
                 task_success = True
                 if task_reason == "未知":
                     task_reason = "任务已完成（截图已保存）"
+
+        # 断点续跑：任务成功完成后清理检查点
+        if task_success and checkpoint_file and checkpoint_file.exists():
+            try:
+                checkpoint_file.unlink()
+                await _log("  [断点续跑] 任务完成，已清理检查点")
+            except Exception:
+                pass
 
         return {
             "success": task_success,
