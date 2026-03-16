@@ -8,20 +8,16 @@ from playwright.async_api import Page
 from page_annotator import get_element_coords
 
 from .page_utils import _safe_print, _wait_for_page_ready
-
-
-def _get_client():
-    from utils import get_openai_client
-    return get_openai_client()
+from .llm_helpers import robust_json_loads
+from utils import llm_chat as _llm_chat
 
 
 class BrowserAgent:
-    def __init__(self, page: Page, screenshots_dir: Path, log_fn=None, client=None, screenshot_callback=None, task_id=None):
+    def __init__(self, page: Page, screenshots_dir: Path, log_fn=None, screenshot_callback=None, task_id=None):
         self.page = page
         self.screenshots_dir = screenshots_dir
         self.screenshots_dir.mkdir(parents=True, exist_ok=True)
         self._log_fn = log_fn  # async callable(msg) or None
-        self._client = client  # shared OpenAI client
         self._screenshot_callback = screenshot_callback
         self._task_id = task_id
         self._active_requests: set = set()  # 由外部主循环注入，供 wait 工具使用
@@ -138,8 +134,7 @@ class BrowserAgent:
             img = await self.screenshot_base64(quality=70)
             if not img:
                 return
-            llm_chat = _get_llm_chat()
-            resp = llm_chat(
+            resp = _llm_chat(
                 messages=[{
                     "role": "user",
                     "content": [
@@ -178,9 +173,8 @@ class BrowserAgent:
         if not img:
             await self._log("  [AI验证] 截图失败，跳过验证")
             return False
-        llm_chat = _get_llm_chat()
         try:
-            resp = llm_chat(
+            resp = _llm_chat(
                 messages=[{
                     "role": "user",
                     "content": [
@@ -212,13 +206,12 @@ class BrowserAgent:
             return "AI操作失败: 无法获取视口尺寸"
         width, height = viewport.get('width', 1280), viewport.get('height', 800)
 
-        llm_chat = _get_llm_chat()
         try:
             task_desc = prompt
             if input_text:
                 task_desc += f"\n要输入的内容: {input_text}"
 
-            resp = llm_chat(
+            resp = _llm_chat(
                 messages=[{
                     "role": "user",
                     "content": [
@@ -434,8 +427,7 @@ class BrowserAgent:
 
                 await self._log(f"  [DOM] 找到 {len(inputs_info)} 个输入框")
 
-                llm_chat = _get_llm_chat()
-                resp = llm_chat(
+                resp = _llm_chat(
                     messages=[{
                         "role": "user",
                         "content": (
@@ -480,9 +472,32 @@ class BrowserAgent:
                 except (ValueError, TypeError):
                     amount = 500
                 direction_str = args.get("direction", "down")
+
+                # 支持滚动到顶部/底部
+                if direction_str == "top":
+                    try:
+                        await page.evaluate("() => window.scrollTo(0, 0)")
+                        return "已滚动到页面顶部"
+                    except Exception as e:
+                        return f"操作失败: 滚动失败 — {e}"
+                elif direction_str == "bottom":
+                    try:
+                        await page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+                        return "已滚动到页面底部"
+                    except Exception as e:
+                        return f"操作失败: 滚动失败 — {e}"
+
                 direction = 1 if direction_str == "down" else -1
                 try:
+                    # 记录滚动前位置，检测是否到底/到顶
+                    scroll_before = await self._safe_evaluate("() => window.scrollY", default=0)
                     await page.evaluate("(px) => window.scrollBy(0, px)", direction * amount)
+                    await asyncio.sleep(0.3)
+                    scroll_after = await self._safe_evaluate("() => window.scrollY", default=0)
+
+                    if scroll_before == scroll_after:
+                        boundary = "底部" if direction_str == "down" else "顶部"
+                        return f"已到达页面{boundary}，无法继续滚动"
                     return f"已向{direction_str}滚动 {amount}px"
                 except Exception as e:
                     return f"操作失败: 滚动失败 — {e}"
@@ -881,9 +896,8 @@ class BrowserAgent:
                         return "操作失败: 截图失败"
 
                 # 用 AI 识别验证码
-                llm_chat = _get_llm_chat()
                 try:
-                    resp = llm_chat(
+                    resp = _llm_chat(
                         messages=[{
                             "role": "user",
                             "content": [
@@ -938,6 +952,254 @@ class BrowserAgent:
                     return json.dumps({"code": code}, ensure_ascii=False)
                 except Exception as e:
                     return f"操作失败: TOTP 生成失败 — {e}"
+
+            elif tool_name == "find_element":
+                description = args.get("description", "")
+                element_type = args.get("element_type", "any")
+                if not description:
+                    return "操作失败: description 参数不能为空"
+
+                img = await self.screenshot_base64(quality=90)
+                if not img:
+                    return "操作失败: 截图失败"
+
+                viewport = self.page.viewport_size
+                if not viewport:
+                    return "操作失败: 无法获取视口尺寸"
+                width, height = viewport.get('width', 1280), viewport.get('height', 800)
+
+                type_hint = ""
+                if element_type == "image":
+                    type_hint = "目标是一张图片（img 标签或 background-image）。"
+                elif element_type == "text":
+                    type_hint = "目标是一段文字内容。"
+                elif element_type == "button":
+                    type_hint = "目标是一个按钮或可点击元素。"
+                elif element_type == "link":
+                    type_hint = "目标是一个链接。"
+
+                try:
+                    resp = _llm_chat(
+                        messages=[{
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": (
+                                        f"在截图中找到以下元素：{description}\n"
+                                        f"{type_hint}\n"
+                                        f"浏览器视口: {width}x{height} CSS像素\n"
+                                        "仔细观察截图，找到目标元素的中心位置。\n"
+                                        "如果找到了，返回坐标；如果截图中没有这个元素，返回 found=false。\n"
+                                        '返回 JSON: {"found": true/false, '
+                                        f'"x": X坐标(0~{width}), '
+                                        f'"y": Y坐标(0~{height}), '
+                                        '"reasoning": "描述元素在截图中的位置和外观"}'
+                                    ),
+                                },
+                                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img}", "detail": "high"}},
+                            ],
+                        }],
+                        response_format={"type": "json_object"},
+                        max_tokens=300,
+                    )
+                    if not resp.choices:
+                        return "操作失败: AI 视觉定位失败（空响应）"
+                    result = robust_json_loads(resp.choices[0].message.content)
+                    found = result.get("found", False)
+                    reasoning = result.get("reasoning", "")
+                    await self._log(f"  [find_element] {'找到' if found else '未找到'}: {reasoning}")
+
+                    if not found:
+                        return f"未找到元素: {description}。建议：向下滚动页面后重试，或检查描述是否准确。"
+
+                    x, y = result.get("x", 0), result.get("y", 0)
+
+                    # 尝试获取该坐标处的元素信息
+                    try:
+                        el_info = await self.page.evaluate(f"""(coords) => {{
+                            const el = document.elementFromPoint(coords.x, coords.y);
+                            if (!el) return null;
+                            const tag = el.tagName.toLowerCase();
+                            const info = {{
+                                tag: tag,
+                                src: el.src || el.currentSrc || '',
+                                alt: el.alt || '',
+                                href: el.href || '',
+                                text: (el.textContent || '').trim().substring(0, 100),
+                            }};
+                            // 检查 background-image
+                            if (!info.src) {{
+                                try {{
+                                    const bg = window.getComputedStyle(el).backgroundImage;
+                                    if (bg && bg !== 'none' && bg.startsWith('url(')) {{
+                                        info.src = bg.slice(5, -2).replace(/['"]/g, '');
+                                        info.tag = 'div(bg-image)';
+                                    }}
+                                }} catch(e) {{}}
+                            }}
+                            // 检查父元素是否是链接
+                            const parent = el.closest('a');
+                            if (parent) info.href = parent.href || '';
+                            return info;
+                        }}""", {"x": x, "y": y})
+                    except Exception:
+                        el_info = None
+
+                    info_str = f"坐标: ({x}, {y})"
+                    if el_info:
+                        if el_info.get("src"):
+                            info_str += f", src={el_info['src'][:200]}"
+                        if el_info.get("alt"):
+                            info_str += f", alt={el_info['alt']}"
+                        if el_info.get("href"):
+                            info_str += f", href={el_info['href'][:200]}"
+                        info_str += f", tag={el_info.get('tag', '')}"
+
+                    return f"找到元素: {description}。{info_str}。你可以用 click(index=...) 点击它，或用 save_element/download_url 下载。"
+
+                except Exception as e:
+                    return f"操作失败: 视觉定位失败 — {e}"
+
+            elif tool_name == "save_element":
+                index = args.get("index")
+                filename = args.get("filename", "saved_element.png")
+
+                if index is None:
+                    return "操作失败: 需要提供 index 参数"
+                if ".." in filename or filename.startswith("/") or "\\" in filename:
+                    return "操作失败: 文件名不合法"
+
+                save_path = self.screenshots_dir / filename
+
+                try:
+                    el_info = await get_element_coords(page, index)
+                    if not el_info:
+                        return f"操作失败: index={index} 定位失败"
+
+                    # 获取元素的 src（图片 URL）
+                    src = await page.evaluate(f"""() => {{
+                        const el = document.querySelector('[data-skyvern-id="{index}"]');
+                        if (!el) return null;
+                        const tag = el.tagName.toLowerCase();
+                        if (tag === 'img') return el.src || el.currentSrc || null;
+                        if (tag === 'video') return el.poster || el.src || null;
+                        // background-image
+                        try {{
+                            const bg = window.getComputedStyle(el).backgroundImage;
+                            if (bg && bg !== 'none' && bg.startsWith('url(')) {{
+                                return bg.slice(5, -2).replace(/['"]/g, '');
+                            }}
+                        }} catch(e) {{}}
+                        return null;
+                    }}""")
+
+                    if src:
+                        # 有 URL，通过浏览器上下文下载（继承 cookies）
+                        await self._log(f"  [save_element] 下载图片: {src[:100]}")
+                        try:
+                            resp = await page.context.request.get(src)
+                            if resp.ok:
+                                body = await resp.body()
+                                save_path.write_bytes(body)
+                                await self._log(f"  ✓ 已保存: {save_path} ({len(body)} bytes)")
+                                if self._screenshot_callback and self._task_id:
+                                    try:
+                                        await self._screenshot_callback(self._task_id, filename)
+                                    except Exception:
+                                        pass
+                                return f"已保存元素到 {save_path}（{len(body)} bytes）"
+                            else:
+                                await self._log(f"  ⚠ HTTP 下载失败: {resp.status}，fallback 到元素截图")
+                        except Exception as e:
+                            await self._log(f"  ⚠ 下载失败: {e}，fallback 到元素截图")
+
+                    # fallback: 对元素区域截图
+                    selector = f'[data-skyvern-id="{index}"]'
+                    try:
+                        el = page.locator(selector)
+                        screenshot_bytes = await el.screenshot(type="png", timeout=10000)
+                        save_path.write_bytes(screenshot_bytes)
+                        await self._log(f"  ✓ 元素截图已保存: {save_path} ({len(screenshot_bytes)} bytes)")
+                        if self._screenshot_callback and self._task_id:
+                            try:
+                                await self._screenshot_callback(self._task_id, filename)
+                            except Exception:
+                                pass
+                        return f"已截图保存元素到 {save_path}（{len(screenshot_bytes)} bytes）"
+                    except Exception as e:
+                        return f"操作失败: 元素截图失败 — {e}"
+
+                except Exception as e:
+                    return f"操作失败: save_element 失败 — {e}"
+
+            elif tool_name == "download_url":
+                url = args.get("url", "")
+                filename = args.get("filename", "download")
+
+                if not url:
+                    return "操作失败: url 参数不能为空"
+                if ".." in filename or filename.startswith("/") or "\\" in filename:
+                    return "操作失败: 文件名不合法"
+
+                save_path = self.screenshots_dir / filename
+
+                try:
+                    await self._log(f"  [download_url] 下载: {url[:150]}")
+                    resp = await page.context.request.get(url)
+                    if resp.ok:
+                        body = await resp.body()
+                        save_path.write_bytes(body)
+                        await self._log(f"  ✓ 已下载: {save_path} ({len(body)} bytes)")
+                        if self._screenshot_callback and self._task_id:
+                            try:
+                                await self._screenshot_callback(self._task_id, filename)
+                            except Exception:
+                                pass
+                        return f"已下载到 {save_path}（{len(body)} bytes）"
+                    else:
+                        return f"操作失败: HTTP {resp.status} — {url[:100]}"
+                except Exception as e:
+                    return f"操作失败: 下载失败 — {e}"
+
+            elif tool_name == "scroll_to_text":
+                text = args.get("text", "")
+                if not text:
+                    return "操作失败: text 参数不能为空"
+
+                try:
+                    # 用 JS 在整个文档中搜索文字并滚动到它
+                    found = await page.evaluate(f"""(searchText) => {{
+                        // 递归搜索所有文本节点
+                        const walker = document.createTreeWalker(
+                            document.body, NodeFilter.SHOW_TEXT, null
+                        );
+                        let node;
+                        while (node = walker.nextNode()) {{
+                            if (node.textContent && node.textContent.includes(searchText)) {{
+                                const el = node.parentElement;
+                                if (el) {{
+                                    el.scrollIntoView({{ behavior: 'smooth', block: 'center' }});
+                                    return {{
+                                        found: true,
+                                        tag: el.tagName.toLowerCase(),
+                                        text: el.textContent.trim().substring(0, 100),
+                                    }};
+                                }}
+                            }}
+                        }}
+                        return {{ found: false }};
+                    }}""", text)
+
+                    if found and found.get("found"):
+                        await asyncio.sleep(0.5)  # 等待平滑滚动完成
+                        await self._log(f"  [scroll_to_text] 找到并滚动到: {found.get('text', '')[:50]}")
+                        return f"已滚动到包含 '{text}' 的元素（{found.get('tag', '')}）"
+                    else:
+                        return f"未找到包含 '{text}' 的文字。建议：检查文字是否准确，或页面可能需要先加载更多内容。"
+
+                except Exception as e:
+                    return f"操作失败: scroll_to_text 失败 — {e}"
 
         except Exception as e:
             return f"操作失败: {e}"

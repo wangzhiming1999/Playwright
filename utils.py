@@ -374,7 +374,20 @@ def llm_call(fn: Callable[..., T], *args, max_retries: int = 3, base_delay: floa
         try:
             return fn(*args, **kwargs)
         except Exception as e:
+            # Fatal errors: don't retry auth or bad request
+            err_type = type(e).__name__
+            if err_type in ("AuthenticationError", "PermissionDeniedError"):
+                raise
+            if err_type == "BadRequestError":
+                raise
             last_exc = e
+            # Unknown errors (not API errors): retry once then raise original
+            is_api_error = err_type in (
+                "RateLimitError", "APIConnectionError", "APITimeoutError",
+                "InternalServerError", "APIStatusError",
+            )
+            if not is_api_error and attempt >= 1:
+                raise
             delay = base_delay * (2 ** attempt)
             logger.warning("LLM call error (attempt %d/%d), retrying in %.1fs: %s",
                            attempt + 1, max_retries, delay, e)

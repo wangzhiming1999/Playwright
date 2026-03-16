@@ -171,11 +171,9 @@ class TestScoreScreenshot:
         p = tmp_path / "test.png"
         Image.new("RGB", (100, 80), color=(200, 200, 200)).save(p)
 
-        with patch("curator._get_client") as mock_client:
-            mock_resp = MagicMock()
-            mock_resp.choices[0].message.content = json.dumps(_MOCK_SCORE)
-            mock_client.return_value.chat.completions.create.return_value = mock_resp
-
+        mock_resp = MagicMock()
+        mock_resp.choices[0].message.content = json.dumps(_MOCK_SCORE)
+        with patch("curator.llm_chat", return_value=mock_resp):
             result = score_screenshot(p)
 
         assert result["filename"] == "test.png"
@@ -186,11 +184,9 @@ class TestScoreScreenshot:
         p = tmp_path / "bad.png"
         Image.new("RGB", (100, 80)).save(p)
 
-        with patch("curator._get_client") as mock_client:
-            mock_resp = MagicMock()
-            mock_resp.choices[0].message.content = "not valid json at all"
-            mock_client.return_value.chat.completions.create.return_value = mock_resp
-
+        mock_resp = MagicMock()
+        mock_resp.choices[0].message.content = "not valid json at all"
+        with patch("curator.llm_chat", return_value=mock_resp):
             result = score_screenshot(p)
 
         assert result["marketing_score"] == 0
@@ -201,11 +197,9 @@ class TestScoreScreenshot:
         p = tmp_path / "fenced.png"
         Image.new("RGB", (100, 80)).save(p)
 
-        with patch("curator._get_client") as mock_client:
-            mock_resp = MagicMock()
-            mock_resp.choices[0].message.content = f"```json\n{json.dumps(_MOCK_SCORE)}\n```"
-            mock_client.return_value.chat.completions.create.return_value = mock_resp
-
+        mock_resp = MagicMock()
+        mock_resp.choices[0].message.content = f"```json\n{json.dumps(_MOCK_SCORE)}\n```"
+        with patch("curator.llm_chat", return_value=mock_resp):
             result = score_screenshot(p)
 
         assert result["marketing_score"] == 8.5

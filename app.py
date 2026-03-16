@@ -137,6 +137,13 @@ async def _broadcast(event: dict):
 async def _log_callback(task_id: str, message: str):
     if task_id not in TASKS:
         return
+    # 解析进度消息，广播为独立事件
+    if message.startswith("__PROGRESS__:"):
+        progress = message.replace("__PROGRESS__:", "")
+        current, total = progress.split("/")
+        TASKS[task_id]["progress"] = {"current": int(current), "total": int(total)}
+        await _broadcast({"type": "progress", "task_id": task_id, "current": int(current), "total": int(total)})
+        return
     TASKS[task_id]["logs"].append(message)
     await _broadcast({"type": "log", "task_id": task_id, "data": message})
 

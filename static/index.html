@@ -59,6 +59,13 @@
   .badge.failed         { background: #3a1a1a; color: #f87171; }
   .badge.waiting_input  { background: #3a2a0a; color: #fbbf24; }
 
+  /* Progress bar */
+  .progress-bar { height: 3px; background: #2d3748; border-radius: 2px; margin-top: 6px; overflow: hidden; display: none; }
+  .progress-bar.active { display: block; }
+  .progress-bar .fill { height: 100%; background: #4f6ef7; border-radius: 2px; transition: width 0.3s ease; }
+  .progress-text { font-size: 11px; color: #64748b; margin-top: 2px; display: none; }
+  .progress-text.active { display: block; }
+
   /* Ask-user question box */
   .ask-user-box {
     margin: 16px 24px; padding: 16px 20px;
@@ -334,17 +341,8 @@
         <label>任务列表（用 --- 分隔不同任务，每个任务可多行描述）</label>
         <textarea id="task-input" placeholder="打开 https://example.com&#10;截图整页保存为 a.png&#10;&#10;---&#10;&#10;打开 https://news.ycombinator.com&#10;滚动到底部并截图保存为 b.png"></textarea>
 
-        <label style="margin-top: 12px;">浏览器模式</label>
-        <select id="browser-mode" style="width: 100%; padding: 8px; background: #1e2535; border: 1px solid #2d3748; border-radius: 6px; color: #e2e8f0; font-size: 13px; margin-bottom: 8px;">
-          <option value="builtin">内置浏览器（独立环境）</option>
-          <option value="user_chrome">用户 Chrome（继承登录态）</option>
-          <option value="cdp">连接运行中的 Chrome</option>
-        </select>
-
-        <div id="cdp-settings" style="display: none; margin-bottom: 8px;">
-          <label style="font-size: 11px; color: #64748b;">CDP 地址</label>
-          <input type="text" id="cdp-url" value="http://localhost:9222" style="width: 100%; padding: 6px; background: #1e2535; border: 1px solid #2d3748; border-radius: 4px; color: #e2e8f0; font-size: 12px;">
-        </div>
+        <input type="hidden" id="browser-mode" value="user_chrome">
+        <div id="cdp-settings" style="display: none;"></div>
 
         <button id="run-btn" onclick="submitTasks()">运行</button>
       </div>
@@ -355,6 +353,12 @@
         <button class="quick-btn" onclick="fillQuick('login_no_creds')">❓ 登录（不给密码，测试 ask_user）</button>
         <button class="quick-btn" onclick="fillQuick('search')">🔍 搜索并截图结果</button>
         <button class="quick-btn" onclick="fillQuick('felo_ai')">🤖 Felo AI 简讯推文</button>
+        <button class="quick-btn" onclick="fillQuick('github_trending')">🔥 GitHub Trending 多步浏览</button>
+        <button class="quick-btn" onclick="fillQuick('wiki_multi_tab')">📚 Wikipedia 搜索 + 滚动截图</button>
+        <button class="quick-btn" onclick="fillQuick('form_fill')">📝 复杂表单填写</button>
+        <button class="quick-btn" onclick="fillQuick('scroll_and_extract')">📜 翻页浏览 + 多页截图</button>
+        <button class="quick-btn" onclick="fillQuick('multi_step_ecommerce')">🛒 电商全流程（登录→购物→结账）</button>
+        <button class="quick-btn" onclick="fillQuick('hover_and_dropdown')">🎯 下拉框 + 悬停交互</button>
       </div>
       <div class="task-list" id="task-list"></div>
     </div>
@@ -427,6 +431,10 @@ es.onmessage = (e) => {
     tasks[msg.task_id].pending_question = { question: msg.question, reason: msg.reason };
     updateTaskItem(msg.task_id);
     if (msg.task_id === activeId) refreshDetail(msg.task_id);
+  } else if (msg.type === 'progress') {
+    if (!tasks[msg.task_id]) return;
+    tasks[msg.task_id].progress = { current: msg.current, total: msg.total };
+    updateProgress(msg.task_id, msg.current, msg.total);
   } else if (msg.type === 'new_screenshot') {
     if (!tasks[msg.task_id]) return;
     if (!tasks[msg.task_id].screenshots) tasks[msg.task_id].screenshots = [];
@@ -521,7 +529,9 @@ function renderTaskItem(t) {
     <div class="task-meta">
       <span class="task-id">#${t.id}</span>
       <span class="badge ${t.status}" id="badge-${t.id}">${badgeLabel(t.status)}</span>
-    </div>`;
+    </div>
+    <div class="progress-bar ${t.status === 'running' ? 'active' : ''}" id="pbar-${t.id}"><div class="fill" id="pfill-${t.id}"></div></div>
+    <div class="progress-text ${t.status === 'running' ? 'active' : ''}" id="ptxt-${t.id}"></div>`;
   document.getElementById('task-list').prepend(div);
 }
 
@@ -529,6 +539,22 @@ function updateTaskItem(id) {
   const t = tasks[id];
   const badge = document.getElementById(`badge-${id}`);
   if (badge) { badge.className = `badge ${t.status}`; badge.innerHTML = badgeLabel(t.status); }
+  // 任务结束时隐藏进度条
+  if (t.status === 'done' || t.status === 'failed' || t.status === 'cancelled') {
+    const pbar = document.getElementById(`pbar-${id}`);
+    const ptxt = document.getElementById(`ptxt-${id}`);
+    if (pbar) pbar.classList.remove('active');
+    if (ptxt) ptxt.classList.remove('active');
+  }
+}
+
+function updateProgress(id, current, total) {
+  const pbar = document.getElementById(`pbar-${id}`);
+  const pfill = document.getElementById(`pfill-${id}`);
+  const ptxt = document.getElementById(`ptxt-${id}`);
+  if (pbar) pbar.classList.add('active');
+  if (pfill) pfill.style.width = Math.min(100, Math.round(current / total * 100)) + '%';
+  if (ptxt) { ptxt.classList.add('active'); ptxt.textContent = `步骤 ${current}/${total}`; }
 }
 
 function badgeLabel(status) {
@@ -997,6 +1023,60 @@ const QUICK_TASKS = {
   search: `打开 https://pre.felo.ai，登录，账号是 1097387898@qq.com，密码是 123456wzm，登录后在首页搜索框输入"AI 简讯"并发起搜索，等搜索结果出现后截图`,
 
   felo_ai: `打开 https://felo.ai/search（已有登录态），在输入框输入：请帮我生成一篇昨日 AI 简讯推文，风格参考宝玉(@dotey)的推文风格：简洁有力、中文为主、每条新闻一行、带 emoji 标注重点、结尾加个人点评。内容涵盖昨天最重要的 AI 行业动态，包括模型发布、研究突破、产品更新等。然后提交，等待生成完成后截图`,
+
+  github_trending: `打开 https://github.com/trending，等页面加载完成后：
+1. 先截一张当前页面的全页截图，保存为 trending_overview.png
+2. 向下滚动浏览前 5 个热门项目，记录每个项目的名称和星标数
+3. 点击第一个热门项目进入详情页
+4. 等详情页加载完成后，截图保存为 top1_detail.png
+5. 返回 trending 页面，截图确认回到了列表页`,
+
+  wiki_multi_tab: `打开 https://en.wikipedia.org，在搜索框输入"Artificial intelligence"并搜索。等搜索结果出来后：
+1. 截图搜索结果页，保存为 wiki_search.png
+2. 点击第一个搜索结果进入词条页面
+3. 向下滚动到"History"部分，截图保存为 wiki_ai_history.png
+4. 再向下滚动到页面底部的"References"部分，截图保存为 wiki_ai_refs.png`,
+
+  form_fill: `打开 https://demoqa.com/automation-practice-form，填写以下表单信息：
+- First Name: Test
+- Last Name: User
+- Email: test@example.com
+- Gender: 选择 Male
+- Mobile: 1234567890
+- Subjects: 输入 Computer Science
+- Hobbies: 勾选 Sports
+- Current Address: 输入 123 Test Street, Beijing
+填写完成后截图保存为 form_filled.png，然后点击 Submit 按钮，等弹窗出现后再截图保存为 form_submitted.png`,
+
+  scroll_and_extract: `打开 https://quotes.toscrape.com，执行以下操作：
+1. 截图首页，保存为 quotes_page1.png
+2. 向下滚动到页面底部
+3. 点击 "Next" 按钮翻到第二页
+4. 等第二页加载完成后，截图保存为 quotes_page2.png
+5. 再点击 "Next" 翻到第三页
+6. 截图保存为 quotes_page3.png`,
+
+  multi_step_ecommerce: `打开 https://www.saucedemo.com，用以下账号登录：
+- 用户名: standard_user
+- 密码: secret_sauce
+登录后：
+1. 截图商品列表页，保存为 products.png
+2. 点击排序下拉框，选择 "Price (low to high)"
+3. 截图排序后的结果，保存为 products_sorted.png
+4. 把第一个商品加入购物车（点击 Add to cart）
+5. 再把第二个商品也加入购物车
+6. 点击右上角购物车图标进入购物车页面
+7. 截图购物车，保存为 cart.png
+8. 点击 Checkout，填写信息：First Name: Test, Last Name: User, Zip: 100000
+9. 点击 Continue，截图订单总览页，保存为 checkout_overview.png`,
+
+  hover_and_dropdown: `打开 https://the-internet.herokuapp.com/dropdown，执行以下操作：
+1. 截图初始状态，保存为 dropdown_before.png
+2. 在下拉框中选择 "Option 1"，截图保存为 dropdown_opt1.png
+3. 再选择 "Option 2"，截图保存为 dropdown_opt2.png
+4. 然后打开 https://the-internet.herokuapp.com/hovers
+5. 鼠标悬停在第一个头像上，等 tooltip 出现后截图保存为 hover1.png
+6. 鼠标悬停在第二个头像上，截图保存为 hover2.png`,
 };
 
 function fillQuick(key) {

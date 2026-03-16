@@ -94,6 +94,25 @@ _ANNOTATE_JS = """() => {
             }
         } catch(e) {}
 
+        // 8. 图片和媒体元素（用于视觉定位和下载）
+        if (tag === 'img' || tag === 'video' || tag === 'audio' || tag === 'canvas') {
+            const rect = el.getBoundingClientRect();
+            // 只标注有意义的图片（面积 > 40x40，排除 icon 和 tracking pixel）
+            if (rect.width >= 40 && rect.height >= 40) return true;
+        }
+
+        // 9. 带 background-image 的 div（常见的图片容器）
+        if (tag === 'div' || tag === 'span' || tag === 'figure') {
+            try {
+                const style = window.getComputedStyle(el);
+                const bgImg = style.backgroundImage;
+                if (bgImg && bgImg !== 'none' && bgImg.startsWith('url(')) {
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width >= 60 && rect.height >= 60) return true;
+                }
+            } catch(e) {}
+        }
+
         return false;
     }
 
@@ -283,6 +302,25 @@ _ANNOTATE_JS = """() => {
             css_selector: buildSelector(el),
             xpath: buildXPath(el),
         };
+
+        // 图片/媒体元素额外属性
+        if (tag === 'img') {
+            info.src = el.src || '';
+            info.alt = el.alt || '';
+        } else if (tag === 'video' || tag === 'audio') {
+            info.src = el.src || el.currentSrc || '';
+        } else if (tag === 'canvas') {
+            info.type = 'canvas';
+        } else {
+            // 检查 background-image
+            try {
+                const bgImg = window.getComputedStyle(el).backgroundImage;
+                if (bgImg && bgImg !== 'none' && bgImg.startsWith('url(')) {
+                    info.src = bgImg.slice(5, -2).replace(/['"]/g, '');
+                    info.type = 'bg-image';
+                }
+            } catch(e) {}
+        }
 
         elements.push(info);
     });

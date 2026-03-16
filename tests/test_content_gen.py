@@ -72,19 +72,18 @@ _MOCK_REVIEW_REJECTED = {
 }
 
 
-def _mock_client(response_json):
-    mock = MagicMock()
-    mock.chat.completions.create.return_value.choices[0].message.content = (
-        json.dumps(response_json)
-    )
-    return mock
+def _mock_llm_response(response_json):
+    """Create a mock llm_chat return value with .choices[0].message.content."""
+    mock_resp = MagicMock()
+    mock_resp.choices[0].message.content = json.dumps(response_json)
+    return mock_resp
 
 
 # ── generate_ai_page ──────────────────────────────────────────────────────────
 
 class TestGenerateAiPage:
     def test_returns_hero_and_features(self):
-        with patch("content_gen._get_client", return_value=_mock_client(_MOCK_PAGE)):
+        with patch("content_gen.llm_chat", return_value=_mock_llm_response(_MOCK_PAGE)):
             result = generate_ai_page(SAMPLE_CARDS, product_context="analytics platform")
 
         assert "hero" in result
@@ -93,19 +92,17 @@ class TestGenerateAiPage:
         assert len(result["faq"]) == 3
 
     def test_handles_json_parse_error(self):
-        mock = MagicMock()
-        mock.chat.completions.create.return_value.choices[0].message.content = "not json"
-        with patch("content_gen._get_client", return_value=mock):
+        mock_resp = MagicMock()
+        mock_resp.choices[0].message.content = "not json"
+        with patch("content_gen.llm_chat", return_value=mock_resp):
             result = generate_ai_page(SAMPLE_CARDS)
 
         assert "_parse_error" in result
 
     def test_strips_markdown_fences(self):
-        mock = MagicMock()
-        mock.chat.completions.create.return_value.choices[0].message.content = (
-            f"```json\n{json.dumps(_MOCK_PAGE)}\n```"
-        )
-        with patch("content_gen._get_client", return_value=mock):
+        mock_resp = MagicMock()
+        mock_resp.choices[0].message.content = f"```json\n{json.dumps(_MOCK_PAGE)}\n```"
+        with patch("content_gen.llm_chat", return_value=mock_resp):
             result = generate_ai_page(SAMPLE_CARDS)
 
         assert "hero" in result
@@ -114,22 +111,18 @@ class TestGenerateAiPage:
     def test_passes_language_in_prompt(self):
         captured = {}
 
-        def fake_create(**kwargs):
+        def fake_llm_chat(**kwargs):
             captured["messages"] = kwargs["messages"]
-            resp = MagicMock()
-            resp.choices[0].message.content = json.dumps(_MOCK_PAGE)
-            return resp
+            return _mock_llm_response(_MOCK_PAGE)
 
-        mock = MagicMock()
-        mock.chat.completions.create.side_effect = fake_create
-        with patch("content_gen._get_client", return_value=mock):
+        with patch("content_gen.llm_chat", side_effect=fake_llm_chat):
             generate_ai_page(SAMPLE_CARDS, language="en-US")
 
         prompt = captured["messages"][0]["content"]
         assert "en-US" in prompt
 
     def test_empty_cards_still_calls_llm(self):
-        with patch("content_gen._get_client", return_value=_mock_client(_MOCK_PAGE)):
+        with patch("content_gen.llm_chat", return_value=_mock_llm_response(_MOCK_PAGE)):
             result = generate_ai_page([])
 
         assert "hero" in result
@@ -139,7 +132,7 @@ class TestGenerateAiPage:
 
 class TestGenerateTweets:
     def test_returns_tweet_fields(self):
-        with patch("content_gen._get_client", return_value=_mock_client(_MOCK_TWEETS)):
+        with patch("content_gen.llm_chat", return_value=_mock_llm_response(_MOCK_TWEETS)):
             result = generate_tweets(SAMPLE_CARDS, product_context="analytics")
 
         assert "single_tweet" in result
@@ -148,19 +141,17 @@ class TestGenerateTweets:
         assert len(result["thread"]) == 3
 
     def test_handles_parse_error(self):
-        mock = MagicMock()
-        mock.chat.completions.create.return_value.choices[0].message.content = "bad"
-        with patch("content_gen._get_client", return_value=mock):
+        mock_resp = MagicMock()
+        mock_resp.choices[0].message.content = "bad"
+        with patch("content_gen.llm_chat", return_value=mock_resp):
             result = generate_tweets(SAMPLE_CARDS)
 
         assert "_parse_error" in result
 
     def test_strips_markdown_fences(self):
-        mock = MagicMock()
-        mock.chat.completions.create.return_value.choices[0].message.content = (
-            f"```json\n{json.dumps(_MOCK_TWEETS)}\n```"
-        )
-        with patch("content_gen._get_client", return_value=mock):
+        mock_resp = MagicMock()
+        mock_resp.choices[0].message.content = f"```json\n{json.dumps(_MOCK_TWEETS)}\n```"
+        with patch("content_gen.llm_chat", return_value=mock_resp):
             result = generate_tweets(SAMPLE_CARDS)
 
         assert "single_tweet" in result
@@ -168,15 +159,11 @@ class TestGenerateTweets:
     def test_passes_language_in_prompt(self):
         captured = {}
 
-        def fake_create(**kwargs):
+        def fake_llm_chat(**kwargs):
             captured["messages"] = kwargs["messages"]
-            resp = MagicMock()
-            resp.choices[0].message.content = json.dumps(_MOCK_TWEETS)
-            return resp
+            return _mock_llm_response(_MOCK_TWEETS)
 
-        mock = MagicMock()
-        mock.chat.completions.create.side_effect = fake_create
-        with patch("content_gen._get_client", return_value=mock):
+        with patch("content_gen.llm_chat", side_effect=fake_llm_chat):
             generate_tweets(SAMPLE_CARDS, language="zh-CN")
 
         prompt = captured["messages"][0]["content"]
@@ -187,16 +174,16 @@ class TestGenerateTweets:
 
 class TestReviewCopy:
     def test_approved_result(self):
-        with patch("content_gen._get_client",
-                   return_value=_mock_client(_MOCK_REVIEW_APPROVED)):
+        with patch("content_gen.llm_chat",
+                   return_value=_mock_llm_response(_MOCK_REVIEW_APPROVED)):
             result = review_copy(SAMPLE_CARDS, _MOCK_PAGE)
 
         assert result["approved"] is True
         assert result["issues"] == []
 
     def test_rejected_result_has_issues(self):
-        with patch("content_gen._get_client",
-                   return_value=_mock_client(_MOCK_REVIEW_REJECTED)):
+        with patch("content_gen.llm_chat",
+                   return_value=_mock_llm_response(_MOCK_REVIEW_REJECTED)):
             result = review_copy(SAMPLE_CARDS, _MOCK_PAGE)
 
         assert result["approved"] is False
@@ -204,9 +191,9 @@ class TestReviewCopy:
         assert "revised_copy" in result
 
     def test_handles_parse_error(self):
-        mock = MagicMock()
-        mock.chat.completions.create.return_value.choices[0].message.content = "bad"
-        with patch("content_gen._get_client", return_value=mock):
+        mock_resp = MagicMock()
+        mock_resp.choices[0].message.content = "bad"
+        with patch("content_gen.llm_chat", return_value=mock_resp):
             result = review_copy(SAMPLE_CARDS, _MOCK_PAGE)
 
         assert result["approved"] is False

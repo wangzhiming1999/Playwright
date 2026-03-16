@@ -18,12 +18,8 @@ from .tools import TOOLS
 from .llm_helpers import _decompose_task, _verify_step, _compress_messages, _analyze_failure
 from .chrome_detector import _find_chrome_user_data_dir
 
-from utils import get_openai_client, llm_call
+from utils import llm_chat
 from page_annotator import annotate_page
-
-
-def _get_client():
-    return get_openai_client()
 
 
 async def run_agent(
@@ -131,8 +127,7 @@ async def run_agent(
             if log_callback and task_id:
                 await log_callback(task_id, msg)
 
-        client = _get_client()
-        agent = BrowserAgent(page, screenshots_dir, log_fn=_log, client=client, screenshot_callback=screenshot_callback, task_id=task_id)
+        agent = BrowserAgent(page, screenshots_dir, log_fn=_log, screenshot_callback=screenshot_callback, task_id=task_id)
 
         # 多 tab 支持：监听新页面，自动切换到最新打开的 tab
         async def _on_new_page(new_page):
@@ -162,24 +157,43 @@ async def run_agent(
                 "role": "system",
                 "content": (
                     "你是一个网页操作助手。每次我会给你当前页面的截图，用视觉理解页面，调用工具完成用户任务。\n"
-                    "核心原则：看截图判断当前状态，再决定下一步操作。\n"
-                    "基本规则：\n"
+                    "核心原则：仔细观察截图，理解页面布局和内容，再决定下一步操作。\n\n"
+                    "## 基本规则\n"
                     "1. 每次只调用一个工具\n"
-                    "2. 操作元素优先用截图中的红色 index 编号，比文字更准确\n"
-                    "3. 操作失败时换个方式重试，不要直接 done 放弃——除非连续5次都失败\n"
+                    "2. 操作元素优先用截图中的蓝色 index 编号，比文字更准确\n"
+                    "3. 操作失败时换个方式重试（换 index、用 text、滚动页面、用 find_element 视觉定位），不要直接 done 放弃——除非连续5次都失败\n"
                     "4. 任务全部完成后先截图，再调用 done\n"
-                    "5. 遇到登录页面，继续完成登录，不要放弃\n"
-                    "等待规则（重要）：\n"
-                    "  - 点击提交/搜索/发送按钮后，如果任务要求等待生成结果，必须调用 wait(wait_for_content_change=true, timeout=120)\n"
-                    "  - wait 会自动等待内容开始出现，再等内容停止变化，完成后再截图\n"
-                    "  - 普通页面跳转（登录、导航）不需要调用 wait，系统已自动处理\n"
-                    "提交规则（重要）：\n"
-                    "  - 在输入框输入内容后，必须点击提交/发送/搜索按钮，或者用 press_enter=true 提交，不能直接 done\n"
-                    "  - 提交后才能等待生成结果\n"
-                    "登录规则：\n"
-                    "  - 看到邮箱框填邮箱，看到密码框填密码，看到按钮就点\n"
-                    "  - 两步登录（先邮箱后密码）：点继续后等新截图再填密码\n"
-                    "  - 没有凭证时调用 get_credentials(site_key) 获取"
+                    "5. 遇到登录页面，继续完成登录，不要放弃\n\n"
+                    "## 查找和定位策略（重要）\n"
+                    "当任务要求找到页面上的特定内容（图片、文字、按钮等）时：\n"
+                    "1. 先仔细观察当前截图，看目标是否已经在可视区域内\n"
+                    "2. 如果目标不在当前视口，用 scroll(direction='down') 向下滚动，每次滚动后观察新截图\n"
+                    "3. 如果元素列表中没有目标元素的 index（比如图片、非交互元素），用 find_element 工具通过视觉描述定位\n"
+                    "4. 找到目标后，根据任务需求决定操作：点击、下载、截图等\n"
+                    "5. 不要在没有看到目标的情况下就放弃，先滚动整个页面搜索\n\n"
+                    "## 下载策略\n"
+                    "下载文件/图片时，按优先级尝试：\n"
+                    "1. 如果页面有明确的下载按钮/链接，用 click 或 download_file 点击它\n"
+                    "2. 如果是图片，用 find_element 定位图片，然后用 save_element 保存图片到本地\n"
+                    "3. 如果以上都不行，用 get_page_html 获取页面源码，找到图片/文件的 URL，然后用 download_url 直接下载\n"
+                    "4. 不要尝试右键另存为（浏览器自动化不支持原生右键菜单）\n\n"
+                    "## 等待规则\n"
+                    "- 点击提交/搜索/发送按钮后，如果任务要求等待生成结果，必须调用 wait(wait_for_content_change=true, timeout=120)\n"
+                    "- wait 会自动等待内容开始出现，再等内容停止变化，完成后再截图\n"
+                    "- 普通页面跳转（登录、导航）不需要调用 wait，系统已自动处理\n\n"
+                    "## 提交规则\n"
+                    "- 在输入框输入内容后，必须点击提交/发送/搜索按钮，或者用 press_enter=true 提交，不能直接 done\n"
+                    "- 提交后才能等待生成结果\n\n"
+                    "## 登录规则\n"
+                    "- 看到邮箱框填邮箱，看到密码框填密码，看到按钮就点\n"
+                    "- 两步登录（先邮箱后密码）：点继续后等新截图再填密码\n"
+                    "- 没有凭证时调用 get_credentials(site_key) 获取\n\n"
+                    "## 滚动搜索策略\n"
+                    "当需要在页面中找到特定内容时：\n"
+                    "- 先观察当前视口，如果没找到就向下滚动\n"
+                    "- 每次滚动后仔细观察新截图中是否出现了目标\n"
+                    "- 如果滚动到底部还没找到，尝试回到顶部用 find_element 搜索\n"
+                    "- 页面可能有懒加载，滚动后等待内容出现\n"
                     + _cred_hint
                 ),
             },
@@ -195,9 +209,9 @@ async def run_agent(
         last_tool_name = None
         last_tool_pressed_enter = False
 
-        # ── 任务分解 ──────────────────────────────────────────────────────────
+        # ── 任务分解 ──────────────────────────────────────────────
         await _log("  [任务分解] 正在拆解任务步骤...")
-        task_steps = _decompose_task(client, task)
+        task_steps = _decompose_task(task)
         if task_steps:
             await _log(f"  [任务分解] 共 {len(task_steps)} 步：")
             for s in task_steps:
@@ -242,6 +256,9 @@ async def run_agent(
         agent._active_requests = active_requests  # 注入到 agent，供 wait 工具使用
 
         for step in range(max_steps):
+            # 广播步骤进度（前端可解析展示进度条）
+            total_steps = len(task_steps) if task_steps else max_steps
+            await _log(f"__PROGRESS__:{step+1}/{total_steps}")
             # 步数预警：80% 时提醒 GPT 加速收尾
             if step == int(max_steps * 0.8):
                 await _log(f"  ⚠ [预警] 已执行 {step+1}/{max_steps} 步，即将达到上限")
@@ -308,12 +325,10 @@ async def run_agent(
 
             # 正常压缩：超过 24 条时压缩中间历史为摘要，保留最近 16 条
             if len(messages) > 24:
-                messages = _compress_messages(messages, client, max_history=16)
+                messages = _compress_messages(messages, max_history=16)
                 await _log(f"  [上下文] 已压缩历史，当前 {len(messages)} 条消息")
 
-            response = llm_call(
-                client.chat.completions.create,
-                model="gpt-4o",
+            response = llm_chat(
                 messages=messages,
                 tools=TOOLS,
                 tool_choice="required",
@@ -321,7 +336,7 @@ async def run_agent(
             )
 
             if not response.choices:
-                await _log("⚠️ OpenAI API 返回空 choices，终止任务")
+                await _log("⚠️ LLM API 返回空 choices，终止任务")
                 break
 
             msg = response.choices[0].message
@@ -437,9 +452,7 @@ async def run_agent(
                             )
                             bottom_hint = "第一张是完整页面截图，第二张是页面底部截图。请同时检查底部是否有未完成的内容。\n"
 
-                        verify_resp = llm_call(
-                            client.chat.completions.create,
-                            model="gpt-4o",
+                        verify_resp = llm_chat(
                             messages=[{
                                 "role": "user",
                                 "content": [
@@ -559,7 +572,7 @@ async def run_agent(
             if is_failure:
                 fail_count += 1
                 await _log(f"  [失败计数] {fail_count}/5 — {result[:80]}")
-                advice = _analyze_failure(client, tool_name, tool_args, result)
+                advice = _analyze_failure(tool_name, tool_args, result)
                 if advice:
                     result += f"\n[建议] {advice}"
                     await _log(f"  [重试建议] {advice}")

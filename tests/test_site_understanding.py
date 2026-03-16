@@ -106,16 +106,15 @@ _MOCK_SITE = {
 }
 
 
-class TestAnalyzeSite:
-    def _mock_client(self, response_json):
-        mock = MagicMock()
-        mock.chat.completions.create.return_value.choices[0].message.content = (
-            json.dumps(response_json)
-        )
-        return mock
+def _mock_llm_response(response_json):
+    mock_resp = MagicMock()
+    mock_resp.choices[0].message.content = json.dumps(response_json)
+    return mock_resp
 
+
+class TestAnalyzeSite:
     def test_returns_structured_result(self):
-        with patch("site_understanding._get_client", return_value=self._mock_client(_MOCK_SITE)):
+        with patch("site_understanding.llm_chat", return_value=_mock_llm_response(_MOCK_SITE)):
             result = analyze_site("https://example.com", "<html><nav>Dashboard</nav></html>")
 
         assert result["site_category"] == "B2B SaaS"
@@ -124,15 +123,15 @@ class TestAnalyzeSite:
         assert len(result["candidate_feature_pages"]) == 2
 
     def test_attaches_analyzed_url(self):
-        with patch("site_understanding._get_client", return_value=self._mock_client(_MOCK_SITE)):
+        with patch("site_understanding.llm_chat", return_value=_mock_llm_response(_MOCK_SITE)):
             result = analyze_site("https://myapp.io", "<html></html>")
 
         assert result["analyzed_url"] == "https://myapp.io"
 
     def test_handles_json_parse_error(self):
-        mock = MagicMock()
-        mock.chat.completions.create.return_value.choices[0].message.content = "not json"
-        with patch("site_understanding._get_client", return_value=mock):
+        mock_resp = MagicMock()
+        mock_resp.choices[0].message.content = "not json"
+        with patch("site_understanding.llm_chat", return_value=mock_resp):
             result = analyze_site("https://example.com", "<html></html>")
 
         assert result["site_category"] == "unknown"
@@ -140,11 +139,9 @@ class TestAnalyzeSite:
         assert "_parse_error" in result
 
     def test_strips_markdown_fences(self):
-        mock = MagicMock()
-        mock.chat.completions.create.return_value.choices[0].message.content = (
-            f"```json\n{json.dumps(_MOCK_SITE)}\n```"
-        )
-        with patch("site_understanding._get_client", return_value=mock):
+        mock_resp = MagicMock()
+        mock_resp.choices[0].message.content = f"```json\n{json.dumps(_MOCK_SITE)}\n```"
+        with patch("site_understanding.llm_chat", return_value=mock_resp):
             result = analyze_site("https://example.com", "<html></html>")
 
         assert result["site_category"] == "B2B SaaS"
@@ -152,15 +149,11 @@ class TestAnalyzeSite:
     def test_accepts_product_context(self):
         captured = {}
 
-        def fake_create(**kwargs):
-            captured["messages"] = kwargs.get("messages", [])
-            resp = MagicMock()
-            resp.choices[0].message.content = json.dumps(_MOCK_SITE)
-            return resp
+        def fake_llm_chat(**kwargs):
+            captured["messages"] = kwargs["messages"]
+            return _mock_llm_response(_MOCK_SITE)
 
-        mock = MagicMock()
-        mock.chat.completions.create.side_effect = fake_create
-        with patch("site_understanding._get_client", return_value=mock):
+        with patch("site_understanding.llm_chat", side_effect=fake_llm_chat):
             analyze_site("https://example.com", "<html></html>",
                          product_context="AI analytics for e-commerce")
 
@@ -180,16 +173,9 @@ _MOCK_PAGE_SCORE = {
 
 
 class TestScorePage:
-    def _mock_client(self, response_json):
-        mock = MagicMock()
-        mock.chat.completions.create.return_value.choices[0].message.content = (
-            json.dumps(response_json)
-        )
-        return mock
-
     def test_returns_score_dict(self):
-        with patch("site_understanding._get_client",
-                   return_value=self._mock_client(_MOCK_PAGE_SCORE)):
+        with patch("site_understanding.llm_chat",
+                   return_value=_mock_llm_response(_MOCK_PAGE_SCORE)):
             result = score_page("https://app.io/dashboard", "<html></html>", "base64img")
 
         assert result["marketing_score"] == 7.5
@@ -197,9 +183,9 @@ class TestScorePage:
         assert result["page_type"] == "analytics"
 
     def test_handles_parse_error(self):
-        mock = MagicMock()
-        mock.chat.completions.create.return_value.choices[0].message.content = "bad"
-        with patch("site_understanding._get_client", return_value=mock):
+        mock_resp = MagicMock()
+        mock_resp.choices[0].message.content = "bad"
+        with patch("site_understanding.llm_chat", return_value=mock_resp):
             result = score_page("https://x.com", "<html></html>", "img")
 
         assert result["marketing_score"] == 0
@@ -207,8 +193,7 @@ class TestScorePage:
 
     def test_low_score_page_not_worth_screenshot(self):
         low = {**_MOCK_PAGE_SCORE, "marketing_score": 2.0, "is_worth_screenshot": False}
-        with patch("site_understanding._get_client",
-                   return_value=self._mock_client(low)):
+        with patch("site_understanding.llm_chat", return_value=_mock_llm_response(low)):
             result = score_page("https://app.io/settings", "<html></html>", "img")
 
         assert result["is_worth_screenshot"] is False

@@ -65,12 +65,12 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "scroll",
-            "description": "滚动页面",
+            "description": "滚动页面。支持上下滚动、滚动到顶部/底部。如果滚动后返回'已到达底部'，说明页面已经没有更多内容了。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "direction": {"type": "string", "enum": ["down", "up"], "description": "滚动方向"},
-                    "amount": {"type": "integer", "description": "滚动像素数，默认 500"},
+                    "direction": {"type": "string", "enum": ["down", "up", "top", "bottom"], "description": "滚动方向：down/up 按像素滚动，top/bottom 直接跳到顶部/底部"},
+                    "amount": {"type": "integer", "description": "滚动像素数，默认 500，仅 down/up 时有效"},
                 },
                 "required": ["direction"],
             },
@@ -291,6 +291,77 @@ TOOLS = [
                     "site_key": {"type": "string", "description": "站点标识，如 github、google，对应环境变量 GITHUB_TOTP_SECRET"},
                 },
                 "required": ["site_key"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_element",
+            "description": (
+                "通过视觉描述在页面中定位元素（图片、文字、图标等）。"
+                "当元素列表中没有目标元素的 index 时使用。"
+                "返回元素的坐标和相关信息（如图片 src）。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "description": {"type": "string", "description": "要找的元素的视觉描述，如'无敌小乌龟图片'、'红色的下载按钮'、'页面底部的版权信息'"},
+                    "element_type": {"type": "string", "enum": ["image", "text", "button", "link", "any"], "description": "元素类型，帮助缩小搜索范围"},
+                },
+                "required": ["description"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "save_element",
+            "description": (
+                "保存页面上的元素（图片、canvas 等）到本地文件。"
+                "用 index 定位元素，自动获取图片 src 并下载，或对 canvas 截图保存。"
+                "适用于保存页面中的图片、截取特定区域等场景。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "index": {"type": "integer", "description": "截图中元素的编号（蓝色数字标签）"},
+                    "filename": {"type": "string", "description": "保存的文件名，如 turtle.png"},
+                },
+                "required": ["index", "filename"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "download_url",
+            "description": (
+                "直接通过 URL 下载文件到本地。"
+                "适用于已知文件 URL 的场景（从 get_page_html 或元素 src 属性获取）。"
+                "会继承当前页面的 cookies 和 headers。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "文件的完整 URL"},
+                    "filename": {"type": "string", "description": "保存的文件名，如 image.png"},
+                },
+                "required": ["url", "filename"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "scroll_to_text",
+            "description": "滚动页面直到找到包含指定文字的元素，并将其滚动到视口中央。找不到时返回失败。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "要查找的文字内容（模糊匹配）"},
+                },
+                "required": ["text"],
             },
         },
     },
