@@ -101,6 +101,22 @@ _SSE_LOCK = asyncio.Lock()  # 保护 _SSE_CLIENTS 并发修改
 _PENDING_QUESTIONS: dict[str, dict] = {}
 _PENDING_LOCK = threading.Lock()  # 保护 _PENDING_QUESTIONS 跨线程访问
 
+# 任务取消信号
+_CANCEL_EVENTS: dict[str, threading.Event] = {}
+
+
+async def _send_webhook(webhook_url: str, payload: dict):
+    """异步 POST webhook 回调，失败静默（不影响主流程）"""
+    if not webhook_url:
+        return
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(webhook_url, json=payload)
+            print(f"[webhook] POST {webhook_url} → {resp.status_code}")
+    except Exception as e:
+        print(f"[webhook] POST {webhook_url} failed: {e}", file=sys.stderr)
+
 
 async def _broadcast(event: dict):
     data = json.dumps(event, ensure_ascii=False)
@@ -231,30 +247,82 @@ async def _run_task(task_id: str, task: str):
     save_task(TASKS[task_id])
     await _broadcast({"type": "status", "task_id": task_id, "data": "running"})
 
+    webhook_url = TASKS[task_id].get("webhook_url", "")
+    timeout_sec = TASKS[task_id].get("timeout", 0)
+
+    # 注册取消信号
+    cancel_event = threading.Event()
+    _CANCEL_EVENTS[task_id] = cancel_event
+
     main_loop = asyncio.get_running_loop()
+    final_status = "failed"
     try:
-        ok, result = await asyncio.get_event_loop().run_in_executor(
+        future = asyncio.get_event_loop().run_in_executor(
             _agent_executor,
             _run_agent_in_thread,
             task_id,
             task,
             main_loop,
         )
+
+        # 超时控制
+        if timeout_sec > 0:
+            try:
+                ok, result = await asyncio.wait_for(future, timeout=timeout_sec)
+            except asyncio.TimeoutError:
+                TASKS[task_id]["status"] = "failed"
+                TASKS[task_id]["logs"].append(f"ERROR: 任务超时（{timeout_sec}秒）")
+                save_task(TASKS[task_id])
+                await _broadcast({"type": "status", "task_id": task_id, "data": "failed"})
+                await _send_webhook(webhook_url, {
+                    "task_id": task_id, "status": "failed",
+                    "reason": f"timeout ({timeout_sec}s)", "task": task,
+                })
+                return
+        else:
+            ok, result = await future
+
+        # 检查是否被取消
+        if cancel_event.is_set():
+            TASKS[task_id]["status"] = "cancelled"
+            TASKS[task_id]["logs"].append("任务已被用户取消")
+            save_task(TASKS[task_id])
+            await _broadcast({"type": "status", "task_id": task_id, "data": "cancelled"})
+            await _send_webhook(webhook_url, {
+                "task_id": task_id, "status": "cancelled", "task": task,
+            })
+            return
+
         if ok:
             TASKS[task_id]["screenshots"] = result
             TASKS[task_id]["status"] = "done"
+            final_status = "done"
             save_task(TASKS[task_id])
             await _broadcast({"type": "status", "task_id": task_id, "data": "done", "screenshots": result})
+            await _send_webhook(webhook_url, {
+                "task_id": task_id, "status": "done", "task": task,
+                "screenshots": result,
+            })
         else:
             TASKS[task_id]["status"] = "failed"
             TASKS[task_id]["logs"].append(f"ERROR: {result}")
             save_task(TASKS[task_id])
             await _broadcast({"type": "status", "task_id": task_id, "data": "failed"})
+            await _send_webhook(webhook_url, {
+                "task_id": task_id, "status": "failed",
+                "reason": str(result)[:500], "task": task,
+            })
     except Exception as e:
         TASKS[task_id]["status"] = "failed"
         TASKS[task_id]["logs"].append(f"ERROR: {e}")
         save_task(TASKS[task_id])
         await _broadcast({"type": "status", "task_id": task_id, "data": "failed"})
+        await _send_webhook(webhook_url, {
+            "task_id": task_id, "status": "failed",
+            "reason": str(e)[:500], "task": task,
+        })
+    finally:
+        _CANCEL_EVENTS.pop(task_id, None)
 
 
 # ── API endpoints ─────────────────────────────────────────────────────────────
@@ -264,6 +332,8 @@ class RunRequest(BaseModel):
     browser_mode: str = "builtin"   # "builtin" | "user_chrome" | "cdp"
     cdp_url: str = "http://localhost:9222"
     chrome_profile: str = "Default"
+    webhook_url: str = ""           # 任务完成/失败时 POST 回调
+    timeout: int = 0                # 单任务超时秒数，0 表示不限
 
 
 @app.get("/")
@@ -303,6 +373,8 @@ async def submit_tasks(req: RunRequest, background_tasks: BackgroundTasks, _: No
             "browser_mode": req.browser_mode,
             "cdp_url": req.cdp_url,
             "chrome_profile": req.chrome_profile,
+            "webhook_url": req.webhook_url,
+            "timeout": req.timeout,
             "created_at": time.time(),
         }
         save_task(TASKS[tid])
@@ -324,6 +396,36 @@ async def submit_tasks(req: RunRequest, background_tasks: BackgroundTasks, _: No
 @app.get("/tasks")
 def list_tasks():
     return list(TASKS.values())
+
+
+@app.post("/tasks/{task_id}/cancel")
+async def cancel_task(task_id: str, _: None = Depends(_verify_api_key)):
+    """取消运行中的任务"""
+    if task_id not in TASKS:
+        raise HTTPException(status_code=404, detail="task not found")
+    status = TASKS[task_id]["status"]
+    if status in ("done", "failed", "cancelled"):
+        raise HTTPException(status_code=400, detail=f"task already {status}")
+
+    # 设置取消信号
+    cancel_ev = _CANCEL_EVENTS.get(task_id)
+    if cancel_ev:
+        cancel_ev.set()
+
+    # 如果还在 pending 状态（未开始执行），直接标记取消
+    if status == "pending":
+        TASKS[task_id]["status"] = "cancelled"
+        TASKS[task_id]["logs"].append("任务已被用户取消（未开始执行）")
+        save_task(TASKS[task_id])
+        await _broadcast({"type": "status", "task_id": task_id, "data": "cancelled"})
+        webhook_url = TASKS[task_id].get("webhook_url", "")
+        if webhook_url:
+            await _send_webhook(webhook_url, {
+                "task_id": task_id, "status": "cancelled",
+                "task": TASKS[task_id].get("task", ""),
+            })
+
+    return {"ok": True, "task_id": task_id, "message": "cancel signal sent"}
 
 
 # NOTE: /tasks/stream must be defined BEFORE /tasks/{task_id} to avoid route conflict
