@@ -211,4 +211,51 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "upload_file",
+            "description": "上传文件到 input[type=file] 元素。先用 index 定位文件上传按钮，再指定本地文件路径。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "index": {"type": "integer", "description": "截图中文件上传元素的编号"},
+                    "file_path": {"type": "string", "description": "本地文件的绝对路径，如 C:/Users/xxx/photo.jpg"},
+                },
+                "required": ["file_path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "download_file",
+            "description": "点击下载链接/按钮并等待下载完成。返回下载文件的路径。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "index": {"type": "integer", "description": "截图中下载按钮/链接的编号"},
+                    "text": {"type": "string", "description": "下载按钮的可见文字，当不确定 index 时使用"},
+                    "timeout": {"type": "integer", "description": "等待下载完成的超时秒数，默认 30"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "drag_drop",
+            "description": "拖拽操作：从一个元素拖到另一个元素或指定坐标",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "from_index": {"type": "integer", "description": "拖拽起点元素的编号"},
+                    "to_index": {"type": "integer", "description": "拖拽终点元素的编号"},
+                    "to_x": {"type": "integer", "description": "终点 X 坐标（当没有 to_index 时使用）"},
+                    "to_y": {"type": "integer", "description": "终点 Y 坐标（当没有 to_index 时使用）"},
+                },
+                "required": ["from_index"],
+            },
+        },
+    },
 ]

@@ -723,6 +723,137 @@ class BrowserAgent:
                     return "操作失败: question 参数不能为空"
                 return f"__ASK_USER__:{question}::{reason}"
 
+            elif tool_name == "upload_file":
+                file_path = args.get("file_path", "")
+                index = args.get("index")
+
+                if not file_path:
+                    return "操作失败: file_path 参数不能为空"
+
+                # 验证文件存在
+                from pathlib import Path
+                file_obj = Path(file_path)
+                if not file_obj.exists():
+                    return f"操作失败: 文件不存在 — {file_path}"
+                if not file_obj.is_file():
+                    return f"操作失败: 路径不是文件 — {file_path}"
+
+                # 定位文件上传元素
+                if index is not None:
+                    try:
+                        el_info = await get_element_coords(page, index)
+                        if not el_info:
+                            return f"操作失败: index={index} 定位失败"
+                        method = el_info.get("method", "skyvern-id")
+                        await self._log(f"  [上传] #{index} method={method} file={file_obj.name}")
+                    except Exception as e:
+                        return f"操作失败: 定位上传元素失败 — {e}"
+
+                # 使用 Playwright 的 set_input_files
+                try:
+                    selector = f'[data-skyvern-id="{index}"]' if index is not None else 'input[type="file"]'
+                    await page.set_input_files(selector, str(file_obj.absolute()), timeout=10000)
+                    await _wait_for_page_ready(page, log_fn=self._log, timeout_ms=5000, check_network=True, active_requests=self._active_requests)
+                    return f"已上传文件: {file_obj.name}"
+                except Exception as e:
+                    return f"操作失败: 上传文件失败 — {e}"
+
+            elif tool_name == "download_file":
+                index = args.get("index")
+                text = args.get("text")
+                timeout_sec = args.get("timeout", 30)
+
+                # 启动下载监听
+                download_info = {"download": None, "path": None}
+
+                async def handle_download(download):
+                    download_info["download"] = download
+                    try:
+                        # 等待下载完成
+                        path = await download.path()
+                        download_info["path"] = str(path)
+                        await self._log(f"  [下载] 完成: {download.suggested_filename} → {path}")
+                    except Exception as e:
+                        await self._log(f"  [下载] 失败: {e}")
+
+                page.once("download", handle_download)
+
+                # 点击下载按钮
+                if index is not None:
+                    try:
+                        el_info = await get_element_coords(page, index)
+                        if el_info:
+                            x, y = el_info["x"], el_info["y"]
+                            method = el_info.get("method", "skyvern-id")
+                            await self._log(f"  [下载] 点击 #{index} method={method}")
+                            await page.mouse.click(x, y)
+                        elif not text:
+                            return f"操作失败: index={index} 定位失败且未提供 text"
+                    except Exception as e:
+                        if not text:
+                            return f"操作失败: {e}"
+
+                if text and not download_info["download"]:
+                    try:
+                        el = page.get_by_text(text, exact=False).first
+                        await el.click(timeout=10000)
+                    except Exception as e:
+                        return f"操作失败: 点击下载按钮失败 — {e}"
+
+                # 等待下载完成
+                try:
+                    for _ in range(timeout_sec * 2):  # 每 0.5 秒检查一次
+                        if download_info["path"]:
+                            return f"下载完成: {download_info['path']}"
+                        await asyncio.sleep(0.5)
+                    return f"操作失败: 下载超时（{timeout_sec}秒）"
+                except Exception as e:
+                    return f"操作失败: 等待下载失败 — {e}"
+
+            elif tool_name == "drag_drop":
+                from_index = args.get("from_index")
+                to_index = args.get("to_index")
+                to_x = args.get("to_x")
+                to_y = args.get("to_y")
+
+                if from_index is None:
+                    return "操作失败: 需要提供 from_index 参数"
+
+                # 定位起点
+                try:
+                    from_info = await get_element_coords(page, from_index)
+                    if not from_info:
+                        return f"操作失败: from_index={from_index} 定位失败"
+                    from_x, from_y = from_info["x"], from_info["y"]
+                except Exception as e:
+                    return f"操作失败: 定位起点失败 — {e}"
+
+                # 定位终点
+                if to_index is not None:
+                    try:
+                        to_info = await get_element_coords(page, to_index)
+                        if not to_info:
+                            return f"操作失败: to_index={to_index} 定位失败"
+                        to_x, to_y = to_info["x"], to_info["y"]
+                    except Exception as e:
+                        return f"操作失败: 定位终点失败 — {e}"
+                elif to_x is None or to_y is None:
+                    return "操作失败: 需要提供 to_index 或 (to_x, to_y)"
+
+                # 执行拖拽
+                try:
+                    await self._log(f"  [拖拽] ({from_x}, {from_y}) → ({to_x}, {to_y})")
+                    await page.mouse.move(from_x, from_y)
+                    await page.mouse.down()
+                    await asyncio.sleep(0.1)
+                    await page.mouse.move(to_x, to_y, steps=10)
+                    await asyncio.sleep(0.1)
+                    await page.mouse.up()
+                    await _wait_for_page_ready(page, log_fn=self._log, timeout_ms=3000, check_network=False)
+                    return f"拖拽完成: ({from_x}, {from_y}) → ({to_x}, {to_y})"
+                except Exception as e:
+                    return f"操作失败: 拖拽失败 — {e}"
+
         except Exception as e:
             return f"操作失败: {e}"
 
