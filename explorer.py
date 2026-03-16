@@ -27,7 +27,7 @@ from playwright.async_api import async_playwright, Page, BrowserContext
 load_dotenv()
 
 from site_understanding import analyze_site
-from utils import get_openai_client
+from utils import llm_chat
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -100,9 +100,7 @@ async def _close_popups(page: Page):
         try:
             data = await page.screenshot(type="jpeg", quality=50)
             img_b64 = base64.b64encode(data).decode()
-            client = get_openai_client()
-            resp = client.chat.completions.create(
-                model="gpt-4o",
+            resp = llm_chat(
                 messages=[{
                     "role": "user",
                     "content": [

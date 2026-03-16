@@ -15,7 +15,7 @@ from pathlib import Path
 import imagehash
 from PIL import Image, ImageFilter
 
-from utils import llm_call, get_openai_client
+from utils import llm_chat
 
 
 # ── Sensitive info patterns ───────────────────────────────────────────────────
@@ -111,8 +111,6 @@ Respond ONLY with valid JSON, no markdown fences."""
 
 def score_screenshot(image_path: Path, product_context: str = "") -> dict:
     """Call VLM to score and generate asset card for a single screenshot."""
-    client = get_openai_client()
-
     with open(image_path, "rb") as f:
         b64 = base64.b64encode(f.read()).decode()
 
@@ -123,9 +121,7 @@ def score_screenshot(image_path: Path, product_context: str = "") -> dict:
     if product_context:
         prompt = f"Product context: {product_context}\n\n{_SCORE_PROMPT}"
 
-    response = llm_call(
-        client.chat.completions.create,
-        model="gpt-4o",
+    response = llm_chat(
         messages=[
             {
                 "role": "user",
@@ -139,7 +135,6 @@ def score_screenshot(image_path: Path, product_context: str = "") -> dict:
             }
         ],
         max_tokens=600,
-        temperature=0.2,
     )
 
     raw = response.choices[0].message.content.strip()

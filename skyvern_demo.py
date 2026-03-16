@@ -21,17 +21,13 @@ if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
         pass
 
 from dotenv import load_dotenv
-from openai import OpenAI
 from playwright.async_api import async_playwright, Page
-from utils import get_openai_client
+from utils import llm_chat
 
 load_dotenv()
 
 
 # ── AI-native page helpers (Skyvern-style interface) ──────────────────────────
-
-def _get_client():
-    return get_openai_client()
 
 
 async def _screenshot_b64(page: Page) -> str:
@@ -46,9 +42,7 @@ async def ai_extract(page: Page, prompt: str, schema: dict = None) -> dict:
     """
     img = await _screenshot_b64(page)
     schema_hint = f"\n返回 JSON，字段: {list(schema.keys())}" if schema else "\n返回 JSON"
-    client = _get_client()
-    resp = client.chat.completions.create(
-        model="gpt-4o",
+    resp = llm_chat(
         messages=[{
             "role": "user",
             "content": [
@@ -71,9 +65,7 @@ async def ai_act(page: Page, prompt: str) -> str:
     截图 + 让 GPT 决定点哪里/输什么，返回 JS 操作
     """
     img = await _screenshot_b64(page)
-    client = _get_client()
-    resp = client.chat.completions.create(
-        model="gpt-4o",
+    resp = llm_chat(
         messages=[{
             "role": "user",
             "content": [
@@ -119,9 +111,7 @@ async def ai_validate(page: Page, prompt: str) -> bool:
     截图 + 让 GPT 判断页面状态，返回 True/False
     """
     img = await _screenshot_b64(page)
-    client = _get_client()
-    resp = client.chat.completions.create(
-        model="gpt-4o",
+    resp = llm_chat(
         messages=[{
             "role": "user",
             "content": [

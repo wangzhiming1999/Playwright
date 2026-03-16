@@ -10,9 +10,7 @@ import os
 import re
 from pathlib import Path
 
-from openai import OpenAI
-
-from utils import llm_call, get_openai_client
+from utils import llm_chat
 
 
 # ── DOM summarizer ────────────────────────────────────────────────────────────
@@ -82,7 +80,7 @@ def analyze_site(
     Analyze a website's homepage to build a site understanding graph.
     Returns structured dict with nav, candidate pages, and exploration strategy.
     """
-    client = get_openai_client()
+    client = None  # no longer needed
 
     nav_summary = extract_nav_summary(html)
     page_text = extract_page_text(html)
@@ -102,12 +100,9 @@ def analyze_site(
             "image_url": {"url": f"data:image/jpeg;base64,{screenshot_b64}", "detail": "low"},
         })
 
-    response = llm_call(
-        client.chat.completions.create,
-        model="gpt-4o",
+    response = llm_chat(
         messages=[{"role": "user", "content": content}],
         max_tokens=1200,
-        temperature=0.2,
     )
 
     raw = response.choices[0].message.content.strip()
@@ -147,17 +142,13 @@ Respond ONLY with valid JSON, no markdown fences."""
 
 def score_page(url: str, html: str, screenshot_b64: str, product_context: str = "") -> dict:
     """Score a visited page for marketing value during exploration."""
-    client = get_openai_client()
-
     page_text = extract_page_text(html, max_chars=1500)
     prompt = f"URL: {url}\n"
     if product_context:
         prompt += f"Product: {product_context}\n"
     prompt += f"Page text: {page_text}\n\n{_PAGE_SCORE_PROMPT}"
 
-    response = llm_call(
-        client.chat.completions.create,
-        model="gpt-4o",
+    response = llm_chat(
         messages=[{
             "role": "user",
             "content": [
@@ -169,7 +160,6 @@ def score_page(url: str, html: str, screenshot_b64: str, product_context: str = 
             ],
         }],
         max_tokens=400,
-        temperature=0.2,
     )
 
     raw = response.choices[0].message.content.strip()

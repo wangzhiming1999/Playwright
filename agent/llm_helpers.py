@@ -5,7 +5,7 @@ import re
 from json_repair import repair_json
 
 from .page_utils import _safe_print
-from utils import llm_call
+from utils import llm_chat
 
 
 # ── JSON 容错解析 ─────────────────────────────────────────────────────────────
@@ -146,7 +146,7 @@ def trim_elements(elements: list[dict], max_tokens: int = _MAX_ELEMENTS_TOKENS) 
 
 # ── 任务分解 ──────────────────────────────────────────────────────────────────
 
-def _decompose_task(client, task: str) -> list[dict]:
+def _decompose_task(task: str) -> list[dict]:
     """
     执行前把用户任务拆成有序步骤列表。
     每个步骤包含：
@@ -156,9 +156,7 @@ def _decompose_task(client, task: str) -> list[dict]:
       - done_signal: 判断这步完成的关键特征（页面上能看到什么）
     """
     try:
-        resp = llm_call(
-            client.chat.completions.create,
-            model="gpt-4o",
+        resp = llm_chat(
             messages=[{
                 "role": "user",
                 "content": (
@@ -195,16 +193,15 @@ def _decompose_task(client, task: str) -> list[dict]:
 
 # ── 预期验证 ──────────────────────────────────────────────────────────────────
 
-async def _verify_step(client, page, expected: str, done_signal: str) -> tuple[bool, str]:
+async def _verify_step(page, expected: str, done_signal: str) -> tuple[bool, str]:
     """
-    操作后截图，让 GPT 判断是否符合预期。
+    操作后截图，让 AI 判断是否符合预期。
     返回 (是否成功, 实际观察到的情况描述)
     """
     try:
         data = await page.screenshot(type="jpeg", quality=70)
         img_b64 = base64.b64encode(data).decode()
-        resp = client.chat.completions.create(
-            model="gpt-4o",
+        resp = llm_chat(
             messages=[{
                 "role": "user",
                 "content": [
@@ -236,14 +233,14 @@ async def _verify_step(client, page, expected: str, done_signal: str) -> tuple[b
 
 # ── 上下文压缩 ────────────────────────────────────────────────────────────────
 
-def _compress_messages(messages: list, client, max_history: int = 16) -> list:
+def _compress_messages(messages: list, max_history: int = 16) -> list:
     """
     消息超出限制时，把中间的历史压缩成一条摘要，保留：
     - messages[0]: system prompt
     - messages[1]: 原始任务
     - 一条压缩摘要（assistant role）
     - 最近 max_history 条消息
-    这样 GPT 不会忘记之前做了什么，同时不会撑爆 context。
+    这样 AI 不会忘记之前做了什么，同时不会撑爆 context。
     """
     if len(messages) <= max_history + 2:
         return messages
@@ -269,8 +266,8 @@ def _compress_messages(messages: list, client, max_history: int = 16) -> list:
         return messages[:2] + messages[-max_history:]
 
     try:
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
+        resp = llm_chat(
+            model="mini",
             messages=[{
                 "role": "user",
                 "content": (
@@ -297,14 +294,14 @@ def _compress_messages(messages: list, client, max_history: int = 16) -> list:
 
 # ── 智能重试分析 ──────────────────────────────────────────────────────────────
 
-def _analyze_failure(client, tool_name: str, tool_args: dict, error_result: str) -> str:
+def _analyze_failure(tool_name: str, tool_args: dict, error_result: str) -> str:
     """
-    操作失败时，用 GPT 分析失败原因并给出下一步建议，
-    注入到下一轮的 tool result 里，引导 GPT 换策略。
+    操作失败时，用 AI 分析失败原因并给出下一步建议，
+    注入到下一轮的 tool result 里，引导 AI 换策略。
     """
     try:
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
+        resp = llm_chat(
+            model="mini",
             messages=[{
                 "role": "user",
                 "content": (

@@ -12,7 +12,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright
 from page_annotator import annotate_page
-from utils import get_openai_client, llm_call
+from utils import llm_chat
 
 from .page_utils import _safe_print, _wait_for_page_ready
 from .core import BrowserAgent
@@ -198,7 +198,7 @@ async def run_agent(
             if log_callback and task_id:
                 await log_callback(task_id, msg)
 
-        client = get_openai_client()
+        client = None  # no longer needed, llm_chat() manages its own client
         agent = BrowserAgent(page, screenshots_dir, log_fn=_log, client=client, screenshot_callback=screenshot_callback, task_id=task_id)
 
         async def _on_new_page(new_page):
@@ -254,7 +254,7 @@ async def run_agent(
 
         # 任务分解
         await _log("  [任务分解] 正在拆解任务步骤...")
-        task_steps = _decompose_task(client, task)
+        task_steps = _decompose_task(task)
         if task_steps:
             await _log(f"  [任务分解] 共 {len(task_steps)} 步：")
             for s in task_steps:
@@ -356,12 +356,10 @@ async def run_agent(
                 messages = [messages[0]] + messages[-20:]
 
             if len(messages) > 24:
-                messages = _compress_messages(messages, client, max_history=16)
+                messages = _compress_messages(messages, max_history=16)
                 await _log(f"  [上下文] 已压缩历史，当前 {len(messages)} 条消息")
 
-            response = llm_call(
-                client.chat.completions.create,
-                model="gpt-4o",
+            response = llm_chat(
                 messages=messages,
                 tools=TOOLS,
                 tool_choice="required",
@@ -369,7 +367,7 @@ async def run_agent(
             )
 
             if not response.choices:
-                await _log("⚠️ OpenAI API 返回空 choices，终止任务")
+                await _log("⚠️ LLM API 返回空 choices，终止任务")
                 break
 
             msg = response.choices[0].message
@@ -478,9 +476,7 @@ async def run_agent(
                             )
                             bottom_hint = "第一张是完整页面截图，第二张是页面底部截图。请同时检查底部是否有未完成的内容。\n"
 
-                        verify_resp = llm_call(
-                            client.chat.completions.create,
-                            model="gpt-4o",
+                        verify_resp = llm_chat(
                             messages=[{
                                 "role": "user",
                                 "content": [
@@ -599,7 +595,7 @@ async def run_agent(
             if is_failure:
                 fail_count += 1
                 await _log(f"  [失败计数] {fail_count}/5 — {result[:80]}")
-                advice = _analyze_failure(client, tool_name, tool_args, result)
+                advice = _analyze_failure(tool_name, tool_args, result)
                 if advice:
                     result += f"\n[建议] {advice}"
                     await _log(f"  [重试建议] {advice}")

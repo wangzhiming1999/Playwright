@@ -10,7 +10,7 @@ import json
 import os
 import re
 
-from utils import llm_call, get_openai_client
+from utils import llm_chat
 
 
 # ── AI Page generation ────────────────────────────────────────────────────────
@@ -61,17 +61,13 @@ def generate_ai_page(
     language: str = "zh-CN",
     tone: str = "professional",
 ) -> dict:
-    client = get_openai_client()
     cards_summary = _build_cards_summary(cards)
     prompt = _PAGE_PROMPT.format(language=language, tone=tone)
     user_content = f"Product: {product_context}\n\nFeature cards:\n{cards_summary}\n\n{prompt}"
 
-    response = llm_call(
-        client.chat.completions.create,
-        model="gpt-4o",
+    response = llm_chat(
         messages=[{"role": "user", "content": user_content}],
         max_tokens=1500,
-        temperature=0.4,
     )
     raw = response.choices[0].message.content.strip()
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
@@ -87,17 +83,13 @@ def generate_tweets(
     product_context: str = "",
     language: str = "zh-CN",
 ) -> dict:
-    client = get_openai_client()
     cards_summary = _build_cards_summary(cards)
     prompt = _TWEET_PROMPT.format(language=language)
     user_content = f"Product: {product_context}\n\nFeature cards:\n{cards_summary}\n\n{prompt}"
 
-    response = llm_call(
-        client.chat.completions.create,
-        model="gpt-4o",
+    response = llm_chat(
         messages=[{"role": "user", "content": user_content}],
         max_tokens=1000,
-        temperature=0.6,
     )
     raw = response.choices[0].message.content.strip()
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
@@ -127,17 +119,13 @@ Respond ONLY with valid JSON, no markdown fences."""
 
 
 def review_copy(cards: list[dict], copy: dict) -> dict:
-    client = get_openai_client()
     cards_summary = _build_cards_summary(cards)
     copy_str = json.dumps(copy, ensure_ascii=False, indent=2)
     prompt = _REVIEW_PROMPT.format(cards_summary=cards_summary, copy=copy_str)
 
-    response = llm_call(
-        client.chat.completions.create,
-        model="gpt-4o",
+    response = llm_chat(
         messages=[{"role": "user", "content": prompt}],
         max_tokens=1500,
-        temperature=0.1,
     )
     raw = response.choices[0].message.content.strip()
     raw = re.sub(r"^```(?:json)?\s*", "", raw)

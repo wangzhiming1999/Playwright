@@ -11,9 +11,9 @@ from .page_utils import _safe_print, _wait_for_page_ready
 from .llm_helpers import robust_json_loads
 
 
-def _get_client():
-    from utils import get_openai_client
-    return get_openai_client()
+def _get_llm_chat():
+    from utils import llm_chat
+    return llm_chat
 
 
 class BrowserAgent:
@@ -139,9 +139,8 @@ class BrowserAgent:
             img = await self.screenshot_base64(quality=70)
             if not img:
                 return
-            client = self._client or _get_client()
-            resp = client.chat.completions.create(
-                model="gpt-4o",
+            llm_chat = _get_llm_chat()
+            resp = llm_chat(
                 messages=[{
                     "role": "user",
                     "content": [
@@ -180,10 +179,9 @@ class BrowserAgent:
         if not img:
             await self._log("  [AI验证] 截图失败，跳过验证")
             return False
-        client = self._client or _get_client()
+        llm_chat = _get_llm_chat()
         try:
-            resp = client.chat.completions.create(
-                model="gpt-4o",
+            resp = llm_chat(
                 messages=[{
                     "role": "user",
                     "content": [
@@ -215,14 +213,13 @@ class BrowserAgent:
             return "AI操作失败: 无法获取视口尺寸"
         width, height = viewport.get('width', 1280), viewport.get('height', 800)
 
-        client = self._client or _get_client()
+        llm_chat = _get_llm_chat()
         try:
             task_desc = prompt
             if input_text:
                 task_desc += f"\n要输入的内容: {input_text}"
 
-            resp = client.chat.completions.create(
-                model="gpt-4o",
+            resp = llm_chat(
                 messages=[{
                     "role": "user",
                     "content": [
@@ -438,9 +435,8 @@ class BrowserAgent:
 
                 await self._log(f"  [DOM] 找到 {len(inputs_info)} 个输入框")
 
-                client = self._client or _get_client()
-                resp = client.chat.completions.create(
-                    model="gpt-4o",
+                llm_chat = _get_llm_chat()
+                resp = llm_chat(
                     messages=[{
                         "role": "user",
                         "content": (
@@ -885,11 +881,10 @@ class BrowserAgent:
                     if not captcha_img:
                         return "操作失败: 截图失败"
 
-                # 用 GPT 识别验证码
-                client = self._client or _get_client()
+                # 用 AI 识别验证码
+                llm_chat = _get_llm_chat()
                 try:
-                    resp = client.chat.completions.create(
-                        model="gpt-4o",
+                    resp = llm_chat(
                         messages=[{
                             "role": "user",
                             "content": [
