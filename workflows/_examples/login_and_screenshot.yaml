@@ -1,0 +1,22 @@
+title: 网站登录并截图
+description: 登录指定网站，截图保存结果
+
+parameters:
+  - key: url
+    type: string
+    description: 登录页面地址
+    required: true
+  - key: credentials
+    type: string
+    description: 凭证 key（对应环境变量 {KEY}_EMAIL / {KEY}_PASSWORD）
+    required: true
+
+blocks:
+  - block_type: login
+    label: do_login
+    url: "{{ url }}"
+    credentials: "{{ credentials }}"
+
+  - block_type: task
+    label: take_screenshot
+    task: "登录成功后，截图保存当前页面"

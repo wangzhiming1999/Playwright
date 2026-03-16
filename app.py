@@ -31,6 +31,13 @@ from explorer import run_exploration
 from content_gen import generate_all
 from db import init_db, save_task, load_all_tasks, save_explore_task, load_all_explore_tasks, DB_PATH
 from utils import validate_url
+from workflow import (
+    init_workflow_db, parse_workflow, validate_workflow,
+    save_workflow, load_all_workflows, delete_workflow,
+    save_workflow_run, load_workflow_runs, load_workflow_run,
+    scan_workflow_directory,
+    WorkflowEngine, WorkflowCreateRequest, WorkflowRunRequest,
+)
 
 # ── Configuration constants ───────────────────────────────────────────────────
 
@@ -73,6 +80,13 @@ async def _verify_api_key(x_api_key: str | None = Header(default=None)):
 Path("screenshots").mkdir(exist_ok=True)
 Path("static").mkdir(exist_ok=True)
 init_db()
+init_workflow_db()
+
+# 启动时扫描 workflows/ 目录，加载 YAML 工作流
+WORKFLOWS: dict[str, dict] = load_all_workflows()
+_loaded_wfs = scan_workflow_directory()
+for wf in _loaded_wfs:
+    WORKFLOWS[wf["id"]] = wf
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
@@ -1025,3 +1039,167 @@ async def cleanup_old_tasks(keep_last: int = 20, _: None = Depends(_verify_api_k
         "deleted_explores": len(deleted_explores),
         "ids": deleted_tasks + deleted_explores,
     }
+
+
+# ── Workflow endpoints ───────────────────────────────────────────────────────
+
+@app.get("/workflows")
+def list_workflows(_: None = Depends(_verify_api_key)):
+    """列出所有工作流。"""
+    return list(WORKFLOWS.values())
+
+
+@app.get("/workflows/{wf_id}")
+def get_workflow(wf_id: str, _: None = Depends(_verify_api_key)):
+    if wf_id not in WORKFLOWS:
+        raise HTTPException(status_code=404, detail="workflow not found")
+    return WORKFLOWS[wf_id]
+
+
+@app.post("/workflows")
+async def create_workflow(req: WorkflowCreateRequest, _: None = Depends(_verify_api_key)):
+    """通过 YAML 创建工作流。"""
+    try:
+        wf_def = parse_workflow(req.yaml_content)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    wf_id = uuid.uuid4().hex[:8]
+    wf_dict = {
+        "id": wf_id,
+        "title": wf_def.title,
+        "description": wf_def.description,
+        "yaml_source": req.yaml_content,
+        "parameters": [p.model_dump() for p in wf_def.parameters],
+        "blocks": [b.model_dump() for b in wf_def.blocks],
+        "source_type": "api",
+    }
+    save_workflow(wf_dict)
+    WORKFLOWS[wf_id] = wf_dict
+    return wf_dict
+
+
+@app.put("/workflows/{wf_id}")
+async def update_workflow(wf_id: str, req: WorkflowCreateRequest, _: None = Depends(_verify_api_key)):
+    """更新工作流 YAML。"""
+    if wf_id not in WORKFLOWS:
+        raise HTTPException(status_code=404, detail="workflow not found")
+
+    try:
+        wf_def = parse_workflow(req.yaml_content)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    wf_dict = WORKFLOWS[wf_id]
+    wf_dict.update({
+        "title": wf_def.title,
+        "description": wf_def.description,
+        "yaml_source": req.yaml_content,
+        "parameters": [p.model_dump() for p in wf_def.parameters],
+        "blocks": [b.model_dump() for b in wf_def.blocks],
+    })
+    save_workflow(wf_dict)
+    return wf_dict
+
+
+@app.delete("/workflows/{wf_id}")
+async def remove_workflow(wf_id: str, _: None = Depends(_verify_api_key)):
+    if wf_id not in WORKFLOWS:
+        raise HTTPException(status_code=404, detail="workflow not found")
+    WORKFLOWS.pop(wf_id)
+    delete_workflow(wf_id)
+    return {"deleted": wf_id}
+
+
+@app.post("/workflows/{wf_id}/run")
+async def run_workflow(
+    wf_id: str,
+    req: WorkflowRunRequest,
+    background_tasks: BackgroundTasks,
+    _: None = Depends(_verify_api_key),
+):
+    """运行工作流，返回 run_id。"""
+    if wf_id not in WORKFLOWS:
+        raise HTTPException(status_code=404, detail="workflow not found")
+
+    wf = WORKFLOWS[wf_id]
+
+    engine = WorkflowEngine(
+        workflow=wf,
+        parameters=req.parameters,
+        log_callback=_log_callback,
+        screenshot_callback=_screenshot_callback,
+    )
+
+    run_id = engine.run_id
+
+    async def _run_workflow_bg():
+        main_loop = asyncio.get_running_loop()
+
+        def _run_in_thread():
+            if sys.platform == "win32":
+                asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+            # 重建 engine（线程内需要独立的 event loop）
+            eng = WorkflowEngine(
+                workflow=wf,
+                parameters=req.parameters,
+                log_callback=lambda rid, msg: asyncio.run_coroutine_threadsafe(
+                    _log_callback(rid, msg), main_loop
+                ).result(timeout=_CALLBACK_TIMEOUT),
+                screenshot_callback=lambda rid, fn: asyncio.run_coroutine_threadsafe(
+                    _screenshot_callback(rid, fn), main_loop
+                ).result(timeout=_CALLBACK_TIMEOUT),
+            )
+            eng.run_id = run_id  # 保持同一个 run_id
+
+            try:
+                result = loop.run_until_complete(eng.run())
+                return result
+            finally:
+                loop.close()
+
+        try:
+            result = await asyncio.get_event_loop().run_in_executor(
+                _agent_executor, _run_in_thread
+            )
+            await _broadcast({
+                "type": "workflow_done", "run_id": run_id,
+                "workflow_id": wf_id, "status": result.get("status"),
+            })
+            # webhook
+            if req.webhook_url:
+                await _send_webhook(req.webhook_url, {
+                    "run_id": run_id, "workflow_id": wf_id,
+                    "status": result.get("status"),
+                    "block_results": result.get("block_results"),
+                })
+        except Exception as e:
+            await _broadcast({
+                "type": "workflow_done", "run_id": run_id,
+                "workflow_id": wf_id, "status": "failed", "error": str(e),
+            })
+
+    background_tasks.add_task(_run_workflow_bg)
+    await _broadcast({
+        "type": "workflow_started", "run_id": run_id, "workflow_id": wf_id,
+    })
+
+    return {"run_id": run_id, "workflow_id": wf_id}
+
+
+@app.get("/workflows/{wf_id}/runs")
+def list_workflow_runs(wf_id: str, _: None = Depends(_verify_api_key)):
+    if wf_id not in WORKFLOWS:
+        raise HTTPException(status_code=404, detail="workflow not found")
+    return load_workflow_runs(wf_id)
+
+
+@app.get("/workflow-runs/{run_id}")
+def get_workflow_run(run_id: str, _: None = Depends(_verify_api_key)):
+    run = load_workflow_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="workflow run not found")
+    return run

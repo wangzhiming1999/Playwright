@@ -1,0 +1,35 @@
+title: 搜索并提取结果
+description: 打开搜索引擎，搜索关键词，提取搜索结果
+
+parameters:
+  - key: search_query
+    type: string
+    description: 搜索关键词
+    required: true
+  - key: search_engine_url
+    type: string
+    description: 搜索引擎地址
+    default: https://www.bing.com
+
+blocks:
+  - block_type: navigation
+    label: open_search
+    url: "{{ search_engine_url }}"
+
+  - block_type: task
+    label: do_search
+    task: "在搜索框中输入「{{ search_query }}」并点击搜索按钮，等待搜索结果加载完成"
+
+  - block_type: extraction
+    label: get_results
+    data_extraction_goal: "提取前5条搜索结果的标题和链接"
+    data_schema:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              title: { type: string }
+              url: { type: string }

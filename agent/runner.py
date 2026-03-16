@@ -71,16 +71,21 @@ async def run_agent(
             else:
                 profile = chrome_profile or "Default"
                 _safe_print(f"  [user_chrome] 使用 Chrome Profile: {user_data_dir} / {profile}")
-                # launch_persistent_context 直接返回 context，不返回 browser
-                context = await pw.chromium.launch_persistent_context(
-                    user_data_dir=user_data_dir,
-                    channel="chrome",          # 用系统安装的 Chrome，不是 Playwright 内置的
-                    headless=False,            # 用户 Profile 模式必须有头
-                    args=["--profile-directory=" + profile],
-                    viewport={"width": 1280, "height": 800},
-                    locale="zh-CN",
-                    proxy={"server": "http://127.0.0.1:7897"} if os.environ.get("USE_PROXY") else None,
-                )
+                try:
+                    # launch_persistent_context 直接返回 context，不返回 browser
+                    context = await pw.chromium.launch_persistent_context(
+                        user_data_dir=user_data_dir,
+                        channel="chrome",          # 用系统安装的 Chrome，不是 Playwright 内置的
+                        headless=False,            # 用户 Profile 模式必须有头
+                        args=["--profile-directory=" + profile],
+                        viewport={"width": 1280, "height": 800},
+                        locale="zh-CN",
+                        proxy={"server": "http://127.0.0.1:7897"} if os.environ.get("USE_PROXY") else None,
+                    )
+                except Exception as e:
+                    _safe_print(f"  [user_chrome] 启动失败: {e}")
+                    _safe_print("  [user_chrome] Chrome 可能正在运行，降级为 builtin 模式")
+                    browser_mode = "builtin"
 
         if browser_mode == "builtin":
             # 默认模式：启动内置 Chromium
