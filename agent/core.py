@@ -310,19 +310,20 @@ class BrowserAgent:
                 index = args.get("index")
                 text = args.get("text")
 
-                # 优先用 data-skyvern-id 精确定位
+                # 优先用回退链定位（skyvern-id → CSS → XPath → 缓存坐标）
                 if index is not None:
                     try:
                         el_info = await get_element_coords(page, index)
                         if el_info:
                             x, y = el_info["x"], el_info["y"]
-                            await self._log(f"  [skyvern-id点击] #{index} → ({x}, {y}) tag={el_info['tag']}")
+                            method = el_info.get("method", "skyvern-id")
+                            await self._log(f"  [点击] #{index} → ({x}, {y}) tag={el_info.get('tag','')} method={method}")
                             await self._click_and_wait(x, y)
                             return "点击成功"
                         else:
-                            await self._log(f"  skyvern-id #{index} 不存在或不可见，fallback 到文字")
+                            await self._log(f"  #{index} 回退链全部失败，fallback 到文字")
                             if not text:
-                                return f"操作失败: index={index} 不存在且未提供 text，请重新截图后用新的 index 重试"
+                                return f"操作失败: index={index} 定位失败且未提供 text，请重新截图后用新的 index 重试"
                     except Exception as e:
                         await self._log(f"  index点击失败: {e}")
                         if not text:
@@ -370,17 +371,18 @@ class BrowserAgent:
                 if not text_to_type:
                     return "操作失败: text 参数不能为空"
 
-                # 优先路径：用 data-skyvern-id 精确定位
+                # 优先路径：用回退链定位（skyvern-id → CSS → XPath → 缓存坐标）
                 if annotation_index is not None:
                     try:
                         el_info = await get_element_coords(page, annotation_index)
                         if el_info:
                             tag = el_info.get("tag", "").lower()
+                            method = el_info.get("method", "skyvern-id")
                             x, y = el_info["x"], el_info["y"]
 
                             # 如果目标不是可输入元素，先点击检查焦点
                             if tag not in ("input", "textarea", "div", "span"):
-                                await self._log(f"  ⚠ index #{annotation_index} 是 {tag}，尝试点击后检查焦点")
+                                await self._log(f"  ⚠ index #{annotation_index} 是 {tag}（method={method}），尝试点击后检查焦点")
                                 await self._click_and_wait(x, y, check_navigation=False)
                                 focused_tag = await page.evaluate("() => document.activeElement?.tagName?.toLowerCase() || ''")
                                 focused_editable = await page.evaluate("() => document.activeElement?.isContentEditable || false")
@@ -390,11 +392,11 @@ class BrowserAgent:
                                 else:
                                     await self._log(f"  ⚠ 点击后焦点在 {focused_tag}，不是输入框，fallback 到 DOM 扫描")
                             else:
-                                await self._log(f"  [skyvern-id输入] #{annotation_index} → ({x}, {y}) tag={tag}")
+                                await self._log(f"  [输入] #{annotation_index} → ({x}, {y}) tag={tag} method={method}")
                                 await self._click_and_wait(x, y, check_navigation=False)
                                 return await self._type_into_focused(text_to_type, press_enter, is_password)
                         else:
-                            await self._log(f"  skyvern-id #{annotation_index} 不存在，fallback 到 DOM 扫描")
+                            await self._log(f"  #{annotation_index} 回退链全部失败，fallback 到 DOM 扫描")
                     except Exception as e:
                         await self._log(f"  index定位失败: {e}，fallback 到 DOM 扫描")
 
@@ -612,11 +614,13 @@ class BrowserAgent:
                         el_info = await get_element_coords(page, index)
                         if el_info:
                             x, y = el_info["x"], el_info["y"]
+                            method = el_info.get("method", "skyvern-id")
+                            await self._log(f"  [悬停] #{index} → ({x}, {y}) method={method}")
                             await page.mouse.move(x, y)
                             await asyncio.sleep(0.5)
                             return f"已悬停在 #{index} ({x}, {y})"
                         elif not text:
-                            return f"操作失败: index={index} 不存在且未提供 text"
+                            return f"操作失败: index={index} 定位失败且未提供 text"
                     except Exception as e:
                         if not text:
                             return f"操作失败: {e}"
@@ -649,9 +653,12 @@ class BrowserAgent:
                 try:
                     el_info = await get_element_coords(page, index)
                     if not el_info:
-                        return f"操作失败: index={index} 不存在"
+                        return f"操作失败: index={index} 定位失败"
 
-                    # 尝试用 Playwright 的 select_option
+                    method = el_info.get("method", "skyvern-id")
+                    await self._log(f"  [选择] #{index} method={method}")
+
+                    # 尝试用 Playwright 的 select_option（优先用 css_selector 回退）
                     selector = f'[data-skyvern-id="{index}"]'
                     try:
                         await page.select_option(selector, value=value, timeout=5000)
