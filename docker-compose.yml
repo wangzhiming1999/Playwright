@@ -1,0 +1,21 @@
+services:
+  agent:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - API_KEY=${API_KEY:-}
+      - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:8000}
+      - USE_PROXY=${USE_PROXY:-}
+      - HEADLESS=true
+      - MAX_QUEUE_SIZE=${MAX_QUEUE_SIZE:-20}
+      - MAX_TASKS_KEEP=${MAX_TASKS_KEEP:-50}
+    volumes:
+      - screenshots:/app/screenshots
+      - db_data:/app
+    restart: unless-stopped
+
+volumes:
+  screenshots:
+  db_data:
