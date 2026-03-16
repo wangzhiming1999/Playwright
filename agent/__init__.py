@@ -10,10 +10,12 @@ agent 包 — 模块化的 Playwright + GPT 网页操作 Agent
   - chrome_detector.py  Chrome/Edge 用户数据目录检测
 """
 
-from .runner import run_agent, SYSTEM_PROMPT_STATIC
+from .runner import run_agent
 from .tools import TOOLS
 from .core import BrowserAgent
 from .llm_helpers import robust_json_loads, trim_elements
 from .page_utils import structured_log
 
-__all__ = ["run_agent", "TOOLS", "BrowserAgent", "robust_json_loads", "trim_elements", "SYSTEM_PROMPT_STATIC", "structured_log"]
+__version__ = "0.1.0"
+
+__all__ = ["run_agent", "TOOLS", "BrowserAgent", "robust_json_loads", "trim_elements", "structured_log", "__version__"]

@@ -1,3 +1,5 @@
+"""LLM 辅助函数：任务分解、步骤验证、上下文压缩、失败分析"""
+
 import base64
 import json
 import re
@@ -5,7 +7,7 @@ import re
 from json_repair import repair_json
 
 from .page_utils import _safe_print
-from utils import llm_chat
+from utils import llm_call
 
 
 # ── JSON 容错解析 ─────────────────────────────────────────────────────────────
@@ -48,11 +50,9 @@ def robust_json_loads(raw: str) -> dict | list:
 
     # 4. 截断 JSON 修复：补全缺失的括号
     trimmed = raw
-    # 去掉 markdown 包裹
     if trimmed.startswith('```'):
         trimmed = re.sub(r'^```(?:json)?\s*\n?', '', trimmed)
         trimmed = re.sub(r'\n?\s*```\s*$', '', trimmed)
-    # 计算未闭合的括号
     open_braces = trimmed.count('{') - trimmed.count('}')
     open_brackets = trimmed.count('[') - trimmed.count(']')
     if open_braces > 0 or open_brackets > 0:
@@ -69,40 +69,29 @@ def robust_json_loads(raw: str) -> dict | list:
 
 # ── 经济元素树裁剪 ────────────────────────────────────────────────────────────
 
-# 粗略估算：1 token ≈ 3 个字符（中英混合场景偏保守）
 _CHARS_PER_TOKEN = 3
-_MAX_ELEMENTS_TOKENS = 3000  # 元素列表的 token 预算
+_MAX_ELEMENTS_TOKENS = 3000
 
-# 交互性高的标签，裁剪时优先保留
 _INTERACTIVE_TAGS = {"input", "textarea", "button", "select"}
 
-# 完整字段列表（annotate_page 返回的）
 _FULL_FIELDS = ["index", "tag", "type", "text", "placeholder", "name", "id", "href", "aria_label", "x", "y"]
-# 精简字段：去掉 name, id, href（对 LLM 决策帮助不大）
 _COMPACT_FIELDS = ["index", "tag", "type", "text", "placeholder", "aria_label"]
-# 最小字段：只保留定位必需的
 _MINIMAL_FIELDS = ["index", "tag", "text"]
 
 
 def trim_elements(elements: list[dict], max_tokens: int = _MAX_ELEMENTS_TOKENS) -> str:
     """
     经济元素树：根据 token 预算逐级裁剪元素列表。
-
     裁剪策略（逐级降级）：
-    1. 完整版：所有字段
-    2. 精简版：去掉 name, id, href 等冗余字段
-    3. 精简版 + 截断文字：text 限制 20 字符
-    4. 最小版：只保留 index, tag, text + 过滤纯导航链接
+    1. 完整版 → 2. 精简字段 → 3. 截断文字 → 4. 最小字段 + 过滤
     """
     if not elements:
         return "[]"
 
-    # Level 1: 完整版
     full_json = json.dumps(elements, ensure_ascii=False)
     if len(full_json) / _CHARS_PER_TOKEN <= max_tokens:
         return full_json
 
-    # Level 2: 精简字段
     compact = [
         {k: el[k] for k in _COMPACT_FIELDS if k in el and el[k] != ""}
         for el in elements
@@ -111,7 +100,6 @@ def trim_elements(elements: list[dict], max_tokens: int = _MAX_ELEMENTS_TOKENS) 
     if len(compact_json) / _CHARS_PER_TOKEN <= max_tokens:
         return compact_json
 
-    # Level 3: 精简 + 截断文字
     for el in compact:
         if "text" in el and len(el["text"]) > 20:
             el["text"] = el["text"][:20] + "…"
@@ -119,12 +107,10 @@ def trim_elements(elements: list[dict], max_tokens: int = _MAX_ELEMENTS_TOKENS) 
     if len(truncated_json) / _CHARS_PER_TOKEN <= max_tokens:
         return truncated_json
 
-    # Level 4: 最小字段 + 过滤纯导航链接（保留按钮和输入框）
     minimal = []
     for el in elements:
         tag = el.get("tag", "")
         text = el.get("text", "")
-        # 过滤掉无文字的纯链接（通常是图标/logo 链接）
         if tag == "a" and not text.strip():
             continue
         entry = {"index": el.get("index", 0), "tag": tag}
@@ -139,24 +125,25 @@ def trim_elements(elements: list[dict], max_tokens: int = _MAX_ELEMENTS_TOKENS) 
     if len(minimal_json) / _CHARS_PER_TOKEN <= max_tokens:
         return minimal_json
 
-    # 兜底：只保留交互性高的元素
     interactive_only = [el for el in minimal if el.get("tag") in _INTERACTIVE_TAGS]
     return json.dumps(interactive_only, ensure_ascii=False)
 
 
 # ── 任务分解 ──────────────────────────────────────────────────────────────────
 
-def _decompose_task(task: str) -> list[dict]:
+def _decompose_task(client, task: str) -> list[dict]:
     """
     执行前把用户任务拆成有序步骤列表。
     每个步骤包含：
       - step: 步骤序号
-      - action: 要做什么（简短描述，可能需要多个工具调用才能完成）
-      - expected: 这个步骤全部完成后，页面的最终状态（粗粒度，不描述中间状态）
-      - done_signal: 判断这步完成的关键特征（页面上能看到什么）
+      - action: 要做什么
+      - expected: 这个步骤全部完成后，页面的最终状态
+      - done_signal: 判断这步完成的关键特征
     """
     try:
-        resp = llm_chat(
+        resp = llm_call(
+            client.chat.completions.create,
+            model="gpt-4o",
             messages=[{
                 "role": "user",
                 "content": (
@@ -183,7 +170,7 @@ def _decompose_task(task: str) -> list[dict]:
         if not resp.choices:
             return []
         raw = resp.choices[0].message.content
-        data = robust_json_loads(raw)
+        data = json.loads(raw)
         steps = data if isinstance(data, list) else data.get("steps", [])
         return steps if isinstance(steps, list) else []
     except Exception as e:
@@ -193,15 +180,16 @@ def _decompose_task(task: str) -> list[dict]:
 
 # ── 预期验证 ──────────────────────────────────────────────────────────────────
 
-async def _verify_step(page, expected: str, done_signal: str) -> tuple[bool, str]:
+async def _verify_step(client, page, expected: str, done_signal: str) -> tuple[bool, str]:
     """
-    操作后截图，让 AI 判断是否符合预期。
-    返回 (是否成功, 实际观察到的情况描述)
+    操作后截图，让 GPT 判断是否符合预期。
+    返回 (是否成功, 观察描述, 差距描述)
     """
     try:
         data = await page.screenshot(type="jpeg", quality=70)
         img_b64 = base64.b64encode(data).decode()
-        resp = llm_chat(
+        resp = client.chat.completions.create(
+            model="gpt-4o",
             messages=[{
                 "role": "user",
                 "content": [
@@ -223,8 +211,8 @@ async def _verify_step(page, expected: str, done_signal: str) -> tuple[bool, str
         if not resp.choices:
             return False, "", "空响应"
         try:
-            result = robust_json_loads(resp.choices[0].message.content)
-        except (json.JSONDecodeError, ValueError) as e:
+            result = json.loads(resp.choices[0].message.content)
+        except json.JSONDecodeError as e:
             return False, "", f"JSON 解析失败: {e}"
         return result.get("success", False), result.get("observation", ""), result.get("mismatch", "")
     except Exception as e:
@@ -233,30 +221,26 @@ async def _verify_step(page, expected: str, done_signal: str) -> tuple[bool, str
 
 # ── 上下文压缩 ────────────────────────────────────────────────────────────────
 
-def _compress_messages(messages: list, max_history: int = 16) -> list:
+def _compress_messages(messages: list, client, max_history: int = 16) -> list:
     """
     消息超出限制时，把中间的历史压缩成一条摘要，保留：
     - messages[0]: system prompt
     - messages[1]: 原始任务
     - 一条压缩摘要（assistant role）
     - 最近 max_history 条消息
-    这样 AI 不会忘记之前做了什么，同时不会撑爆 context。
     """
     if len(messages) <= max_history + 2:
         return messages
 
-    # 要压缩的中间段（去掉 system + task + 最近 max_history 条）
     to_compress = messages[2: -max_history]
     if not to_compress:
         return messages
 
-    # 提取文本内容用于摘要（跳过图片）
     history_text = []
     for m in to_compress:
         role = m.get("role", "")
         content = m.get("content", "")
         if isinstance(content, list):
-            # 多模态消息，只取文本部分
             text_parts = [p["text"] for p in content if isinstance(p, dict) and p.get("type") == "text"]
             content = " ".join(text_parts)
         if isinstance(content, str) and content.strip():
@@ -266,13 +250,13 @@ def _compress_messages(messages: list, max_history: int = 16) -> list:
         return messages[:2] + messages[-max_history:]
 
     try:
-        resp = llm_chat(
-            model="mini",
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
             messages=[{
                 "role": "user",
                 "content": (
                     "以下是网页操作的历史记录，请用 2-4 句话总结已完成的操作和当前状态：\n\n"
-                    + "\n".join(history_text[-30:])  # 最多取 30 条避免超 token
+                    + "\n".join(history_text[-30:])
                 ),
             }],
             max_tokens=200,
@@ -294,14 +278,13 @@ def _compress_messages(messages: list, max_history: int = 16) -> list:
 
 # ── 智能重试分析 ──────────────────────────────────────────────────────────────
 
-def _analyze_failure(tool_name: str, tool_args: dict, error_result: str) -> str:
+def _analyze_failure(client, tool_name: str, tool_args: dict, error_result: str) -> str:
     """
-    操作失败时，用 AI 分析失败原因并给出下一步建议，
-    注入到下一轮的 tool result 里，引导 AI 换策略。
+    操作失败时，用 GPT 分析失败原因并给出下一步建议。
     """
     try:
-        resp = llm_chat(
-            model="mini",
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
             messages=[{
                 "role": "user",
                 "content": (

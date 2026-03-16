@@ -1,5 +1,6 @@
 """
-run_agent() 主函数 — 从原始 agent.py 提取的 GPT 决策循环。
+run_agent() 主流程：启动浏览器、执行任务循环、返回结果。
+从 agent.py 抽取，作为 agent 包的一部分。
 """
 
 import asyncio
@@ -9,43 +10,20 @@ import os
 import re
 from pathlib import Path
 
-from dotenv import load_dotenv
 from playwright.async_api import async_playwright
-from page_annotator import annotate_page
-from utils import llm_chat
 
 from .page_utils import _safe_print, _wait_for_page_ready
 from .core import BrowserAgent
 from .tools import TOOLS
-from .llm_helpers import _decompose_task, _verify_step, _compress_messages, _analyze_failure, robust_json_loads, trim_elements
+from .llm_helpers import _decompose_task, _verify_step, _compress_messages, _analyze_failure
 from .chrome_detector import _find_chrome_user_data_dir
 
-load_dotenv()
+from utils import get_openai_client, llm_call
+from page_annotator import annotate_page
 
 
-# ── 静态 Prompt（不随步骤变化，可被模型缓存） ─────────────────────────────────
-
-SYSTEM_PROMPT_STATIC = (
-    "你是一个网页操作助手。每次我会给你当前页面的截图，用视觉理解页面，调用工具完成用户任务。\n"
-    "核心原则：看截图判断当前状态，再决定下一步操作。\n"
-    "基本规则：\n"
-    "1. 每次只调用一个工具\n"
-    "2. 操作元素优先用截图中的红色 index 编号，比文字更准确\n"
-    "3. 操作失败时换个方式重试，不要直接 done 放弃——除非连续5次都失败\n"
-    "4. 任务全部完成后先截图，再调用 done\n"
-    "5. 遇到登录页面，继续完成登录，不要放弃\n"
-    "等待规则（重要）：\n"
-    "  - 点击提交/搜索/发送按钮后，如果任务要求等待生成结果，必须调用 wait(wait_for_content_change=true, timeout=120)\n"
-    "  - wait 会自动等待内容开始出现，再等内容停止变化，完成后再截图\n"
-    "  - 普通页面跳转（登录、导航）不需要调用 wait，系统已自动处理\n"
-    "提交规则（重要）：\n"
-    "  - 在输入框输入内容后，必须点击提交/发送/搜索按钮，或者用 press_enter=true 提交，不能直接 done\n"
-    "  - 提交后才能等待生成结果\n"
-    "登录规则：\n"
-    "  - 看到邮箱框填邮箱，看到密码框填密码，看到按钮就点\n"
-    "  - 两步登录（先邮箱后密码）：点继续后等新截图再填密码\n"
-    "  - 没有凭证时调用 get_credentials(site_key) 获取"
-)
+def _get_client():
+    return get_openai_client()
 
 
 async def run_agent(
@@ -58,88 +36,38 @@ async def run_agent(
     ask_user_callback=None,      # async (task_id, question, reason) -> str
     screenshot_callback=None,    # async (task_id, filename) -> None
     browser_mode: str = "builtin",  # "builtin" | "user_chrome" | "cdp"
-    cdp_url: str = "http://localhost:9222",
-    chrome_profile: str = None,
-    checkpoint_dir: str = None,  # 检查点目录，设置后启用断点续跑
+    cdp_url: str = "http://localhost:9222",  # browser_mode="cdp" 时使用
+    chrome_profile: str = None,  # browser_mode="user_chrome" 时指定 profile 名，默认 "Default"
 ) -> dict:
     """
     运行 agent 执行任务。
     返回: {"success": bool, "reason": str, "steps": int}
-
-    断点续跑：设置 checkpoint_dir 后，每步执行完保存检查点。
-    下次用相同 checkpoint_dir 调用时自动从上次中断处恢复。
     """
     screenshots_dir = Path(screenshots_dir)
     task_success = False
     task_reason = "未知"
     steps_executed = 0
 
-    # ── 断点续跑：加载检查点 ──
-    checkpoint_file = None
-    resume_step = 0
-    resume_messages = None
-    resume_url = None
-
-    if checkpoint_dir:
-        cp_dir = Path(checkpoint_dir)
-        cp_dir.mkdir(parents=True, exist_ok=True)
-        checkpoint_file = cp_dir / "checkpoint.json"
-        if checkpoint_file.exists():
-            try:
-                cp_data = json.loads(checkpoint_file.read_text(encoding="utf-8"))
-                resume_step = cp_data.get("step", 0)
-                resume_url = cp_data.get("url", "")
-                # 恢复消息历史（去掉图片内容，只保留文本）
-                resume_messages = cp_data.get("messages", [])
-                _safe_print(f"  [断点续跑] 从第 {resume_step + 1} 步恢复，URL: {resume_url}")
-            except Exception as e:
-                _safe_print(f"  [断点续跑] 加载检查点失败: {e}，从头开始")
-
-    def _save_checkpoint(step: int, messages: list, current_url: str):
-        """保存检查点（去掉图片 base64 以减小体积）"""
-        if not checkpoint_file:
-            return
-        try:
-            # 深拷贝消息，去掉图片内容
-            clean_msgs = []
-            for m in messages:
-                content = m.get("content", "")
-                if isinstance(content, list):
-                    # 多模态消息：只保留文本部分
-                    text_parts = [p for p in content if isinstance(p, dict) and p.get("type") == "text"]
-                    clean_msgs.append({**m, "content": text_parts or ""})
-                else:
-                    clean_msgs.append(m)
-            cp_data = {
-                "step": step,
-                "url": current_url,
-                "messages": clean_msgs[-20:],  # 只保留最近 20 条
-                "task": task,
-                "saved_at": __import__("time").strftime("%Y-%m-%dT%H:%M:%S"),
-            }
-            checkpoint_file.write_text(
-                json.dumps(cp_data, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-        except Exception as e:
-            _safe_print(f"  [断点续跑] 保存检查点失败: {e}")
-
     async with async_playwright() as pw:
+        # ── 三种浏览器模式 ────────────────────────────────────────────────────
         browser = None
         context = None
 
         if browser_mode == "cdp":
+            # 连接用户正在运行的 Chrome（需要用 --remote-debugging-port=9222 启动）
             _safe_print(f"  [CDP] 连接 {cdp_url} ...")
             try:
                 browser = await pw.chromium.connect_over_cdp(cdp_url)
             except Exception as e:
                 raise RuntimeError(f"CDP 连接失败 ({cdp_url}): {e}") from e
+            # 复用已有的第一个 context（继承所有登录态）
             if browser.contexts:
                 context = browser.contexts[0]
             else:
                 context = await browser.new_context(viewport={"width": 1280, "height": 800}, locale="zh-CN")
 
         elif browser_mode == "user_chrome":
+            # 用用户的 Chrome Profile 启动，继承所有登录态
             user_data_dir = await _find_chrome_user_data_dir()
             if not user_data_dir:
                 _safe_print("  [user_chrome] 未找到 Chrome Profile，降级为 builtin 模式")
@@ -147,10 +75,11 @@ async def run_agent(
             else:
                 profile = chrome_profile or "Default"
                 _safe_print(f"  [user_chrome] 使用 Chrome Profile: {user_data_dir} / {profile}")
+                # launch_persistent_context 直接返回 context，不返回 browser
                 context = await pw.chromium.launch_persistent_context(
                     user_data_dir=user_data_dir,
-                    channel="chrome",
-                    headless=False,
+                    channel="chrome",          # 用系统安装的 Chrome，不是 Playwright 内置的
+                    headless=False,            # 用户 Profile 模式必须有头
                     args=["--profile-directory=" + profile],
                     viewport={"width": 1280, "height": 800},
                     locale="zh-CN",
@@ -158,6 +87,7 @@ async def run_agent(
                 )
 
         if browser_mode == "builtin":
+            # 默认模式：启动内置 Chromium
             browser = await pw.chromium.launch(
                 headless=headless,
                 proxy={"server": "http://127.0.0.1:7897"} if os.environ.get("USE_PROXY") else None,
@@ -167,8 +97,10 @@ async def run_agent(
                 locale="zh-CN",
             )
 
+        # cookies_file 所有模式都需要定义（builtin 模式读写，其他模式只在需要时写）
         cookies_file = Path(cookies_path)
 
+        # builtin 模式才需要手动加载 cookies
         if browser_mode == "builtin":
             if cookies_file.exists():
                 try:
@@ -181,6 +113,7 @@ async def run_agent(
                 except (json.JSONDecodeError, Exception) as e:
                     _safe_print(f"⚠ 加载 cookies 失败: {e}，继续执行")
 
+            # 注入环境变量中的站点 token
             _felo_token = os.environ.get("FELO_AI_TOKEN", "").strip()
             if _felo_token:
                 await context.add_cookies([{
@@ -198,9 +131,10 @@ async def run_agent(
             if log_callback and task_id:
                 await log_callback(task_id, msg)
 
-        client = None  # no longer needed, llm_chat() manages its own client
+        client = _get_client()
         agent = BrowserAgent(page, screenshots_dir, log_fn=_log, client=client, screenshot_callback=screenshot_callback, task_id=task_id)
 
+        # 多 tab 支持：监听新页面，自动切换到最新打开的 tab
         async def _on_new_page(new_page):
             try:
                 await new_page.wait_for_load_state("domcontentloaded", timeout=10000)
@@ -211,6 +145,7 @@ async def run_agent(
 
         context.on("page", lambda p: asyncio.ensure_future(_on_new_page(p)))
 
+        # 如果任务中包含明文账号密码，直接注入到 system prompt，避免 GPT 调用 get_credentials
         task_for_gpt = task
         _cred_hint = ""
         _email_match = re.search(r'账号[是为：:]\s*(\S+)', task)
@@ -222,11 +157,31 @@ async def run_agent(
                 "密码框必须设 is_password: true。"
             )
 
-        # system prompt = 静态规则 + 动态凭证提示（凭证提示追加在末尾，不影响静态部分缓存命中）
         messages = [
             {
                 "role": "system",
-                "content": SYSTEM_PROMPT_STATIC + _cred_hint,
+                "content": (
+                    "你是一个网页操作助手。每次我会给你当前页面的截图，用视觉理解页面，调用工具完成用户任务。\n"
+                    "核心原则：看截图判断当前状态，再决定下一步操作。\n"
+                    "基本规则：\n"
+                    "1. 每次只调用一个工具\n"
+                    "2. 操作元素优先用截图中的红色 index 编号，比文字更准确\n"
+                    "3. 操作失败时换个方式重试，不要直接 done 放弃——除非连续5次都失败\n"
+                    "4. 任务全部完成后先截图，再调用 done\n"
+                    "5. 遇到登录页面，继续完成登录，不要放弃\n"
+                    "等待规则（重要）：\n"
+                    "  - 点击提交/搜索/发送按钮后，如果任务要求等待生成结果，必须调用 wait(wait_for_content_change=true, timeout=120)\n"
+                    "  - wait 会自动等待内容开始出现，再等内容停止变化，完成后再截图\n"
+                    "  - 普通页面跳转（登录、导航）不需要调用 wait，系统已自动处理\n"
+                    "提交规则（重要）：\n"
+                    "  - 在输入框输入内容后，必须点击提交/发送/搜索按钮，或者用 press_enter=true 提交，不能直接 done\n"
+                    "  - 提交后才能等待生成结果\n"
+                    "登录规则：\n"
+                    "  - 看到邮箱框填邮箱，看到密码框填密码，看到按钮就点\n"
+                    "  - 两步登录（先邮箱后密码）：点继续后等新截图再填密码\n"
+                    "  - 没有凭证时调用 get_credentials(site_key) 获取"
+                    + _cred_hint
+                ),
             },
             {
                 "role": "user",
@@ -240,21 +195,9 @@ async def run_agent(
         last_tool_name = None
         last_tool_pressed_enter = False
 
-        # 断点续跑：恢复消息历史和导航到上次 URL
-        if resume_messages and resume_url:
-            messages = resume_messages
-            await _log(f"  [断点续跑] 恢复 {len(messages)} 条消息历史")
-            try:
-                await page.goto(resume_url, wait_until="domcontentloaded", timeout=30000)
-                await _wait_for_page_ready(page, log_fn=_log, timeout_ms=10000, check_network=True, active_requests=set())
-                await _log(f"  [断点续跑] 已导航到: {resume_url}")
-            except Exception as e:
-                await _log(f"  [断点续跑] 导航失败: {e}，从头开始")
-                resume_step = 0
-
-        # 任务分解
+        # ── 任务分解 ──────────────────────────────────────────────────────────
         await _log("  [任务分解] 正在拆解任务步骤...")
-        task_steps = _decompose_task(task)
+        task_steps = _decompose_task(client, task)
         if task_steps:
             await _log(f"  [任务分解] 共 {len(task_steps)} 步：")
             for s in task_steps:
@@ -263,6 +206,7 @@ async def run_agent(
         else:
             await _log("  [任务分解] 分解失败，使用自由模式执行")
 
+        # 把任务步骤列表格式化成提示文字，注入到每步的 user message 里
         steps_hint = ""
         if task_steps:
             steps_hint = "【任务步骤参考】\n" + "\n".join(
@@ -270,7 +214,7 @@ async def run_agent(
                 for s in task_steps
             ) + "\n按顺序完成以上步骤，每步完成后再进行下一步。\n"
 
-        # 网络请求监听
+        # 全程监听网络请求，供 _wait_for_page_ready 使用
         active_requests: set[str] = set()
 
         def _on_request(req):
@@ -295,9 +239,10 @@ async def run_agent(
         agent.page.on("request", _on_request)
         agent.page.on("response", _on_response)
         agent.page.on("requestfailed", _on_request_failed)
-        agent._active_requests = active_requests
+        agent._active_requests = active_requests  # 注入到 agent，供 wait 工具使用
 
-        for step in range(resume_step, max_steps):
+        for step in range(max_steps):
+            # 步数预警：80% 时提醒 GPT 加速收尾
             if step == int(max_steps * 0.8):
                 await _log(f"  ⚠ [预警] 已执行 {step+1}/{max_steps} 步，即将达到上限")
                 messages.append({
@@ -305,11 +250,14 @@ async def run_agent(
                     "content": "⚠️ 注意：你已使用了大部分步数，请尽快完成任务。如果核心目标已达成，请截图并调用 done。"
                 })
 
+            # 只在第一步和 navigate 后检查弹窗，避免干扰正常操作
             if step == 0:
                 await agent.dismiss_overlay()
 
+            # 截图前确保页面就绪（统一使用 _wait_for_page_ready）
             await _wait_for_page_ready(agent.page, log_fn=_log, timeout_ms=10000, check_network=True, active_requests=active_requests)
 
+            # 用标注截图：给所有可交互元素打红框+编号
             try:
                 img_b64, elements = await annotate_page(agent.page)
             except Exception as e:
@@ -321,8 +269,9 @@ async def run_agent(
                 except Exception as e2:
                     await _log(f"  ❌ 截图也失败: {e2}，终止任务")
                     break
-            elements_summary = trim_elements(elements)
+            elements_summary = json.dumps(elements, ensure_ascii=False)
 
+            # 保存标注截图，方便调试，并实时推送给前端
             debug_path = screenshots_dir / f"step_{step+1:02d}_annotated.jpg"
             try:
                 debug_path.write_bytes(base64.b64decode(img_b64))
@@ -335,31 +284,36 @@ async def run_agent(
                 except Exception as e:
                     await _log(f"  ⚠ 截图回调失败: {e}")
 
-            # 动态 prompt：第一步包含 steps_hint，后续步骤省略以节省 token
-            step_text = f"第{step+1}步，当前页面截图（红框+编号标注了所有可交互元素）：\n"
-            if step == 0 and steps_hint:
-                step_text += steps_hint
-            step_text += f"元素列表: {elements_summary}\n"
-            step_text += "根据截图判断当前状态，调用一个工具推进任务。"
-            step_text += "操作时用元素的 index 编号，不要猜 selector 或坐标。"
-
             messages.append({
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": step_text},
+                    {
+                        "type": "text",
+                        "text": (
+                            f"第{step+1}步，当前页面截图（红框+编号标注了所有可交互元素）：\n"
+                            f"{steps_hint}"
+                            f"元素列表: {elements_summary}\n"
+                            "根据截图判断当前状态，调用一个工具推进任务。"
+                            "操作时用元素的 index 编号，不要猜 selector 或坐标。"
+                        ),
+                    },
                     {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}", "detail": "high"}},
                 ],
             })
 
+            # 上下文压缩：硬上限 60 条防止压缩失败时无限增长
             if len(messages) > 60:
                 await _log(f"  ⚠ [上下文] 消息数 {len(messages)} 超过硬上限，强制截断")
                 messages = [messages[0]] + messages[-20:]
 
+            # 正常压缩：超过 24 条时压缩中间历史为摘要，保留最近 16 条
             if len(messages) > 24:
-                messages = _compress_messages(messages, max_history=16)
+                messages = _compress_messages(messages, client, max_history=16)
                 await _log(f"  [上下文] 已压缩历史，当前 {len(messages)} 条消息")
 
-            response = llm_chat(
+            response = llm_call(
+                client.chat.completions.create,
+                model="gpt-4o",
                 messages=messages,
                 tools=TOOLS,
                 tool_choice="required",
@@ -367,10 +321,11 @@ async def run_agent(
             )
 
             if not response.choices:
-                await _log("⚠️ LLM API 返回空 choices，终止任务")
+                await _log("⚠️ OpenAI API 返回空 choices，终止任务")
                 break
 
             msg = response.choices[0].message
+            # 转成 dict 存入 messages，避免 _compress_messages 中 .get() 报错
             msg_dict = {"role": msg.role, "content": msg.content}
             if msg.tool_calls:
                 msg_dict["tool_calls"] = [
@@ -391,8 +346,8 @@ async def run_agent(
             tool_name = tool_call.function.name
 
             try:
-                tool_args = robust_json_loads(tool_call.function.arguments)
-            except (json.JSONDecodeError, ValueError) as e:
+                tool_args = json.loads(tool_call.function.arguments)
+            except json.JSONDecodeError as e:
                 await _log(f"❌ GPT 返回的 JSON 无效: {e}")
                 await _log(f"   原始内容: {tool_call.function.arguments[:200]}")
                 messages.append({
@@ -406,7 +361,7 @@ async def run_agent(
 
             await _log(f"\n>>> step={step+1} tool={tool_name} args={json.dumps(tool_args, ensure_ascii=False)}")
 
-            # 拦截：输入后未提交就 done
+            # 拦截：上一步是 type_text 且没有 press_enter，GPT 就直接 done 了——说明忘记提交
             if tool_name == "done" and last_tool_name == "type_text" and not last_tool_pressed_enter:
                 await _log("  [拦截] 检测到输入后未提交就 done，强制要求先提交")
                 messages.append({
@@ -418,7 +373,7 @@ async def run_agent(
                     messages.append({"role": "tool", "tool_call_id": tc.id, "content": "skipped"})
                 continue
 
-            # done/screenshot 前强制等待内容稳定
+            # done/screenshot 前强制等待内容稳定（主循环层面兜底）
             if tool_name in ("done", "screenshot"):
                 await _log("  [wait_stable] 执行前等待内容稳定...")
                 wait_result = await _wait_for_page_ready(agent.page, log_fn=_log, timeout_ms=120000, check_network=True, active_requests=active_requests)
@@ -427,9 +382,11 @@ async def run_agent(
             result = await agent.execute(tool_name, tool_args)
             await _log(f"  result: {str(result)[:200]}")
 
+            # navigate 后自动检查弹窗
             if tool_name == "navigate":
                 await agent.dismiss_overlay()
 
+            # click 成功后保存 cookies（不做 AI 验证，让 GPT 从下一步截图自己判断）
             if tool_name == "click" and not result.startswith("操作失败"):
                 try:
                     cookies = await context.cookies()
@@ -442,11 +399,13 @@ async def run_agent(
             if result == "__DONE__":
                 summary = tool_args.get("summary", "任务完成")
 
-                # 完成前验证
+                # ── 完成前验证：截图 + GPT 判断是否真正满足用户需求 ──
+                # 每 15 秒检查一次，最多 3 次，防止页面还没渲染完就结束
                 done_verified = False
                 for check_round in range(1, 4):
                     await _log(f"\n🔍 [完成验证] 第 {check_round}/3 次检查...")
                     try:
+                        # full_page 截图，确保长页面内容完整可见
                         check_img = await agent.screenshot_base64(quality=75, full_page=True)
                         if not check_img:
                             await _log(f"  ⚠ 截图为空，跳过本轮验证")
@@ -454,6 +413,7 @@ async def run_agent(
                                 await asyncio.sleep(15)
                             continue
 
+                        # 额外截一张底部 viewport 截图，检测底部是否有 loading
                         bottom_img = None
                         try:
                             scroll_h = await agent.page.evaluate("() => document.body.scrollHeight")
@@ -466,6 +426,7 @@ async def run_agent(
                         except Exception:
                             pass
 
+                        # 构建验证图片列表
                         image_parts = [
                             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{check_img}", "detail": "low"}},
                         ]
@@ -476,7 +437,9 @@ async def run_agent(
                             )
                             bottom_hint = "第一张是完整页面截图，第二张是页面底部截图。请同时检查底部是否有未完成的内容。\n"
 
-                        verify_resp = llm_chat(
+                        verify_resp = llm_call(
+                            client.chat.completions.create,
+                            model="gpt-4o",
                             messages=[{
                                 "role": "user",
                                 "content": [
@@ -507,8 +470,8 @@ async def run_agent(
                             break
 
                         try:
-                            verify_data = robust_json_loads(verify_resp.choices[0].message.content)
-                        except (json.JSONDecodeError, ValueError):
+                            verify_data = json.loads(verify_resp.choices[0].message.content)
+                        except json.JSONDecodeError:
                             await _log(f"  ⚠ 验证结果 JSON 解析失败，视为通过")
                             done_verified = True
                             break
@@ -539,13 +502,14 @@ async def run_agent(
                         messages.append({"role": "tool", "tool_call_id": tc.id, "content": "skipped"})
                     break
                 else:
+                    # 3 次验证都未通过，告诉 GPT 继续操作
                     await _log(f"  ⚠ 3次验证均未通过，要求 agent 继续执行")
                     result = (
                         "任务尚未真正完成。页面内容仍在加载或结果不符合预期。"
                         "请等待页面加载完成，或检查当前页面状态后继续操作。不要急于调用 done。"
                     )
 
-            # 处理 ask_user
+            # ── 处理 ask_user：暂停并等待用户回答 ──────────────────────────
             if result.startswith("__ASK_USER__:"):
                 parts = result.split("::", 1)
                 question = parts[0].replace("__ASK_USER__:", "").strip()
@@ -595,7 +559,7 @@ async def run_agent(
             if is_failure:
                 fail_count += 1
                 await _log(f"  [失败计数] {fail_count}/5 — {result[:80]}")
-                advice = _analyze_failure(tool_name, tool_args, result)
+                advice = _analyze_failure(client, tool_name, tool_args, result)
                 if advice:
                     result += f"\n[建议] {advice}"
                     await _log(f"  [重试建议] {advice}")
@@ -604,6 +568,7 @@ async def run_agent(
                     await _log(f"  [失败计数] 已重置（上次={fail_count}）")
                 fail_count = 0
 
+            # 记录上一步工具信息，供下一步拦截判断
             last_tool_name = tool_name
             last_tool_pressed_enter = (
                 tool_name == "type_text" and bool(tool_args.get("press_enter"))
@@ -615,11 +580,9 @@ async def run_agent(
                 "content": result,
             })
 
+            # 补齐其余 tool_call 的 response
             for tc in msg.tool_calls[1:]:
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": "skipped"})
-
-            # 断点续跑：每步保存检查点
-            _save_checkpoint(step + 1, messages, agent.page.url)
 
             if fail_count >= 5:
                 await _log("\n⚠️  连续5次失败，终止任务")
@@ -631,7 +594,7 @@ async def run_agent(
             task_reason = f"达到最大步数限制({max_steps}步)"
             steps_executed = max_steps
 
-        # 保存 cookies
+        # builtin 模式保存 cookies；user_chrome/cdp 模式不需要（浏览器本身保存）
         if browser_mode == "builtin":
             try:
                 cookies = await context.cookies()
@@ -641,7 +604,8 @@ async def run_agent(
             except Exception as e:
                 await _log(f"⚠ 保存 cookies 失败: {e}")
 
-        # 关闭浏览器
+        # 关闭浏览器：保留浏览器供用户查看结果，仅在非 headless 模式下保持打开
+        # CDP 模式不关闭（用户还在用），builtin headless 模式关闭（无界面无意义）
         if browser_mode == "cdp":
             await _log("  [CDP] 保持浏览器运行，不关闭")
         elif browser_mode == "user_chrome":
@@ -655,7 +619,7 @@ async def run_agent(
             else:
                 await _log("  🌐 浏览器保持打开，可手动查看结果。关闭浏览器窗口即可释放资源。")
 
-        # 兜底判断
+        # 兜底：如果 AI 没调 done 但截图目录里有非调试截图，也算成功
         if not task_success:
             user_screenshots = [
                 f for f in screenshots_dir.glob("*.*")
@@ -668,14 +632,6 @@ async def run_agent(
                 task_success = True
                 if task_reason == "未知":
                     task_reason = "任务已完成（截图已保存）"
-
-        # 断点续跑：任务成功完成后清理检查点
-        if task_success and checkpoint_file and checkpoint_file.exists():
-            try:
-                checkpoint_file.unlink()
-                await _log("  [断点续跑] 任务完成，已清理检查点")
-            except Exception:
-                pass
 
         return {
             "success": task_success,

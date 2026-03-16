@@ -13,7 +13,7 @@ services:
       - MAX_TASKS_KEEP=${MAX_TASKS_KEEP:-50}
     volumes:
       - screenshots:/app/screenshots
-      - db_data:/app
+      - db_data:/app/data
     restart: unless-stopped
 
 volumes:

@@ -42,8 +42,13 @@ _USER_REPLY_TIMEOUT = 300   # 5 minutes
 API_KEY = os.getenv("API_KEY")  # Optional API key for authentication
 MAX_QUEUE_SIZE = int(os.getenv("MAX_QUEUE_SIZE", "20"))
 MAX_TASKS_KEEP = int(os.getenv("MAX_TASKS_KEEP", "50"))
+HEADLESS = os.getenv("HEADLESS", "false").lower() in ("true", "1", "yes")
 
-app = FastAPI()
+app = FastAPI(
+    title="Skyvern",
+    version="0.1.0",
+    description="AI-driven browser automation platform",
+)
 
 # CORS configuration
 _cors_origins_env = os.getenv("CORS_ORIGINS", "")
@@ -206,7 +211,7 @@ def _run_agent_in_thread(
         agent_result = loop.run_until_complete(
             run_agent(
                 task=task,
-                headless=False,
+                headless=HEADLESS,
                 task_id=task_id,
                 log_callback=thread_safe_log,
                 cookies_path=f"cookies_{task_id}.json",
@@ -584,7 +589,7 @@ def _run_exploration_in_thread(
                 screenshots_dir=f"screenshots/explore_{eid}",
                 cookies_path=cookies_path or None,
                 max_pages=max_pages,
-                headless=False,
+                headless=HEADLESS,
                 log_fn=thread_safe_log,
             )
         )

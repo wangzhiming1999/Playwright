@@ -8,12 +8,11 @@ from playwright.async_api import Page
 from page_annotator import get_element_coords
 
 from .page_utils import _safe_print, _wait_for_page_ready
-from .llm_helpers import robust_json_loads
 
 
-def _get_llm_chat():
-    from utils import llm_chat
-    return llm_chat
+def _get_client():
+    from utils import get_openai_client
+    return get_openai_client()
 
 
 class BrowserAgent:

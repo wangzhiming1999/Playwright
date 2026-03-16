@@ -1,53 +1,58 @@
 # Skyvern - AI 驱动的浏览器自动化平台
 
-基于 GPT-4o 视觉能力的智能浏览器 Agent，用 AI 理解网页代替传统 CSS 选择器，实现复杂的 Web 自动化任务。
+基于 GPT-4o / Claude 视觉能力的智能浏览器 Agent，用 AI 理解网页代替传统 CSS 选择器，实现复杂的 Web 自动化任务。
 
 ## ✨ 核心特性
 
-- **视觉驱动操作** - GPT-4o 直接"看"网页截图，通过视觉理解定位元素
+- **视觉驱动操作** - LLM 直接"看"网页截图，通过视觉理解定位元素
+- **双 LLM 后端** - 支持 OpenAI (GPT-4o) 和 Anthropic (Claude)，一键切换
 - **智能任务分解** - 自动将复杂任务拆解为可执行步骤
 - **失败自愈** - 操作失败时 AI 自动分析原因并调整策略重试
 - **Human-in-the-loop** - 执行中可暂停向用户提问，获取必要信息
-- **多浏览器模式** - 当前支持内置 Chromium，用户 Chrome / CDP 远程调试模式开发中
+- **2FA / 验证码** - 支持 TOTP 两步验证和图形验证码识别
+- **文件操作** - 文件上传、下载、拖拽
 - **实时监控** - Web Dashboard + SSE 实时推送任务状态和日志
+- **Webhook 回调** - 任务完成/失败时自动通知外部系统
+- **断点续跑** - 从检查点恢复中断的任务
 - **Cookie 持久化** - 自动保存登录状态，跨会话复用
 - **网站探索** - 自动爬取网站并生成营销内容（截图策展 + 文案生成）
+- **Docker 支持** - 开箱即用的容器化部署
 
 ## 🚀 快速开始
 
-### 1. 安装依赖
+### 方式一：本地运行
 
 ```bash
-# 安装 Python 依赖
+# 1. 安装 Python 依赖
 pip install -r requirements.txt
 
-# 安装 Playwright 浏览器
+# 2. 安装 Playwright 浏览器
 playwright install chromium
-```
 
-### 2. 配置环境变量
-
-```bash
+# 3. 配置环境变量
 cp .env.example .env
-```
+# 编辑 .env，填入 API Key（详见 .env.example 中的注释）
 
-编辑 `.env` 文件，填入你的 OpenAI API Key：
-
-```env
-OPENAI_API_KEY=sk-your-openai-api-key
-
-# 可选：网站登录凭证（用于需要登录的任务）
-# EXAMPLE_COM_EMAIL=your@email.com
-# EXAMPLE_COM_PASSWORD=your_password
-```
-
-### 3. 启动服务
-
-```bash
+# 4. 启动服务
 uvicorn app:app --reload --port 8000
 ```
 
 打开浏览器访问 [http://localhost:8000](http://localhost:8000)
+
+### 方式二：Docker
+
+```bash
+# 配置环境变量
+cp .env.example .env
+# 编辑 .env，填入 API Key
+
+# 启动
+docker-compose up
+```
+
+### 交互式 API 文档
+
+启动服务后访问 [http://localhost:8000/docs](http://localhost:8000/docs) 查看 Swagger UI，可直接在线调试所有 API。
 
 ## 📖 使用示例
 
@@ -76,16 +81,9 @@ const es = new EventSource('http://localhost:8000/tasks/stream');
 es.onmessage = (e) => console.log(JSON.parse(e.data));
 ```
 
-### CLI 模式
-
-```bash
-python agent.py
-# 按提示输入任务描述
-```
-
 ## 🛠️ Agent 工具集
 
-Agent 拥有 14 个工具来操作浏览器：
+Agent 拥有 20+ 个工具来操作浏览器：
 
 | 工具 | 功能 | 示例 |
 |------|------|------|
@@ -97,51 +95,70 @@ Agent 拥有 14 个工具来操作浏览器：
 | `screenshot` | 保存截图 | `screenshot(filename="result.png")` |
 | `get_page_html` | 获取 HTML | `get_page_html()` |
 | `press_key` | 按键 | `press_key(key="Escape")` |
-| `get_credentials` | 获取凭证 | `get_credentials(site="example.com")` |
+| `hover` | 鼠标悬停 | `hover(index=3)` |
+| `select_option` | 下拉选择 | `select_option(index=5, value="option1")` |
+| `switch_tab` | 切换标签页 | `switch_tab(tab_index=1)` |
+| `upload_file` | 上传文件 | `upload_file(index=2, file_path="/path/to/file")` |
+| `download_file` | 下载文件 | `download_file(index=3)` |
+| `drag_drop` | 拖拽操作 | `drag_drop(from_index=1, to_index=5)` |
+| `solve_captcha` | 识别验证码 | `solve_captcha(input_index=3)` |
+| `get_totp_code` | 生成 TOTP | `get_totp_code(site_key="github")` |
+| `get_credentials` | 获取凭证 | `get_credentials(site_key="github")` |
 | `ask_user` | 向用户提问 | `ask_user(question="请输入验证码")` |
 | `dismiss_overlay` | 关闭弹窗 | `dismiss_overlay()` |
-| `done` | 标记完成 | `done(reason="任务已完成")` |
-| `_ai_validate` | AI 验证 | 内部工具，验证操作结果 |
-| `_ai_act` | AI 操作 | 内部工具，视觉驱动操作 |
+| `done` | 标记完成 | `done(summary="任务已完成")` |
 
 ## 🏗️ 项目架构
 
 ```
-playwright/
-├── agent.py              # 核心 Agent 逻辑（1669 行）
-├── app.py                # FastAPI 后端服务（699 行）
-├── db.py                 # SQLite 数据库（118 行）
-├── utils.py              # 工具函数（OpenAI 客户端等）
-├── page_annotator.py     # 页面元素标注（红框+编号）
-├── explorer.py           # 网站探索爬虫
-├── curator.py            # 截图策展（去重+打分）
-├── content_gen.py        # 营销内容生成
-├── site_understanding.py # 网站结构分析
+skyvern/
+├── agent/                  # 核心 Agent 包
+│   ├── __init__.py         # 包导出
+│   ├── core.py             # BrowserAgent 类（截图、点击、输入、工具执行）
+│   ├── runner.py           # run_agent() 主函数（LLM 决策循环）
+│   ├── tools.py            # 工具定义（LLM 可调用的 20+ 操作）
+│   ├── llm_helpers.py      # 任务分解、步骤验证、上下文压缩
+│   ├── page_utils.py       # 页面就绪等待、安全打印
+│   └── chrome_detector.py  # Chrome/Edge 用户数据目录检测
+├── app.py                  # FastAPI 后端服务
+├── db.py                   # SQLite 数据持久化
+├── utils.py                # LLM 路由（OpenAI/Anthropic）、URL 验证
+├── page_annotator.py       # 页面元素标注（红框+编号）
+├── explorer.py             # 网站探索爬虫
+├── curator.py              # 截图策展（去重+打分）
+├── content_gen.py          # 营销内容生成
+├── site_understanding.py   # 网站结构分析
 ├── static/
-│   └── index.html        # Web Dashboard
-├── tests/                # 测试套件（8 个模块）
+│   └── index.html          # Web Dashboard
+├── tests/                  # 测试套件（8 个模块）
 ├── data/
-│   └── tasks.db          # SQLite 数据库
-├── screenshots/          # 任务截图存储
-└── requirements.txt      # Python 依赖
+│   └── tasks.db            # SQLite 数据库
+├── screenshots/            # 任务截图存储
+├── Dockerfile              # 容器化构建
+├── docker-compose.yml      # Docker Compose 编排
+├── pyproject.toml          # 项目元数据 & 版本号
+└── requirements.txt        # Python 依赖
 ```
 
 ## 🔧 高级配置
 
 ### 环境变量
 
+详见 `.env.example`，主要配置项：
+
 | 变量 | 说明 | 默认值 |
 |------|------|--------|
-| `OPENAI_API_KEY` | OpenAI API Key（必填） | - |
+| `OPENAI_API_KEY` | OpenAI API Key | - |
+| `ANTHROPIC_API_KEY` | Anthropic API Key | - |
+| `LLM_BACKEND` | LLM 后端选择 | `openai` |
 | `API_KEY` | 服务端 API 认证密钥（可选） | - |
+| `HEADLESS` | 浏览器无头模式 | `false` |
 | `USE_PROXY` | 是否使用代理 | `false` |
 | `CORS_ORIGINS` | CORS 允许的源（逗号分隔） | `http://localhost:8000` |
 | `MAX_QUEUE_SIZE` | 最大并发任务数 | `20` |
 | `MAX_TASKS_KEEP` | 保留的历史任务数 | `50` |
 
 ### 浏览器模式
-
-目前仅内置 Chromium 模式可用，其余两种模式尚在开发中：
 
 | 模式 | 状态 | 说明 |
 |------|------|------|
@@ -154,16 +171,15 @@ playwright/
 在 `.env` 中添加站点凭证（站点域名用下划线替换点和连字符）：
 
 ```env
-# 示例：felo.ai 的凭证
-FELO_AI_EMAIL=your@email.com
-FELO_AI_PASSWORD=your_password
-
 # 示例：github.com 的凭证
 GITHUB_COM_EMAIL=your@email.com
 GITHUB_COM_PASSWORD=your_password
+
+# 可选：TOTP 两步验证密钥
+GITHUB_COM_TOTP_SECRET=JBSWY3DPEHPK3PXP
 ```
 
-Agent 会在需要时通过 `get_credentials` 工具自动获取。
+Agent 会在需要时通过 `get_credentials` / `get_totp_code` 工具自动获取。
 
 ## 🧪 运行测试
 
@@ -175,8 +191,8 @@ pip install -r requirements-dev.txt
 pytest
 
 # 运行特定测试
-pytest tests/test_agent.py
 pytest tests/test_app.py -v
+pytest -k "test_validate_url"
 ```
 
 ## 📊 API 端点
@@ -192,10 +208,14 @@ pytest tests/test_app.py -v
 
 - `GET /tasks/stream` - SSE 实时订阅任务更新
 
+- `GET /tasks/{task_id}/logs` - 获取任务日志
+
 - `POST /tasks/{task_id}/reply` - 回答 Agent 的提问
   ```json
   {"answer": "用户输入的答案"}
   ```
+
+- `POST /tasks/{task_id}/cancel` - 取消运行中的任务
 
 - `DELETE /tasks/{task_id}` - 删除指定任务
 
@@ -223,6 +243,11 @@ pytest tests/test_app.py -v
   }
   ```
 
+### 导出
+
+- `GET /export/{source}/{id}/json` - 导出为 JSON
+- `GET /export/{source}/{id}/zip` - 导出为 ZIP
+
 ### 静态资源
 
 - `GET /screenshots/{task_id}/{filename}` - 获取截图文件
@@ -233,54 +258,36 @@ pytest tests/test_app.py -v
 - ✅ URL 白名单（阻止 localhost、内网 IP）
 - ✅ 输入验证（selector、filename 等）
 - ✅ 可选 API Key 认证
+- ✅ CORS 配置
+- ✅ 凭证脱敏（密码在日志中显示为 `***`）
 - ✅ 敏感信息检测（自动模糊处理 PII）
-
-## 🐛 已知问题与解决方案
-
-### 问题：Agent 在 AI 生成内容完成前就截图
-
-**原因**：`wait_for_content_change` 在内容开始变化前就返回了。
-
-**解决方案**：使用两阶段等待（已修复）
-```python
-# 任务中明确指定等待时间
-wait(wait_for_content_change=true, timeout=120)
-```
-
-### 问题：Windows 上 Playwright 报 NotImplementedError
-
-**原因**：主事件循环不支持 Playwright 的子进程操作。
-
-**解决方案**：已在 [app.py:75](app.py#L75) 中使用独立线程池 + ProactorEventLoop。
 
 ## 🗺️ 功能路线图
 
-### 第一优先级（解锁真实场景）
-- [ ] 2FA / 验证码处理（短信、TOTP、图形验证码）
-- [ ] 文件上传/下载
-- [ ] 更多 action 类型（hover、drag & drop、原生 select、日期选择器）
+### 已完成
 
-### 第二优先级（工程完整性）
-- [ ] Webhook 回调（任务完成/失败通知）
-- [ ] 任务取消 & 超时配置
-- [ ] 断点续跑（从检查点恢复）
+- [x] 2FA / 验证码处理（TOTP、图形验证码）
+- [x] 文件上传/下载
+- [x] 更多 action 类型（hover、drag & drop、select、switch_tab）
+- [x] Webhook 回调（任务完成/失败通知）
+- [x] 任务取消 & 超时配置
+- [x] 断点续跑（从检查点恢复）
+- [x] 结构化 JSON 日志
+- [x] Docker 支持
+- [x] 商用级稳定性加固（50+ 问题修复）
 
-### 第三优先级（生产化）
+### 计划中
+
 - [ ] YAML 工作流定义（声明式多步骤）
-- [ ] 结构化 JSON 日志
-- [ ] Docker 支持
+- [ ] 多浏览器实例并行执行
+- [ ] 插件系统（自定义工具扩展）
 
-## 📝 开发日志
+## 🧪 运行测试
 
-- **2026-03-14** - 完成商用级稳定性加固（修复 50+ 问题）
-  - 数组越界保护、JSON 解析异常处理
-  - Playwright 操作异常捕获、资源泄漏修复
-  - 安全漏洞修复、防御性编程改进
-  - 详见 [stability_plan.md](C:\Users\wangzhiming\.claude\projects\c--Users-wangzhiming-Desktop-playwright\memory\stability_plan.md)
-
-- **2026-03-12** - 实现 Human-in-the-loop（ask_user 工具）
-
-- **2026-03-10** - 优化内容稳定检测（两阶段等待）
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
 
 ## 🤝 贡献指南
 
@@ -296,12 +303,13 @@ wait(wait_for_content_change=true, timeout=120)
 
 ## 📄 许可证
 
-MIT License
+[MIT License](LICENSE)
 
 ## 🙏 致谢
 
 - [Playwright](https://playwright.dev/) - 浏览器自动化框架
 - [OpenAI GPT-4o](https://openai.com/) - 视觉语言模型
+- [Anthropic Claude](https://anthropic.com/) - 视觉语言模型
 - [FastAPI](https://fastapi.tiangolo.com/) - 现代 Web 框架
 - [Skyvern](https://github.com/Skyvern-AI/skyvern) - 灵感来源
 

@@ -1,0 +1,26 @@
+[project]
+name = "skyvern"
+version = "0.1.0"
+description = "AI-driven browser automation platform using GPT-4o / Claude vision"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.11"
+dependencies = [
+    "playwright>=1.44.0",
+    "openai>=1.30.0",
+    "anthropic>=0.34.0",
+    "python-dotenv>=1.0.0",
+    "fastapi>=0.111.0",
+    "uvicorn[standard]>=0.29.0",
+    "pillow>=10.0.0",
+    "imagehash>=4.3.1",
+    "httpx>=0.27.0",
+    "json-repair>=0.34.0",
+    "pyotp>=2.9.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.0.0",
+    "pytest-asyncio>=1.3.0",
+]
