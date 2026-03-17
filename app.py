@@ -235,7 +235,7 @@ def _run_agent_in_thread(
                 headless=HEADLESS,
                 task_id=task_id,
                 log_callback=thread_safe_log,
-                cookies_path=f"cookies_{task_id}.json",
+                cookies_path=f"data/cookies/cookies_{task_id}.json",
                 screenshots_dir=f"screenshots/{task_id}",
                 ask_user_callback=ask_user_callback,
                 screenshot_callback=thread_safe_screenshot,

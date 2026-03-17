@@ -19,8 +19,8 @@ htmlcov/
 .env.local
 *.log
 
-# 会话/运行时生成（如 cookies_2c77321a.json）
-cookies*.json
+# 会话/运行时生成的 cookies
+data/cookies/
 
 # 截图/测试产出（可重新生成）
 screenshots/
@@ -31,6 +31,9 @@ screenshots/
 .vscode/
 *.swp
 *.swo
+
+# 归档的遗留代码
+_archive/
 
 # Node（若有前端）
 node_modules/

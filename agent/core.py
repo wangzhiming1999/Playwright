@@ -428,6 +428,7 @@ class BrowserAgent:
                 await self._log(f"  [DOM] 找到 {len(inputs_info)} 个输入框")
 
                 resp = _llm_chat(
+                    model="mini",
                     messages=[{
                         "role": "user",
                         "content": (

@@ -15,8 +15,10 @@ from playwright.async_api import async_playwright
 from .page_utils import _safe_print, _wait_for_page_ready
 from .core import BrowserAgent
 from .tools import TOOLS
-from .llm_helpers import _decompose_task, _verify_step, _compress_messages, _analyze_failure
+from .llm_helpers import _decompose_task, _verify_step, _compress_messages, _analyze_failure, trim_elements
 from .chrome_detector import _find_chrome_user_data_dir
+from .error_recovery import FailureTracker
+from .circuit_breaker import CircuitBreaker
 
 from utils import llm_chat
 from page_annotator import annotate_page
@@ -27,7 +29,7 @@ async def run_agent(
     headless: bool = False,
     task_id: str = None,
     log_callback=None,
-    cookies_path: str = "cookies.json",
+    cookies_path: str = "data/cookies/cookies.json",
     screenshots_dir: str = "screenshots",
     ask_user_callback=None,      # async (task_id, question, reason) -> str
     screenshot_callback=None,    # async (task_id, filename) -> None
@@ -100,6 +102,7 @@ async def run_agent(
 
         # cookies_file 所有模式都需要定义（builtin 模式读写，其他模式只在需要时写）
         cookies_file = Path(cookies_path)
+        cookies_file.parent.mkdir(parents=True, exist_ok=True)
 
         # builtin 模式才需要手动加载 cookies
         if browser_mode == "builtin":
@@ -157,50 +160,54 @@ async def run_agent(
                 "密码框必须设 is_password: true。"
             )
 
+        # ── Prompt 静态/动态拆分 ──────────────────────────────────────────
+        # 静态部分放在 system message 开头，利用 prompt caching 降低成本
+        # 动态部分（任务、凭证提示）放在 user message
+        _SYSTEM_PROMPT_STATIC = (
+            "你是一个网页操作助手。每次我会给你当前页面的截图，用视觉理解页面，调用工具完成用户任务。\n"
+            "核心原则：仔细观察截图，理解页面布局和内容，再决定下一步操作。\n\n"
+            "## 基本规则\n"
+            "1. 每次只调用一个工具\n"
+            "2. 操作元素优先用截图中的蓝色 index 编号，比文字更准确\n"
+            "3. 操作失败时换个方式重试（换 index、用 text、滚动页面、用 find_element 视觉定位），不要直接 done 放弃——除非连续5次都失败\n"
+            "4. 任务全部完成后先截图，再调用 done\n"
+            "5. 遇到登录页面，继续完成登录，不要放弃\n\n"
+            "## 查找和定位策略（重要）\n"
+            "当任务要求找到页面上的特定内容（图片、文字、按钮等）时：\n"
+            "1. 先仔细观察当前截图，看目标是否已经在可视区域内\n"
+            "2. 如果目标不在当前视口，用 scroll(direction='down') 向下滚动，每次滚动后观察新截图\n"
+            "3. 如果元素列表中没有目标元素的 index（比如图片、非交互元素），用 find_element 工具通过视觉描述定位\n"
+            "4. 找到目标后，根据任务需求决定操作：点击、下载、截图等\n"
+            "5. 不要在没有看到目标的情况下就放弃，先滚动整个页面搜索\n\n"
+            "## 下载策略\n"
+            "下载文件/图片时，按优先级尝试：\n"
+            "1. 如果页面有明确的下载按钮/链接，用 click 或 download_file 点击它\n"
+            "2. 如果是图片，用 find_element 定位图片，然后用 save_element 保存图片到本地\n"
+            "3. 如果以上都不行，用 get_page_html 获取页面源码，找到图片/文件的 URL，然后用 download_url 直接下载\n"
+            "4. 不要尝试右键另存为（浏览器自动化不支持原生右键菜单）\n\n"
+            "## 等待规则\n"
+            "- 点击提交/搜索/发送按钮后，如果任务要求等待生成结果，必须调用 wait(wait_for_content_change=true, timeout=120)\n"
+            "- wait 会自动等待内容开始出现，再等内容停止变化，完成后再截图\n"
+            "- 普通页面跳转（登录、导航）不需要调用 wait，系统已自动处理\n\n"
+            "## 提交规则\n"
+            "- 在输入框输入内容后，必须点击提交/发送/搜索按钮，或者用 press_enter=true 提交，不能直接 done\n"
+            "- 提交后才能等待生成结果\n\n"
+            "## 登录规则\n"
+            "- 看到邮箱框填邮箱，看到密码框填密码，看到按钮就点\n"
+            "- 两步登录（先邮箱后密码）：点继续后等新截图再填密码\n"
+            "- 没有凭证时调用 get_credentials(site_key) 获取\n\n"
+            "## 滚动搜索策略\n"
+            "当需要在页面中找到特定内容时：\n"
+            "- 先观察当前视口，如果没找到就向下滚动\n"
+            "- 每次滚动后仔细观察新截图中是否出现了目标\n"
+            "- 如果滚动到底部还没找到，尝试回到顶部用 find_element 搜索\n"
+            "- 页面可能有懒加载，滚动后等待内容出现\n"
+        )
+
         messages = [
             {
                 "role": "system",
-                "content": (
-                    "你是一个网页操作助手。每次我会给你当前页面的截图，用视觉理解页面，调用工具完成用户任务。\n"
-                    "核心原则：仔细观察截图，理解页面布局和内容，再决定下一步操作。\n\n"
-                    "## 基本规则\n"
-                    "1. 每次只调用一个工具\n"
-                    "2. 操作元素优先用截图中的蓝色 index 编号，比文字更准确\n"
-                    "3. 操作失败时换个方式重试（换 index、用 text、滚动页面、用 find_element 视觉定位），不要直接 done 放弃——除非连续5次都失败\n"
-                    "4. 任务全部完成后先截图，再调用 done\n"
-                    "5. 遇到登录页面，继续完成登录，不要放弃\n\n"
-                    "## 查找和定位策略（重要）\n"
-                    "当任务要求找到页面上的特定内容（图片、文字、按钮等）时：\n"
-                    "1. 先仔细观察当前截图，看目标是否已经在可视区域内\n"
-                    "2. 如果目标不在当前视口，用 scroll(direction='down') 向下滚动，每次滚动后观察新截图\n"
-                    "3. 如果元素列表中没有目标元素的 index（比如图片、非交互元素），用 find_element 工具通过视觉描述定位\n"
-                    "4. 找到目标后，根据任务需求决定操作：点击、下载、截图等\n"
-                    "5. 不要在没有看到目标的情况下就放弃，先滚动整个页面搜索\n\n"
-                    "## 下载策略\n"
-                    "下载文件/图片时，按优先级尝试：\n"
-                    "1. 如果页面有明确的下载按钮/链接，用 click 或 download_file 点击它\n"
-                    "2. 如果是图片，用 find_element 定位图片，然后用 save_element 保存图片到本地\n"
-                    "3. 如果以上都不行，用 get_page_html 获取页面源码，找到图片/文件的 URL，然后用 download_url 直接下载\n"
-                    "4. 不要尝试右键另存为（浏览器自动化不支持原生右键菜单）\n\n"
-                    "## 等待规则\n"
-                    "- 点击提交/搜索/发送按钮后，如果任务要求等待生成结果，必须调用 wait(wait_for_content_change=true, timeout=120)\n"
-                    "- wait 会自动等待内容开始出现，再等内容停止变化，完成后再截图\n"
-                    "- 普通页面跳转（登录、导航）不需要调用 wait，系统已自动处理\n\n"
-                    "## 提交规则\n"
-                    "- 在输入框输入内容后，必须点击提交/发送/搜索按钮，或者用 press_enter=true 提交，不能直接 done\n"
-                    "- 提交后才能等待生成结果\n\n"
-                    "## 登录规则\n"
-                    "- 看到邮箱框填邮箱，看到密码框填密码，看到按钮就点\n"
-                    "- 两步登录（先邮箱后密码）：点继续后等新截图再填密码\n"
-                    "- 没有凭证时调用 get_credentials(site_key) 获取\n\n"
-                    "## 滚动搜索策略\n"
-                    "当需要在页面中找到特定内容时：\n"
-                    "- 先观察当前视口，如果没找到就向下滚动\n"
-                    "- 每次滚动后仔细观察新截图中是否出现了目标\n"
-                    "- 如果滚动到底部还没找到，尝试回到顶部用 find_element 搜索\n"
-                    "- 页面可能有懒加载，滚动后等待内容出现\n"
-                    + _cred_hint
-                ),
+                "content": _SYSTEM_PROMPT_STATIC + _cred_hint,
             },
             {
                 "role": "user",
@@ -213,6 +220,12 @@ async def run_agent(
         fail_count = 0
         last_tool_name = None
         last_tool_pressed_enter = False
+        _last_content_hash = None  # 用于截图复用：检测 DOM 是否变化
+
+        # ── 智能错误恢复 + 熔断器 ──────────────────────────────────
+        failure_tracker = FailureTracker()
+        llm_breaker = CircuitBreaker("llm_api", failure_threshold=3, cooldown=30.0,
+                                     log_fn=lambda msg: asyncio.ensure_future(_log(msg)))
 
         # ── 任务分解 ──────────────────────────────────────────────
         await _log("  [任务分解] 正在拆解任务步骤...")
@@ -279,19 +292,37 @@ async def run_agent(
             # 截图前确保页面就绪（统一使用 _wait_for_page_ready）
             await _wait_for_page_ready(agent.page, log_fn=_log, timeout_ms=10000, check_network=True, active_requests=active_requests)
 
-            # 用标注截图：给所有可交互元素打红框+编号
+            # DOM 变化检测：如果页面内容没变，复用上一张截图（节省 token）
             try:
-                img_b64, elements = await annotate_page(agent.page)
-            except Exception as e:
-                await _log(f"  ⚠ 页面标注失败: {e}，使用普通截图")
+                _cur_hash = await agent.page.evaluate("() => document.body.innerText.length + '|' + document.body.children.length")
+            except Exception:
+                _cur_hash = None
+
+            _reuse_screenshot = (
+                _cur_hash is not None
+                and _cur_hash == _last_content_hash
+                and step > 0
+                and last_tool_name in ("wait", "screenshot")  # 只有无副作用的操作才复用
+            )
+
+            if _reuse_screenshot:
+                await _log(f"  [截图复用] DOM 未变化，跳过重新截图")
+            else:
+                # 用标注截图：给所有可交互元素打蓝框+编号
                 try:
-                    raw = await agent.page.screenshot(type="jpeg", quality=80)
-                    img_b64 = base64.b64encode(raw).decode()
-                    elements = []
-                except Exception as e2:
-                    await _log(f"  ❌ 截图也失败: {e2}，终止任务")
-                    break
-            elements_summary = json.dumps(elements, ensure_ascii=False)
+                    img_b64, elements = await annotate_page(agent.page)
+                except Exception as e:
+                    await _log(f"  ⚠ 页面标注失败: {e}，使用普通截图")
+                    try:
+                        raw = await agent.page.screenshot(type="jpeg", quality=60)
+                        img_b64 = base64.b64encode(raw).decode()
+                        elements = []
+                    except Exception as e2:
+                        await _log(f"  ❌ 截图也失败: {e2}，终止任务")
+                        break
+                _last_content_hash = _cur_hash
+
+            elements_summary = trim_elements(elements)
 
             # 保存标注截图，方便调试，并实时推送给前端
             debug_path = screenshots_dir / f"step_{step+1:02d}_annotated.jpg"
@@ -333,12 +364,26 @@ async def run_agent(
                 messages = _compress_messages(messages, max_history=16)
                 await _log(f"  [上下文] 已压缩历史，当前 {len(messages)} 条消息")
 
-            response = llm_chat(
-                messages=messages,
-                tools=TOOLS,
-                tool_choice="required",
-                max_tokens=1000,
-            )
+            # LLM 调用（带熔断保护）
+            if not llm_breaker.check():
+                await _log("  ⚠ LLM API 熔断中，等待冷却...")
+                await asyncio.sleep(llm_breaker.cooldown)
+
+            try:
+                response = llm_chat(
+                    messages=messages,
+                    tools=TOOLS,
+                    tool_choice="required",
+                    max_tokens=1000,
+                )
+                llm_breaker.record_success()
+            except Exception as e:
+                llm_breaker.record_failure()
+                await _log(f"  ❌ LLM API 调用失败: {e}")
+                if llm_breaker.state.value == "open":
+                    await _log(f"  ⚠ LLM API 熔断，等待 {llm_breaker.cooldown}s 后重试")
+                    await asyncio.sleep(llm_breaker.cooldown)
+                continue
 
             if not response.choices:
                 await _log("⚠️ LLM API 返回空 choices，终止任务")
@@ -567,7 +612,7 @@ async def run_agent(
                         messages.append({"role": "tool", "tool_call_id": tc.id, "content": "skipped"})
                     break
 
-            # 失败计数 + 智能重试分析
+            # 失败计数 + 智能重试分析（使用 FailureTracker 替代全局计数器）
             is_failure = (
                 result.startswith("操作失败") or
                 result.startswith("AI操作失败") or
@@ -575,16 +620,19 @@ async def run_agent(
                 result.startswith("输入失败")
             )
             if is_failure:
-                fail_count += 1
-                await _log(f"  [失败计数] {fail_count}/5 — {result[:80]}")
+                ft, ft_count, recovery_hint = failure_tracker.record_failure(tool_name, result)
+                await _log(f"  [失败追踪] {ft.value} #{ft_count} — {result[:80]}")
+                if recovery_hint:
+                    result += f"\n[恢复建议] {recovery_hint}"
+                    await _log(f"  [恢复建议] {recovery_hint}")
                 advice = _analyze_failure(tool_name, tool_args, result)
                 if advice:
-                    result += f"\n[建议] {advice}"
-                    await _log(f"  [重试建议] {advice}")
+                    result += f"\n[AI建议] {advice}"
+                    await _log(f"  [AI建议] {advice}")
             else:
-                if fail_count > 0:
-                    await _log(f"  [失败计数] 已重置（上次={fail_count}）")
-                fail_count = 0
+                if failure_tracker.total_consecutive > 0:
+                    await _log(f"  [失败追踪] 已重置（上次连续={failure_tracker.total_consecutive}）")
+                failure_tracker.record_success()
 
             # 记录上一步工具信息，供下一步拦截判断
             last_tool_name = tool_name
@@ -602,9 +650,11 @@ async def run_agent(
             for tc in msg.tool_calls[1:]:
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": "skipped"})
 
-            if fail_count >= 5:
-                await _log("\n⚠️  连续5次失败，终止任务")
-                task_reason = "连续5次操作失败"
+            # 检查是否应该终止（基于 FailureTracker 的分类计数）
+            should_abort, abort_reason = failure_tracker.should_abort()
+            if should_abort:
+                await _log(f"\n⚠️  {abort_reason}，终止任务")
+                task_reason = abort_reason
                 steps_executed = step + 1
                 break
         else:

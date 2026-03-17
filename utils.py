@@ -1,6 +1,15 @@
 """
 Shared utilities: multi-backend LLM router, retry wrapper, URL validation.
-Supports OpenAI and Anthropic backends, switchable via LLM_BACKEND env var.
+Supports OpenAI, Anthropic, and litellm (Gemini, local models, etc.) backends.
+
+Backend selection:
+  - LLM_BACKEND=openai    → direct OpenAI SDK
+  - LLM_BACKEND=anthropic → direct Anthropic SDK
+  - LLM_BACKEND=litellm   → litellm router (supports 100+ models)
+
+Model override:
+  - LLM_MODEL=gpt-4o              → override default model
+  - LLM_MINI_MODEL=gpt-4o-mini    → override mini model
 """
 
 import json
@@ -16,23 +25,30 @@ logger = logging.getLogger(__name__)
 
 # ── Backend config ───────────────────────────────────────────────────────────
 
-_MODELS = {
+_BUILTIN_MODELS = {
     "openai": {"default": "gpt-4o", "mini": "gpt-4o-mini"},
     "anthropic": {"default": "claude-sonnet-4-20250514", "mini": "claude-haiku-4-5-20251001"},
+    "litellm": {"default": "gpt-4o", "mini": "gpt-4o-mini"},
 }
 
 
 def get_backend() -> str:
-    """Return current LLM backend: 'openai' or 'anthropic'."""
+    """Return current LLM backend: 'openai', 'anthropic', or 'litellm'."""
     return os.getenv("LLM_BACKEND", "openai").lower().strip()
 
 
 def get_default_model() -> str:
-    return _MODELS[get_backend()]["default"]
+    env_model = os.getenv("LLM_MODEL", "").strip()
+    if env_model:
+        return env_model
+    return _BUILTIN_MODELS.get(get_backend(), _BUILTIN_MODELS["openai"])["default"]
 
 
 def get_mini_model() -> str:
-    return _MODELS[get_backend()]["mini"]
+    env_model = os.getenv("LLM_MINI_MODEL", "").strip()
+    if env_model:
+        return env_model
+    return _BUILTIN_MODELS.get(get_backend(), _BUILTIN_MODELS["openai"])["mini"]
 
 
 def _resolve_backend(model: str) -> str:
@@ -41,19 +57,25 @@ def _resolve_backend(model: str) -> str:
         return "anthropic"
     if model.startswith("gpt"):
         return "openai"
-    return get_backend()
+    backend = get_backend()
+    # 非 openai/anthropic 前缀的模型，如果 backend 不是 litellm，自动走 litellm
+    if backend not in ("openai", "anthropic") or (
+        not model.startswith("gpt") and not model.startswith("claude")
+    ):
+        if backend == "litellm":
+            return "litellm"
+    return backend
 
 
 def _resolve_model(model: str) -> tuple[str, str]:
     """Resolve model alias and determine backend. Returns (actual_model, backend)."""
     if model == "default" or not model:
-        backend = get_backend()
-        return _MODELS[backend]["default"], backend
+        actual = get_default_model()
+        return actual, _resolve_backend(actual)
     if model == "mini":
-        backend = get_backend()
-        return _MODELS[backend]["mini"], backend
-    backend = _resolve_backend(model)
-    return model, backend
+        actual = get_mini_model()
+        return actual, _resolve_backend(actual)
+    return model, _resolve_backend(model)
 
 
 # ── Client factories (cached) ───────────────────────────────────────────────
@@ -213,6 +235,21 @@ def _convert_tools(openai_tools: list) -> list:
     ]
 
 
+def _strip_images(messages: list) -> list:
+    """Remove image_url blocks from messages for non-vision models."""
+    stripped = []
+    for m in messages:
+        content = m.get("content")
+        if isinstance(content, list):
+            text_only = [b for b in content if isinstance(b, dict) and b.get("type") != "image_url"]
+            if text_only:
+                stripped.append({**m, "content": text_only})
+            # skip messages that were image-only
+        else:
+            stripped.append(m)
+    return stripped
+
+
 # ── OpenAI backend ───────────────────────────────────────────────────────────
 
 def _call_openai(messages: list, model: str, max_tokens: int,
@@ -320,25 +357,109 @@ def _call_anthropic(messages: list, model: str, max_tokens: int,
     return _WrappedResponse.from_anthropic(resp)
 
 
+# ── litellm backend ─────────────────────────────────────────────────────────
+
+def _call_litellm(messages: list, model: str, max_tokens: int,
+                  tools: list = None, tool_choice: str = None,
+                  response_format: dict = None, **kwargs) -> _WrappedResponse:
+    """
+    Call any model via litellm (Gemini, Ollama, Azure, etc.).
+    litellm uses OpenAI-compatible format, so we wrap the response the same way.
+    """
+    import litellm
+
+    # litellm respects env vars: OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY, etc.
+    api_kwargs = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+    }
+    if tools:
+        api_kwargs["tools"] = tools
+    if tool_choice:
+        api_kwargs["tool_choice"] = tool_choice
+    if response_format:
+        api_kwargs["response_format"] = response_format
+
+    resp = litellm.completion(**api_kwargs)
+    return _WrappedResponse.from_openai(resp)
+
+
+# ── Model capabilities detection ────────────────────────────────────────────
+
+# Known vision-capable model prefixes
+_VISION_MODELS = {
+    "gpt-4o", "gpt-4-turbo", "gpt-4-vision",
+    "claude-sonnet", "claude-opus", "claude-haiku",
+    "gemini-2", "gemini-1.5", "gemini-pro-vision",
+}
+
+# Known models that support function calling / tool use
+_TOOL_MODELS = {
+    "gpt-4o", "gpt-4-turbo", "gpt-4o-mini", "gpt-3.5-turbo",
+    "claude-sonnet", "claude-opus", "claude-haiku",
+    "gemini-2", "gemini-1.5",
+}
+
+
+def get_model_capabilities(model: str) -> dict:
+    """
+    Detect model capabilities based on model name.
+    Returns: {"vision": bool, "tools": bool, "max_tokens": int}
+    """
+    m = model.lower()
+
+    has_vision = any(m.startswith(prefix) for prefix in _VISION_MODELS)
+    has_tools = any(m.startswith(prefix) for prefix in _TOOL_MODELS)
+
+    # Rough max context estimates
+    if "gpt-4o" in m:
+        max_ctx = 128000
+    elif "claude" in m:
+        max_ctx = 200000
+    elif "gemini" in m:
+        max_ctx = 1000000
+    else:
+        max_ctx = 8000  # conservative default
+
+    return {
+        "vision": has_vision,
+        "tools": has_tools,
+        "max_tokens": max_ctx,
+    }
+
+
 # ── Unified LLM call (public API) ───────────────────────────────────────────
 
 def llm_chat(messages: list, model: str = None, max_tokens: int = 1000,
              tools: list = None, tool_choice: str = None,
              response_format: dict = None, **kwargs) -> _WrappedResponse:
     """
-    Unified LLM call — routes to OpenAI or Anthropic based on model name / env.
+    Unified LLM call — routes to OpenAI, Anthropic, or litellm.
 
     Model resolution:
-      - None / "default" → current backend's default model
-      - "mini"           → current backend's mini model
-      - "gpt-*"          → OpenAI
-      - "claude-*"       → Anthropic
-      - other            → current backend (LLM_BACKEND env)
+      - None / "default" → LLM_MODEL env or backend's default
+      - "mini"           → LLM_MINI_MODEL env or backend's mini
+      - "gpt-*"          → OpenAI direct
+      - "claude-*"       → Anthropic direct
+      - other            → litellm (if LLM_BACKEND=litellm) or current backend
 
     Returns OpenAI-compatible response wrapper regardless of backend.
     """
     actual_model, backend = _resolve_model(model or "default")
-    call_fn = _call_openai if backend == "openai" else _call_anthropic
+
+    # Auto-strip images for non-vision models
+    caps = get_model_capabilities(actual_model)
+    if not caps["vision"] and tools is None:
+        # Remove image content from messages to avoid errors
+        messages = _strip_images(messages)
+
+    _backends = {
+        "openai": _call_openai,
+        "anthropic": _call_anthropic,
+        "litellm": _call_litellm,
+    }
+    call_fn = _backends.get(backend, _call_openai)
 
     last_exc = None
     for attempt in range(3):

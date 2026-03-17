@@ -284,6 +284,15 @@ _ANNOTATE_JS = """() => {
 
         // 构建元素信息
         const tag = el.tagName.toLowerCase();
+
+        // 装饰性元素标记：SVG icon < 24x24、空文本的 span/div、纯装饰图片
+        let is_decorative = false;
+        if (tag === 'svg' || (tag === 'img' && rect.width < 24 && rect.height < 24)) {
+            is_decorative = true;
+        } else if ((tag === 'span' || tag === 'div' || tag === 'i') && !(el.textContent || '').trim() && !el.querySelector('img')) {
+            is_decorative = true;
+        }
+
         const info = {
             index: index,
             tag: tag,
@@ -301,6 +310,7 @@ _ANNOTATE_JS = """() => {
             h: Math.round(rect.height),
             css_selector: buildSelector(el),
             xpath: buildXPath(el),
+            is_decorative: is_decorative,
         };
 
         // 图片/媒体元素额外属性
@@ -413,7 +423,7 @@ async def annotate_page(page):
 
     await asyncio.sleep(0.3)
 
-    screenshot = await page.screenshot(type="jpeg", quality=85)
+    screenshot = await page.screenshot(type="jpeg", quality=60)
     img_b64 = base64.b64encode(screenshot).decode()
 
     # 移除视觉标注，但保留 data-skyvern-id（execute 还要用）

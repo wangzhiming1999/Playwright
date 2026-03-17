@@ -79,27 +79,71 @@ _COMPACT_FIELDS = ["index", "tag", "type", "text", "placeholder", "aria_label", 
 _MINIMAL_FIELDS = ["index", "tag", "text"]
 
 
+def _filter_decorative(elements: list[dict]) -> list[dict]:
+    """过滤装饰性元素（由 page_annotator 标记的 is_decorative=true）"""
+    return [el for el in elements if not el.get("is_decorative", False)]
+
+
+def _merge_similar_siblings(elements: list[dict], max_group: int = 5) -> list[dict]:
+    """
+    合并相邻的同类元素（如连续的 <li>、<a> 列表项），只保留前 max_group 个 + 计数。
+    减少重复元素对 token 的浪费。
+    """
+    if len(elements) <= max_group:
+        return elements
+
+    result = []
+    i = 0
+    while i < len(elements):
+        el = elements[i]
+        tag = el.get("tag", "")
+        # 只对列表类元素做合并
+        if tag not in ("li", "a", "option", "tr"):
+            result.append(el)
+            i += 1
+            continue
+
+        # 收集连续同 tag 元素
+        group = [el]
+        j = i + 1
+        while j < len(elements) and elements[j].get("tag") == tag:
+            group.append(elements[j])
+            j += 1
+
+        if len(group) <= max_group:
+            result.extend(group)
+        else:
+            result.extend(group[:max_group])
+            result.append({"index": -1, "tag": tag, "text": f"...还有 {len(group) - max_group} 个同类元素"})
+        i = j
+
+    return result
+
+
 def trim_elements(elements: list[dict], max_tokens: int = _MAX_ELEMENTS_TOKENS) -> str:
     """
-    经济元素树：根据 token 预算逐级裁剪元素列表。
-    裁剪策略（逐级降级）：
-    1. 完整版 → 2. 精简字段 → 3. 截断文字 → 4. 最小字段 + 过滤
+    经济元素树：默认使用 compact fields，逐级降级裁剪。
+    裁剪策略：
+    0. 过滤装饰性元素 + 合并同类兄弟
+    1. 精简字段（默认起点）→ 2. 截断文字 → 3. 最小字段 + 过滤 → 4. 仅交互元素
     """
     if not elements:
         return "[]"
 
-    full_json = json.dumps(elements, ensure_ascii=False)
-    if len(full_json) / _CHARS_PER_TOKEN <= max_tokens:
-        return full_json
+    # Step 0: 预处理 — 过滤装饰性元素 + 合并同类兄弟
+    filtered = _filter_decorative(elements)
+    filtered = _merge_similar_siblings(filtered)
 
+    # Step 1: compact fields（默认起点，不再先尝试完整版）
     compact = [
         {k: el[k] for k in _COMPACT_FIELDS if k in el and el[k] != ""}
-        for el in elements
+        for el in filtered
     ]
     compact_json = json.dumps(compact, ensure_ascii=False)
     if len(compact_json) / _CHARS_PER_TOKEN <= max_tokens:
         return compact_json
 
+    # Step 2: 截断长文本
     for el in compact:
         if "text" in el and len(el["text"]) > 20:
             el["text"] = el["text"][:20] + "…"
@@ -107,8 +151,9 @@ def trim_elements(elements: list[dict], max_tokens: int = _MAX_ELEMENTS_TOKENS) 
     if len(truncated_json) / _CHARS_PER_TOKEN <= max_tokens:
         return truncated_json
 
+    # Step 3: 最小字段
     minimal = []
-    for el in elements:
+    for el in filtered:
         tag = el.get("tag", "")
         text = el.get("text", "")
         if tag == "a" and not text.strip():
@@ -125,6 +170,7 @@ def trim_elements(elements: list[dict], max_tokens: int = _MAX_ELEMENTS_TOKENS) 
     if len(minimal_json) / _CHARS_PER_TOKEN <= max_tokens:
         return minimal_json
 
+    # Step 4: 仅保留交互元素
     interactive_only = [el for el in minimal if el.get("tag") in _INTERACTIVE_TAGS]
     return json.dumps(interactive_only, ensure_ascii=False)
 
@@ -142,6 +188,7 @@ def _decompose_task(task: str) -> list[dict]:
     """
     try:
         resp = llm_chat(
+            model="mini",
             messages=[{
                 "role": "user",
                 "content": (
@@ -273,12 +320,53 @@ def _compress_messages(messages: list, max_history: int = 16) -> list:
     return messages[:2] + [summary_msg] + messages[-max_history:]
 
 
-# ── 智能重试分析 ──────────────────────────────────────────────────────────────
+# ── 失败模式识别 + 智能重试分析 ──────────────────────────────────────────────
+
+# 常见失败模式的规则匹配（不需要调用 LLM，快速返回）
+_FAILURE_PATTERNS = {
+    "login_wall": {
+        "keywords": ["登录", "login", "sign in", "sign up", "注册", "log in", "authenticate"],
+        "hint": "检测到登录墙。建议调用 get_credentials 获取凭证，然后完成登录流程。",
+    },
+    "captcha": {
+        "keywords": ["captcha", "验证码", "recaptcha", "hcaptcha", "人机验证", "verify"],
+        "hint": "检测到验证码。建议调用 solve_captcha 尝试自动识别，失败则用 ask_user 请求人工协助。",
+    },
+    "anti_bot": {
+        "keywords": ["blocked", "forbidden", "403", "access denied", "cloudflare", "bot detection", "反爬"],
+        "hint": "检测到反爬/反机器人拦截。建议：1) 等待几秒后重试 2) 尝试刷新页面 3) 如果持续被拦截，用 ask_user 通知用户。",
+    },
+    "redirect": {
+        "keywords": ["redirect", "重定向", "跳转", "302", "301"],
+        "hint": "页面发生了重定向。建议截图观察当前实际页面，根据新页面内容调整操作。",
+    },
+    "rate_limit": {
+        "keywords": ["429", "rate limit", "too many requests", "频率限制", "请求过多"],
+        "hint": "触发了频率限制。建议等待 10-30 秒后重试。",
+    },
+}
+
+
+def _match_failure_pattern(error_result: str) -> str | None:
+    """规则匹配常见失败模式，返回恢复建议或 None。"""
+    lower = error_result.lower()
+    for pattern_name, pattern in _FAILURE_PATTERNS.items():
+        if any(kw in lower for kw in pattern["keywords"]):
+            return f"[{pattern_name}] {pattern['hint']}"
+    return None
+
 
 def _analyze_failure(tool_name: str, tool_args: dict, error_result: str) -> str:
     """
-    操作失败时，用 GPT 分析失败原因并给出下一步建议。
+    操作失败时，先用规则匹配常见模式（快速、免费），
+    匹配不到再用 GPT 分析失败原因并给出下一步建议。
     """
+    # 1. 规则匹配（零成本）
+    pattern_hint = _match_failure_pattern(error_result)
+    if pattern_hint:
+        return pattern_hint
+
+    # 2. LLM 分析（兜底）
     try:
         resp = llm_chat(
             model="mini",
