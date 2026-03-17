@@ -1,0 +1,20 @@
+.tasks-page {
+  display: grid;
+  grid-template-columns: 360px 1fr;
+  height: 100%;
+  overflow: hidden;
+}
+
+.tasks-sidebar {
+  background: var(--bg-secondary);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.tasks-detail {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}

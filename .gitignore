@@ -35,5 +35,7 @@ screenshots/
 # 归档的遗留代码
 _archive/
 
-# Node（若有前端）
+# Node（前端）
 node_modules/
+frontend/node_modules/
+frontend/dist/

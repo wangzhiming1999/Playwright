@@ -1,0 +1,61 @@
+.explore-page {
+  display: grid;
+  grid-template-columns: 360px 1fr;
+  height: 100%;
+  overflow: hidden;
+}
+
+.explore-sidebar {
+  background: var(--bg-secondary);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.explore-form {
+  padding: 12px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.explore-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px;
+}
+
+.explore-detail {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.site-understanding {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.site-info-row {
+  display: flex;
+  gap: 12px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 14px;
+}
+
+.site-label {
+  color: var(--text-secondary);
+  min-width: 100px;
+  font-weight: 500;
+}
+
+.candidate-page {
+  padding: 12px;
+  background: var(--bg-tertiary);
+  border-radius: var(--radius-sm);
+  margin-bottom: 8px;
+}

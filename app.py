@@ -1203,3 +1203,15 @@ def get_workflow_run(run_id: str, _: None = Depends(_verify_api_key)):
     if not run:
         raise HTTPException(status_code=404, detail="workflow run not found")
     return run
+
+
+# ── SPA fallback: React Router 需要所有非 API 路径返回 index.html ──────────
+@app.get("/{full_path:path}")
+def spa_fallback(full_path: str):
+    static_file = Path("static") / full_path
+    if static_file.exists() and static_file.is_file():
+        return FileResponse(str(static_file))
+    index = Path("static/index.html")
+    if index.exists():
+        return FileResponse(str(index))
+    raise HTTPException(status_code=404, detail="not found")
