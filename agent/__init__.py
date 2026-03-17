@@ -21,6 +21,7 @@ from .plan_manager import PlanManager
 from .watchdog import Watchdog, EventType
 from .action_registry import action, load_custom_actions, get_custom_tools, get_registry
 from .task_pool import TaskPool
+from .browser_pool import BrowserPool
 
 __version__ = "0.1.0"
 
@@ -32,5 +33,6 @@ __all__ = [
     "Watchdog", "EventType",
     "action", "load_custom_actions", "get_custom_tools", "get_registry",
     "TaskPool",
+    "BrowserPool",
     "__version__",
 ]

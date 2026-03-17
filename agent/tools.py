@@ -139,6 +139,24 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "extract",
+            "description": (
+                "从当前页面提取信息（不需要截图，用轻量模型分析页面文本）。"
+                "适用于：读取页面上的文字内容、查找特定信息、确认页面状态。"
+                "比截图更快更省 token。复杂视觉内容（图片、验证码）请用 screenshot。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "description": "要从页面提取的信息，如'页面上显示的价格是多少'、'搜索结果有几条'、'当前登录的用户名是什么'"},
+                },
+                "required": ["question"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "done",
             "description": "任务已完成，退出循环",
             "parameters": {

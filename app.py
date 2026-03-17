@@ -21,6 +21,7 @@ from dotenv import load_dotenv
 load_dotenv()
 from pathlib import Path
 
+from contextlib import asynccontextmanager
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
@@ -29,6 +30,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from agent import run_agent
 from agent.task_pool import TaskPool
+from agent.browser_pool import BrowserPool
 from curator import curate
 from explorer import run_exploration
 from content_gen import generate_all
@@ -55,11 +57,33 @@ API_KEY = os.getenv("API_KEY")  # Optional API key for authentication
 MAX_QUEUE_SIZE = int(os.getenv("MAX_QUEUE_SIZE", "20"))
 MAX_TASKS_KEEP = int(os.getenv("MAX_TASKS_KEEP", "50"))
 HEADLESS = os.getenv("HEADLESS", "false").lower() in ("true", "1", "yes")
+_BROWSER_POOL_SIZE = int(os.getenv("BROWSER_POOL_SIZE", str(_MAX_CONCURRENT_TASKS)))
+_BROWSER_POOL_IDLE_TIMEOUT = float(os.getenv("BROWSER_POOL_IDLE_TIMEOUT", "300"))
+_USE_BROWSER_POOL = os.getenv("USE_BROWSER_POOL", "true").lower() in ("true", "1", "yes")
+
+@asynccontextmanager
+async def lifespan(app):
+    """启动时预热浏览器池，关闭时清理。"""
+    if _browser_pool:
+        try:
+            _browser_pool.start_sync()
+            print(f"[BrowserPool] Started with {_browser_pool.max_size} browsers (headless={HEADLESS})")
+        except Exception as e:
+            print(f"[BrowserPool] Failed to start: {e}", file=sys.stderr)
+    yield
+    if _browser_pool and _browser_pool.started:
+        try:
+            _browser_pool.shutdown_sync()
+            print("[BrowserPool] Shutdown complete")
+        except Exception as e:
+            print(f"[BrowserPool] Shutdown error: {e}", file=sys.stderr)
+
 
 app = FastAPI(
     title="Skyvern",
     version="0.1.0",
     description="AI-driven browser automation platform",
+    lifespan=lifespan,
 )
 
 # CORS configuration
@@ -105,6 +129,17 @@ _agent_executor = concurrent.futures.ThreadPoolExecutor(max_workers=_AGENT_THREA
 # 并行任务执行池：Semaphore 控制最大并发浏览器数
 _task_pool = TaskPool(max_workers=_MAX_CONCURRENT_TASKS)
 
+# 浏览器实例池：池化复用���览器实例，避免每次冷启动
+_browser_pool: BrowserPool | None = None
+if _USE_BROWSER_POOL:
+    _proxy = "http://127.0.0.1:7897" if os.environ.get("USE_PROXY") else None
+    _browser_pool = BrowserPool(
+        max_size=_BROWSER_POOL_SIZE,
+        idle_timeout=_BROWSER_POOL_IDLE_TIMEOUT,
+        headless=HEADLESS,
+        proxy=_proxy,
+    )
+
 # ── In-memory store (backed by SQLite) ────────────────────────────────────────
 
 TASKS: dict[str, dict] = load_all_tasks()
@@ -123,6 +158,7 @@ def _startup_cleanup():
             store.pop(t["id"], None)
 
 _startup_cleanup()
+
 
 # Per-client SSE queues for broadcast
 _SSE_CLIENTS: list[asyncio.Queue] = []
@@ -241,23 +277,57 @@ def _run_agent_in_thread(
 
     try:
         t = TASKS.get(task_id, {})
-        agent_result = loop.run_until_complete(
-            run_agent(
-                task=task,
-                headless=HEADLESS,
-                task_id=task_id,
-                log_callback=thread_safe_log,
-                cookies_path=f"data/cookies/cookies_{task_id}.json",
-                screenshots_dir=f"screenshots/{task_id}",
-                ask_user_callback=ask_user_callback,
-                screenshot_callback=thread_safe_screenshot,
-                browser_mode=t.get("browser_mode", "builtin"),
-                cdp_url=t.get("cdp_url", "http://localhost:9222"),
-                chrome_profile=t.get("chrome_profile", "Default"),
-            )
+        browser_mode = t.get("browser_mode", "builtin")
+
+        # 浏览器池：builtin 模式且池可用时，从池中借用浏览器
+        pool_browser = None
+        pool_context = None
+        _use_pool = (
+            _browser_pool is not None
+            and _browser_pool.started
+            and browser_mode == "builtin"
         )
-        # agent_result: {"success": bool, "reason": str, "steps": int}
+
+        if _use_pool:
+            try:
+                pool_browser, pool_context = _browser_pool.acquire_sync(task_id)
+                print(f"[BrowserPool] Acquired browser for task {task_id}")
+            except Exception as e:
+                print(f"[BrowserPool] Acquire failed: {e}, falling back to standalone", file=sys.stderr)
+                pool_browser = None
+                pool_context = None
+                _use_pool = False
+
+        try:
+            agent_result = loop.run_until_complete(
+                run_agent(
+                    task=task,
+                    headless=HEADLESS,
+                    task_id=task_id,
+                    log_callback=thread_safe_log,
+                    cookies_path=f"data/cookies/cookies_{task_id}.json",
+                    screenshots_dir=f"screenshots/{task_id}",
+                    ask_user_callback=ask_user_callback,
+                    screenshot_callback=thread_safe_screenshot,
+                    browser_mode=browser_mode,
+                    cdp_url=t.get("cdp_url", "http://localhost:9222"),
+                    chrome_profile=t.get("chrome_profile", "Default"),
+                    pool_browser=pool_browser,
+                    pool_context=pool_context,
+                )
+            )
+        finally:
+            # 归还浏览器到池
+            if _use_pool:
+                try:
+                    _browser_pool.release_sync(task_id)
+                    print(f"[BrowserPool] Released browser for task {task_id}")
+                except Exception as e:
+                    print(f"[BrowserPool] Release failed: {e}", file=sys.stderr)
+
+        # agent_result: {"success": bool, "reason": str, "steps": int, "cost": dict}
         task_succeeded = agent_result.get("success", False) if isinstance(agent_result, dict) else True
+        cost_data = agent_result.get("cost", {}) if isinstance(agent_result, dict) else {}
         shot_dir = Path(f"screenshots/{task_id}")
         screenshots = []
         if shot_dir.exists():
@@ -265,9 +335,9 @@ def _run_agent_in_thread(
                 [f.name for f in shot_dir.glob("*.png")] + [f.name for f in shot_dir.glob("*.jpg")],
                 key=lambda n: (shot_dir / n).stat().st_mtime
             )
-        return (task_succeeded, screenshots)
+        return (task_succeeded, screenshots, cost_data)
     except Exception as e:
-        return (False, str(e))
+        return (False, str(e), {})
     finally:
         loop.close()
 
@@ -307,7 +377,7 @@ async def _run_task(task_id: str, task: str):
         # 超时控制
         if timeout_sec > 0:
             try:
-                ok, result = await asyncio.wait_for(future, timeout=timeout_sec)
+                ok, result, cost_data = await asyncio.wait_for(future, timeout=timeout_sec)
             except asyncio.TimeoutError:
                 TASKS[task_id]["status"] = "failed"
                 TASKS[task_id]["logs"].append(f"ERROR: 任务超时（{timeout_sec}秒）")
@@ -319,7 +389,7 @@ async def _run_task(task_id: str, task: str):
                 })
                 return
         else:
-            ok, result = await future
+            ok, result, cost_data = await future
 
         # 检查是否被取消
         if cancel_event.is_set():
@@ -332,15 +402,19 @@ async def _run_task(task_id: str, task: str):
             })
             return
 
+        # 保存成本数据
+        if cost_data:
+            TASKS[task_id]["cost"] = cost_data
+
         if ok:
             TASKS[task_id]["screenshots"] = result
             TASKS[task_id]["status"] = "done"
             final_status = "done"
             save_task(TASKS[task_id])
-            await _broadcast({"type": "status", "task_id": task_id, "data": "done", "screenshots": result})
+            await _broadcast({"type": "status", "task_id": task_id, "data": "done", "screenshots": result, "cost": cost_data})
             await _send_webhook(webhook_url, {
                 "task_id": task_id, "status": "done", "task": task,
-                "screenshots": result,
+                "screenshots": result, "cost": cost_data,
             })
         else:
             TASKS[task_id]["status"] = "failed"
@@ -392,7 +466,8 @@ def index():
 
 @app.get("/health")
 def health_check():
-    return {"status": "ok", "tasks": len(TASKS), "explore_tasks": len(EXPLORE_TASKS), "pool": _task_pool.stats_dict()}
+    bp = _browser_pool.stats() if _browser_pool and _browser_pool.started else {"enabled": False}
+    return {"status": "ok", "tasks": len(TASKS), "explore_tasks": len(EXPLORE_TASKS), "pool": _task_pool.stats_dict(), "browser_pool": bp}
 
 
 @app.get("/pool")
@@ -413,6 +488,41 @@ def pool_resize(req: PoolResizeRequest, _: None = Depends(_verify_api_key)):
     old = _task_pool.max_workers
     _task_pool.resize(req.max_workers)
     return {"old_max_workers": old, "new_max_workers": req.max_workers, "pool": _task_pool.stats_dict()}
+
+
+# ── 浏览器池 API ─────────────────────────────────────────────────────────────
+
+@app.get("/browser-pool")
+def browser_pool_status(_: None = Depends(_verify_api_key)):
+    """查询浏览器池状态。"""
+    if not _browser_pool or not _browser_pool.started:
+        return {"enabled": False}
+    return {"enabled": True, **_browser_pool.stats()}
+
+
+class BrowserPoolResizeRequest(BaseModel):
+    max_size: int
+
+
+@app.put("/browser-pool")
+def browser_pool_resize(req: BrowserPoolResizeRequest, _: None = Depends(_verify_api_key)):
+    """动态调整浏览器池大小。"""
+    if not _browser_pool or not _browser_pool.started:
+        raise HTTPException(status_code=400, detail="Browser pool is not enabled")
+    if req.max_size < 1 or req.max_size > 10:
+        raise HTTPException(status_code=400, detail="max_size must be 1-10")
+    old = _browser_pool.max_size
+    _browser_pool.resize_sync(req.max_size)
+    return {"old_max_size": old, "new_max_size": req.max_size, **_browser_pool.stats()}
+
+
+@app.post("/browser-pool/warmup")
+def browser_pool_warmup(_: None = Depends(_verify_api_key)):
+    """手动触发浏览器池预热。"""
+    if not _browser_pool or not _browser_pool.started:
+        raise HTTPException(status_code=400, detail="Browser pool is not enabled")
+    _browser_pool.warmup_sync()
+    return {"status": "ok", **_browser_pool.stats()}
 
 
 @app.get("/screenshots/{task_id}/{filename}")

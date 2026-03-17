@@ -57,6 +57,39 @@ export function resizePool(maxWorkers: number) {
   return api.put<{ old_max_workers: number; new_max_workers: number }>('/pool', { max_workers: maxWorkers });
 }
 
+// ── 浏览器池 API ──
+
+export interface BrowserSlotInfo {
+  index: number;
+  in_use: boolean;
+  task_id: string | null;
+  connected: boolean;
+  idle_seconds: number;
+}
+
+export interface BrowserPoolStats {
+  enabled: boolean;
+  max_size?: number;
+  total?: number;
+  in_use?: number;
+  idle?: number;
+  headless?: boolean;
+  idle_timeout?: number;
+  slots?: BrowserSlotInfo[];
+}
+
+export function getBrowserPool() {
+  return api.get<BrowserPoolStats>('/browser-pool');
+}
+
+export function resizeBrowserPool(maxSize: number) {
+  return api.put<BrowserPoolStats & { old_max_size: number; new_max_size: number }>('/browser-pool', { max_size: maxSize });
+}
+
+export function warmupBrowserPool() {
+  return api.post<BrowserPoolStats & { status: string }>('/browser-pool/warmup');
+}
+
 export function batchDeleteTasks(taskIds: string[]) {
   return api.post<{ deleted: number; deleted_ids: string[] }>('/tasks/batch-delete', { task_ids: taskIds });
 }

@@ -25,6 +25,8 @@ from .plan_manager import PlanManager
 from .watchdog import Watchdog, EventType
 from .action_registry import load_custom_actions, get_custom_tools
 from .cost_tracker import CostTracker
+from .a11y_tree import extract_a11y_tree, get_page_summary, should_use_screenshot
+from .model_router import select_model_tier
 
 from utils import llm_chat
 from page_annotator import annotate_page
@@ -144,6 +146,8 @@ async def run_agent(
     browser_mode: str = "builtin",  # "builtin" | "user_chrome" | "cdp"
     cdp_url: str = "http://localhost:9222",  # browser_mode="cdp" 时使用
     chrome_profile: str = None,  # browser_mode="user_chrome" 时指定 profile 名，默认 "Default"
+    pool_browser=None,           # 从 BrowserPool 注入的浏览器实例
+    pool_context=None,           # 从 BrowserPool 注入的 BrowserContext
 ) -> dict:
     """
     运行 agent 执行任务。
@@ -154,26 +158,34 @@ async def run_agent(
     task_reason = "未知"
     steps_executed = 0
 
-    async with async_playwright() as pw:
-        # ── 三种浏览器模式 ────────────────────────────────────────────────────
+    # ── 浏览器池模式：跳过 Playwright 启动，直接使用注入的实例 ──
+    _using_pool = pool_browser is not None and pool_context is not None
+    _pw_cm = None  # Playwright context manager（非池模式时需要）
+
+    if _using_pool:
+        pw = None
+        browser = pool_browser
+        context = pool_context
+        browser_mode = "pool"  # 标记为池模式
+    else:
+        _pw_cm = async_playwright()
+        pw = await _pw_cm.start()
         browser = None
         context = None
 
         if browser_mode == "cdp":
-            # 连接用户正在运行的 Chrome（需要用 --remote-debugging-port=9222 启动）
             _safe_print(f"  [CDP] 连接 {cdp_url} ...")
             try:
                 browser = await pw.chromium.connect_over_cdp(cdp_url)
             except Exception as e:
+                await _pw_cm.__aexit__(type(e), e, e.__traceback__)
                 raise RuntimeError(f"CDP 连接失败 ({cdp_url}): {e}") from e
-            # 复用已有的第一个 context（继承所有登录态）
             if browser.contexts:
                 context = browser.contexts[0]
             else:
                 context = await browser.new_context(viewport={"width": 1920, "height": 1080}, locale="zh-CN")
 
         elif browser_mode == "user_chrome":
-            # 用用户的 Chrome Profile 启动，继承所有登录态
             user_data_dir = await _find_chrome_user_data_dir()
             if not user_data_dir:
                 _safe_print("  [user_chrome] 未找到 Chrome Profile，降级为 builtin 模式")
@@ -182,11 +194,10 @@ async def run_agent(
                 profile = chrome_profile or "Default"
                 _safe_print(f"  [user_chrome] 使用 Chrome Profile: {user_data_dir} / {profile}")
                 try:
-                    # launch_persistent_context 直接返回 context，不返回 browser
                     context = await pw.chromium.launch_persistent_context(
                         user_data_dir=user_data_dir,
-                        channel="chrome",          # 用系统安装的 Chrome，不是 Playwright 内置的
-                        headless=False,            # 用户 Profile 模式必须有头
+                        channel="chrome",
+                        headless=False,
                         args=["--profile-directory=" + profile],
                         viewport={"width": 1920, "height": 1080},
                         locale="zh-CN",
@@ -198,7 +209,6 @@ async def run_agent(
                     browser_mode = "builtin"
 
         if browser_mode == "builtin":
-            # 默认模式：启动内置 Chromium
             browser = await pw.chromium.launch(
                 headless=headless,
                 proxy={"server": "http://127.0.0.1:7897"} if os.environ.get("USE_PROXY") else None,
@@ -207,6 +217,8 @@ async def run_agent(
                 viewport={"width": 1920, "height": 1080},
                 locale="zh-CN",
             )
+
+    try:
 
         # cookies_file 所有模式都需要定义（builtin 模式读写，其他模式只在需要时写）
         cookies_file = Path(cookies_path)
@@ -278,8 +290,13 @@ async def run_agent(
         # 静态部分放在 system message 开头，利用 prompt caching 降低成本
         # 动态部分（任务、凭证提示）放在 user message
         _SYSTEM_PROMPT_STATIC = (
-            "你是一个网页操作助手。每次我会给你当前页面的截图，用视觉理解页面，调用工具完成用户任务。\n"
-            "核心原则：仔细观察截图，理解页面布局和内容，再决定下一步操作。\n\n"
+            "你是一个网页操作助手。系统会给你当前页面的信息（截图或 Accessibility Tree），你需要理解页面状态并调用工具完成用户任务。\n"
+            "核心原则：仔细分析页面信息，理解页面布局和内容，再决定下一步操作。\n\n"
+            "## 输入模式\n"
+            "系统会根据场景自动选择两种模式之一：\n"
+            "- 截图模式：提供标注截图（蓝框+编号），适合需要视觉理解的场景\n"
+            "- DOM模式：提供 Accessibility Tree 文本 + 元素列表，更轻量高效\n"
+            "两种模式下都可以用 index 编号操作元素。如果 DOM 模式下需要视觉信息，调用 screenshot 工具。\n\n"
             "## 基本规则\n"
             "1. 你可以一次返回多个工具调用（批量执行），系统会按顺序执行，遇到页面跳转自动中断剩余操作\n"
             "2. 适合批量的场景：连续填写多个表单字段、先输入再按回车、先滚动再点击等不涉及页面跳转的连续操作\n"
@@ -356,6 +373,8 @@ async def run_agent(
         _last_content_hash = None  # 用于截图复用：检测 DOM 是否变化
         _pending_nudges: list[str] = []  # 缓存 nudge 消息，下一轮截图时注入（避免打断 tool_result 顺序）
         cost_tracker = CostTracker()  # 成本追踪
+        _consecutive_dom_steps = 0  # 连续使用 DOM 模式的步数（用于按需截图判断）
+        _dom_tokens_saved = 0  # 累计节省的 token 数
 
         # ── 智能错误恢复 + 熔断器 + 循环检测 ──────────────────────────────────
         failure_tracker = FailureTracker()
@@ -434,7 +453,17 @@ async def run_agent(
             # 截图前确保页面就绪（统一使用 _wait_for_page_ready）
             await _wait_for_page_ready(agent.page, log_fn=_log, timeout_ms=10000, check_network=True, active_requests=active_requests)
 
-            # DOM 变化检测：如果页面内容没变，复用上一张截图（节省 token）
+            # ── DOM 优先 + 按需截图策略 ──────────────────────────────────
+            # 获取页面摘要，判断是否需要截图
+            page_summary = await get_page_summary(agent.page)
+            use_screenshot = should_use_screenshot(
+                step=step,
+                last_tool=last_tool_name,
+                page_summary=page_summary,
+                consecutive_dom_steps=_consecutive_dom_steps,
+            )
+
+            # DOM 变化检测
             try:
                 _cur_hash = await agent.page.evaluate("() => document.body.innerText.length + '|' + document.body.children.length")
             except Exception:
@@ -444,17 +473,18 @@ async def run_agent(
                 _cur_hash is not None
                 and _cur_hash == _last_content_hash
                 and step > 0
-                and last_tool_name in ("wait", "screenshot")  # 只有无副作用的操作才复用
+                and last_tool_name in ("wait", "screenshot")
             )
 
+            # 始终执行标注（需要 data-skyvern-id 供 execute 使用）
             if _reuse_screenshot:
                 await _log(f"  [截图复用] DOM 未变化，跳过重新截图")
             else:
-                # 用标注截图：给所有可交互元素打蓝框+编号
                 try:
                     img_b64, elements = await annotate_page(agent.page)
                 except Exception as e:
                     await _log(f"  ⚠ 页面标注失败: {e}，使用普通截图")
+                    use_screenshot = True  # 标注失败时强制截图
                     try:
                         raw = await agent.page.screenshot(type="jpeg", quality=60, timeout=10000)
                         img_b64 = base64.b64encode(raw).decode()
@@ -470,43 +500,68 @@ async def run_agent(
             max_index = max((el.get("index", 0) for el in elements), default=-1) if elements else -1
             index_hint = f"⚠️ 有效 index 范围: 0~{max_index}，不要使用超出此范围的 index。\n" if max_index >= 0 else ""
 
-            # 保存标注截图，方便调试，并实时推送给前端
-            debug_path = screenshots_dir / f"step_{step+1:02d}_annotated.jpg"
-            try:
-                debug_path.write_bytes(base64.b64decode(img_b64))
-            except Exception as e:
-                await _log(f"  ⚠ 保存调试截图失败: {e}")
-            await _log(f"  [截图] {debug_path.name}")
-            if screenshot_callback and task_id:
-                try:
-                    await screenshot_callback(task_id, debug_path.name)
-                except Exception as e:
-                    await _log(f"  ⚠ 截图回调失败: {e}")
-
             # 注入缓存的 nudge（循环检测/停滞检测），避免作为独立 user 消息打断 tool_result 顺序
             nudge_text = ""
             if _pending_nudges:
                 nudge_text = "\n".join(_pending_nudges) + "\n"
                 _pending_nudges.clear()
 
-            messages.append({
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": (
-                            f"第{step+1}步，当前页面截图（蓝框+编号标注了所有可交互元素）：\n"
-                            f"{nudge_text}"
-                            f"{plan_manager.format_hint()}"
-                            f"{index_hint}"
-                            f"元素列表: {elements_summary}\n"
-                            "根据截图判断当前状态，调用工具推进任务（可一次返回多个工具调用）。"
-                            "操作时用元素的 index 编号，不要猜 selector 或坐标。"
-                        ),
-                    },
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}", "detail": "high"}},
-                ],
-            })
+            if use_screenshot:
+                # ── 截图模式：发送标注截图 + 元素列表（~1100 tokens for image） ──
+                _consecutive_dom_steps = 0
+
+                # 保存标注截图，方便调试，并实时推送给前端
+                debug_path = screenshots_dir / f"step_{step+1:02d}_annotated.jpg"
+                try:
+                    debug_path.write_bytes(base64.b64decode(img_b64))
+                except Exception as e:
+                    await _log(f"  ⚠ 保存调试截图失败: {e}")
+                await _log(f"  [截图模式] {debug_path.name}")
+                if screenshot_callback and task_id:
+                    try:
+                        await screenshot_callback(task_id, debug_path.name)
+                    except Exception as e:
+                        await _log(f"  ⚠ 截图回调失败: {e}")
+
+                messages.append({
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                f"第{step+1}步，当前页面截图（蓝框+编号标注了所有可交互元素）：\n"
+                                f"{nudge_text}"
+                                f"{plan_manager.format_hint()}"
+                                f"{index_hint}"
+                                f"元素列表: {elements_summary}\n"
+                                "根据截图判断当前状态，调用工具推进任务（可一次返回多个工具调用）。"
+                                "操作时用元素的 index 编号，不要猜 selector 或坐标。"
+                            ),
+                        },
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}", "detail": "high"}},
+                    ],
+                })
+            else:
+                # ── DOM 模式：发送 a11y tree + 元素列表（~500-1500 tokens，节省截图 ~1100 tokens） ──
+                _consecutive_dom_steps += 1
+                _dom_tokens_saved += 1100  # 每次省掉一张截图的 token
+
+                a11y_tree = await extract_a11y_tree(agent.page)
+                await _log(f"  [DOM模式] 第{_consecutive_dom_steps}步（累计节省 ~{_dom_tokens_saved} tokens）")
+
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        f"第{step+1}步，当前页面结构（Accessibility Tree）：\n"
+                        f"{nudge_text}"
+                        f"{plan_manager.format_hint()}"
+                        f"{index_hint}"
+                        f"```\n{a11y_tree}\n```\n"
+                        f"元素列表: {elements_summary}\n"
+                        "根据页面结构判断当前状态，调用工具推进任务（可一次返回多个工具调用）。"
+                        "操作时用元素的 index 编号。如果需要视觉信息（如验证码、图片内容），请调用 screenshot 工具获取截图。"
+                    ),
+                })
 
             # ── Token 级上下文压缩 ──────────────────────────────────────
             # 硬上限：消息数 > 50 时强制截断（防止压缩失败时无限增长）
@@ -520,6 +575,22 @@ async def run_agent(
                 await _log(f"  [上下文] 当前 {current_tokens} tokens，触发压缩...")
                 messages = _compress_messages(messages, max_tokens=65000, keep_recent=15)
 
+            # ── 智能模型路由 ──────────────────────────────────────────
+            _last_failed = (
+                failure_tracker.total_consecutive > 0
+            )
+            model_tier = select_model_tier(
+                use_screenshot=use_screenshot,
+                step=step,
+                last_tool=last_tool_name,
+                last_failed=_last_failed,
+                consecutive_failures=failure_tracker.total_consecutive,
+                has_captcha=page_summary.get("has_captcha", False),
+                has_dialog=page_summary.get("has_dialog", False),
+            )
+            if model_tier == "mini":
+                await _log(f"  [模型路由] mini（DOM模式，简单操作）")
+
             # LLM 调用（带指数退避重试 + 熔断保护）
             _LLM_RETRY_DELAYS = [1.0, 3.0]  # 2 次重试: 1s, 3s
             response = None
@@ -532,6 +603,7 @@ async def run_agent(
 
                 try:
                     response = llm_chat(
+                        model=model_tier,
                         messages=messages,
                         tools=all_tools,
                         tool_choice="required",
@@ -541,7 +613,7 @@ async def run_agent(
                     # 记录 token 消耗
                     if response and hasattr(response, 'usage') and response.usage:
                         from utils import _resolve_model as _rm
-                        _actual_model, _ = _rm(None)
+                        _actual_model, _ = _rm(model_tier)
                         cost_tracker.record(model=_actual_model, usage=response.usage, purpose="main_loop")
                     break  # 成功
                 except Exception as e:
@@ -827,9 +899,14 @@ async def run_agent(
             except Exception as e:
                 await _log(f"⚠ 保存 cookies 失败: {e}")
 
-        # 关闭浏览器：保留浏览器供用户查看结果，仅在非 headless 模式下保持打开
-        # CDP 模式不关闭（用户还在用），builtin headless 模式关闭（无界面无意义）
-        if browser_mode == "cdp":
+        # 关闭浏览器：池模式不关闭（由池管理），其他模式按原逻辑
+        if browser_mode == "pool":
+            # 池模式：只关闭 page，不关闭 browser/context（由 BrowserPool.release 处理）
+            try:
+                await page.close()
+            except Exception:
+                pass
+        elif browser_mode == "cdp":
             await _log("  [CDP] 保持浏览器运行，不关闭")
         elif browser_mode == "user_chrome":
             await _log("  [user_chrome] 保持浏览器运行，用户可查看结果")
@@ -866,6 +943,8 @@ async def run_agent(
                 f"缓存命中 {cost_summary['cache_hit_rate']*100:.0f}%, "
                 f"成本 ${cost_summary['total_cost_usd']}"
             )
+            if _dom_tokens_saved > 0:
+                await _log(f"  🌿 [DOM模式] 节省 ~{_dom_tokens_saved} 截图 tokens（{_dom_tokens_saved // 1100} 步使用 DOM 模式）")
 
         return {
             "success": task_success,
@@ -873,3 +952,10 @@ async def run_agent(
             "steps": steps_executed,
             "cost": cost_summary,
         }
+    finally:
+        # 非池模式：清理 Playwright 实例
+        if _pw_cm:
+            try:
+                await _pw_cm.stop()
+            except Exception:
+                pass

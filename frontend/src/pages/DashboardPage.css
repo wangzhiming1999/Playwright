@@ -87,6 +87,16 @@
   flex-shrink: 0;
 }
 
+.cost-section {
+  margin-bottom: 32px;
+}
+
+.cost-section h2 {
+  font-size: 18px;
+  font-weight: 600;
+  margin-bottom: 16px;
+}
+
 .recent-section h2 {
   font-size: 18px;
   font-weight: 600;

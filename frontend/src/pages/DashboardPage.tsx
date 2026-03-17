@@ -80,6 +80,31 @@ export function DashboardPage() {
     return buckets.map((b) => ({ label: b.label, value: b.count }));
   }, [tasks]);
 
+  // Cost aggregation across all tasks
+  const costStats = useMemo(() => {
+    let totalCalls = 0;
+    let totalInput = 0;
+    let totalOutput = 0;
+    let totalCached = 0;
+    let totalCost = 0;
+    let tasksWithCost = 0;
+
+    for (const t of tasks) {
+      const c = (t as Record<string, unknown>).cost as Record<string, number> | undefined;
+      if (c && c.total_calls > 0) {
+        tasksWithCost++;
+        totalCalls += c.total_calls || 0;
+        totalInput += c.total_input_tokens || 0;
+        totalOutput += c.total_output_tokens || 0;
+        totalCached += c.total_cached_tokens || 0;
+        totalCost += c.total_cost_usd || 0;
+      }
+    }
+    const cacheRate = totalInput > 0 ? totalCached / totalInput : 0;
+    const avgCost = tasksWithCost > 0 ? totalCost / tasksWithCost : 0;
+    return { totalCalls, totalInput, totalOutput, totalCached, totalCost, cacheRate, avgCost, tasksWithCost };
+  }, [tasks]);
+
   // Combined recent activity
   const recentActivity = useMemo(() => {
     const items: { type: 'task' | 'explore'; id: string; label: string; status: string; time: string }[] = [];
@@ -161,6 +186,40 @@ export function DashboardPage() {
           <BarChart data={durationBuckets} />
         </div>
       </div>
+
+      {/* Cost & Performance */}
+      {costStats.tasksWithCost > 0 && (
+        <div className="cost-section">
+          <h2>LLM 成本统计</h2>
+          <div className="stats-grid">
+            <div className="stat-card">
+              <div className="stat-label">总成本</div>
+              <div className="stat-value">${costStats.totalCost.toFixed(4)}</div>
+              <div className="stat-sub">平均 ${costStats.avgCost.toFixed(4)}/任务</div>
+            </div>
+            <div className="stat-card">
+              <div className="stat-label">LLM 调用</div>
+              <div className="stat-value">{costStats.totalCalls}</div>
+              <div className="stat-sub">{costStats.tasksWithCost} 个任务</div>
+            </div>
+            <div className="stat-card">
+              <div className="stat-label">输入 Tokens</div>
+              <div className="stat-value">{(costStats.totalInput / 1000).toFixed(1)}k</div>
+            </div>
+            <div className="stat-card">
+              <div className="stat-label">输出 Tokens</div>
+              <div className="stat-value">{(costStats.totalOutput / 1000).toFixed(1)}k</div>
+            </div>
+            <div className="stat-card">
+              <div className="stat-label">缓存命中率</div>
+              <div className="stat-value" style={{ color: costStats.cacheRate > 0.3 ? 'var(--green)' : 'var(--text-primary)' }}>
+                {(costStats.cacheRate * 100).toFixed(0)}%
+              </div>
+              <div className="stat-sub">{(costStats.totalCached / 1000).toFixed(1)}k cached</div>
+            </div>
+          </div>
+        </div>
+      )}
 
       <div className="recent-section">
         <h2>最近活动</h2>

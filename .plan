@@ -1,0 +1,82 @@
+# 浏览器池管理迭代计划
+
+## 目标
+实现浏览器实例池化复用，避免每个任务都冷启动浏览器，提升任务启动速度和资源利用率。
+
+## 现状分析
+- `runner.py` 的 `run_agent()` 每次都 `async_playwright() → launch → new_context → new_page`
+- 任务结束后浏览器关闭（headless）或保持打开但无法复用
+- `TaskPool` 只做 semaphore 并发控制，不管浏览器生命周期
+- 每次冷启动 Chromium 耗时 2-5 秒，并行任务时资源浪费严重
+
+## 实现方案
+
+### 1. 新建 `agent/browser_pool.py` — 浏览器池核心
+- `BrowserPool` 类：管理 Playwright 实例和浏览器实例的生命周期
+- 池化策略：预创建 N 个浏览器实例（N = max_workers），任务从池中借用，用完归还
+- 每个浏览器实例用独立的 BrowserContext 隔离任务（cookies/storage 互不干扰）
+- 归还时清理 context（关闭所有 page、清除 cookies），浏览器进程保持运行
+- 空闲超时自动回收（默认 5 分钟无任务则关闭浏览器释放内存）
+- 健康检查：借出前检测浏览器是否存活，崩溃的自动替换
+- 预热池：启动时异步预创建浏览器，首个任务无需等待
+
+关键数据结构：
+```python
+@dataclass
+class BrowserSlot:
+    browser: Browser
+    in_use: bool = False
+    created_at: float = 0
+    last_used_at: float = 0
+    task_id: str | None = None
+
+class BrowserPool:
+    def __init__(self, max_size=3, idle_timeout=300, headless=False)
+    async def start()          # 启动 Playwright + 预热浏览器
+    async def acquire(task_id) -> tuple[Browser, BrowserContext]  # 借用
+    async def release(task_id) # 归还 + 清理 context
+    async def shutdown()       # 关闭所有浏览器
+    async def resize(new_size) # 动态调整池大小
+    def stats() -> dict        # 池状态
+```
+
+### 2. 修改 `agent/runner.py` — 支持外部注入浏览器
+- `run_agent()` 新增可选参数 `browser` 和 `context`
+- 如果传入了 browser/context，跳过浏览器启动逻辑，直接使用
+- 任务结束时不关闭浏览器（由池管理），只关闭 page
+- 保持向后兼容：不传 browser/context 时行为不变（自己启动浏览器）
+
+### 3. 修改 `app.py` — 集成浏览器池
+- 启动时创建全局 `BrowserPool` 实例（替代直接在线程中启动浏览器）
+- `_run_agent_in_thread` 改为：先从池中 acquire，执行完 release
+- 浏览器池运行在主线程的事件循环中（Playwright 实例共享）
+- 注意：Windows 上 Playwright 需要 ProactorEventLoop，池的 acquire/release 需要跨线程安全调用
+
+### 4. 新增 API 端点
+- `GET /api/browser-pool` — 查询浏览器池状态（总数/在用/空闲/各实例详情）
+- `PUT /api/browser-pool` — 调整池大小（复用 resize 逻辑）
+- `POST /api/browser-pool/warmup` — 手动触发预热
+
+### 5. 前端 Settings 页面更新
+- 在"并发任务池"section 下方新增"浏览器池"section
+- 显示池状态：总实例数、在用、空闲、各实例创建时间和最后使用时间
+- 池大小调整滑块
+- 预热按钮
+- 自动刷新状态（5秒轮询或 SSE）
+
+### 6. 测试
+- `tests/test_browser_pool.py` — 单元测试（acquire/release/resize/timeout/健康检查）
+
+## 文件变更清单
+- 新建: `agent/browser_pool.py`
+- 修改: `agent/runner.py`（支持外部注入浏览器）
+- 修改: `app.py`（集成浏览器池 + 新 API）
+- 修改: `frontend/src/pages/SettingsPage.tsx`（浏览器池 UI）
+- 修改: `frontend/src/api/tasks.ts`（新 API 调用）
+- 新建: `tests/test_browser_pool.py`
+
+## 注意事项
+- Windows ProactorEventLoop 兼容性：浏览器池需要在正确的事件循环中运行
+- CDP 和 user_chrome 模式不走池（这两种模式本身就是复用外部浏览器）
+- 只有 builtin 模式走浏览器池
+- 池中浏览器崩溃时自动替换，不影响其他任务

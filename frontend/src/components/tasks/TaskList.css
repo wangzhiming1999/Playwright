@@ -100,6 +100,29 @@
   font-size: 13px;
 }
 
+.task-form-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.task-form-browser-mode {
+  font-size: 13px;
+  padding: 8px 12px;
+  min-width: 140px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  cursor: pointer;
+}
+.task-form-browser-mode:hover { border-color: var(--accent); }
+.task-form-browser-mode:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
 .bulk-bar {
   display: flex;
   align-items: center;

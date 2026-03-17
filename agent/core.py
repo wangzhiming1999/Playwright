@@ -632,6 +632,40 @@ class BrowserAgent:
                             pass
                     return f"操作失败: 按键 {key} 失败 — {e}"
 
+            elif tool_name == "extract":
+                # 轻量信息提取：用 mini 模型从页面 HTML 中提取信息，不需要截图
+                question = args.get("question", "")
+                if not question:
+                    return "操作失败: question 参数不能为空"
+                try:
+                    # 提取页面文本内容（限制长度避免 token 爆炸）
+                    page_text = await self._safe_evaluate(
+                        "() => document.body.innerText.substring(0, 5000)",
+                        timeout_ms=5000,
+                        default=""
+                    )
+                    if not page_text:
+                        return "提取失败: 页面内容为空"
+
+                    resp = _llm_chat(
+                        model="mini",
+                        messages=[{
+                            "role": "user",
+                            "content": (
+                                f"页面内容：\n{page_text}\n\n"
+                                f"问题：{question}\n\n"
+                                "请根据页面内容回答问题。如果页面中没有相关信息，说明'未找到'。简洁回答。"
+                            ),
+                        }],
+                        max_tokens=300,
+                    )
+                    if resp.choices:
+                        answer = resp.choices[0].message.content.strip()
+                        return f"提取结果: {answer}"
+                    return "提取失败: API 返回空"
+                except Exception as e:
+                    return f"提取失败: {e}"
+
             elif tool_name == "done":
                 # 主循环已在 done 前调用了 _wait_for_page_ready
                 # 直接截图，避免重复等待导致超时
