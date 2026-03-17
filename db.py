@@ -24,9 +24,19 @@ def init_db():
                 screenshots TEXT NOT NULL DEFAULT '[]',
                 curation TEXT,
                 generated TEXT,
-                created_at TEXT DEFAULT (datetime('now'))
+                created_at TEXT DEFAULT (datetime('now')),
+                started_at TEXT,
+                finished_at TEXT
             );
 
+        """)
+        # Migration: add timing columns if missing
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+        if "started_at" not in cols:
+            conn.execute("ALTER TABLE tasks ADD COLUMN started_at TEXT")
+        if "finished_at" not in cols:
+            conn.execute("ALTER TABLE tasks ADD COLUMN finished_at TEXT")
+        conn.executescript("""
             CREATE TABLE IF NOT EXISTS explore_tasks (
                 id TEXT PRIMARY KEY,
                 url TEXT NOT NULL,
@@ -59,14 +69,16 @@ def save_task(t: dict):
     with _conn() as conn:
         conn.execute("""
             INSERT OR REPLACE INTO tasks
-              (id, task, status, logs, screenshots, curation, generated)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+              (id, task, status, logs, screenshots, curation, generated, started_at, finished_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             t["id"], t["task"], t["status"],
             json.dumps(t.get("logs", []), ensure_ascii=False),
             json.dumps(t.get("screenshots", []), ensure_ascii=False),
             json.dumps(t["curation"], ensure_ascii=False) if t.get("curation") else None,
             json.dumps(t["generated"], ensure_ascii=False) if t.get("generated") else None,
+            t.get("started_at"),
+            t.get("finished_at"),
         ))
 
 

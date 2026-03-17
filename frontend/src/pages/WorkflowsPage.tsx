@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { listWorkflows, createWorkflow, deleteWorkflow, runWorkflow, listWorkflowRuns } from '@/api/workflows';
 import type { Workflow, WorkflowRun } from '@/types/workflow';
+import { toast } from '@/utils/toast';
 import './WorkflowsPage.css';
 
 export function WorkflowsPage() {
@@ -14,11 +15,11 @@ export function WorkflowsPage() {
   useEffect(() => { loadWorkflows(); }, []);
 
   async function loadWorkflows() {
-    try { setWorkflows(await listWorkflows()); } catch (e) { console.error(e); }
+    try { setWorkflows(await listWorkflows()); } catch (e) { toast.error('加载工作流失败'); }
   }
 
   async function loadRuns(wfId: string) {
-    try { setRuns(await listWorkflowRuns(wfId)); } catch (e) { console.error(e); }
+    try { setRuns(await listWorkflowRuns(wfId)); } catch (e) { toast.error('加载运行记录失败'); }
   }
 
   function selectWorkflow(wf: Workflow) {
@@ -34,7 +35,8 @@ export function WorkflowsPage() {
       const wf = await createWorkflow(template);
       await loadWorkflows();
       selectWorkflow(wf);
-    } catch (e) { console.error(e); }
+      toast.success('工作流已创建');
+    } catch (e) { toast.error('创建失败'); }
     setLoading(false);
   }
 
@@ -44,7 +46,8 @@ export function WorkflowsPage() {
       await deleteWorkflow(id);
       if (activeId === id) { setActiveId(null); setYaml(''); }
       await loadWorkflows();
-    } catch (e) { console.error(e); }
+      toast.success('已删除');
+    } catch (e) { toast.error('删除失败'); }
   }
 
   async function handleRun() {
@@ -54,7 +57,8 @@ export function WorkflowsPage() {
       await runWorkflow(activeId);
       await loadRuns(activeId);
       setTab('runs');
-    } catch (e) { console.error(e); }
+      toast.success('工作流已启动');
+    } catch (e) { toast.error('运行失败'); }
     setLoading(false);
   }
 

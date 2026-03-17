@@ -1,20 +1,32 @@
-import { useState } from 'react';
+import { useState, useMemo } from 'react';
 import { useExploreStore } from '@/hooks/useExploreStore';
-import { startExplore, deleteExplore } from '@/api/explore';
+import { startExplore, deleteExplore, curateExplore } from '@/api/explore';
+import { runGenerate } from '@/api/tasks';
+import { toast } from '@/utils/toast';
+import { normalizeCurationResult, normalizeGenerated } from '@/utils/normalize';
+import { CurationView } from '@/components/CurationView';
+import { GeneratedView } from '@/components/GeneratedView';
+import { LogViewer } from '@/components/LogViewer';
+import { ScreenshotReplay } from '@/components/ScreenshotReplay';
 import './ExplorePage.css';
 
 export function ExplorePage() {
-  const tasks = useExploreStore((s) => Object.values(s.tasks));
+  const tasksMap = useExploreStore((s) => s.tasks);
+  const tasks = useMemo(() => Object.values(tasksMap), [tasksMap]);
   const activeEid = useExploreStore((s) => s.activeEid);
   const selectTask = useExploreStore((s) => s.selectTask);
   const removeTask = useExploreStore((s) => s.removeTask);
+  const setCuration = useExploreStore((s) => s.setCuration);
+  const setGenerated = useExploreStore((s) => s.setGenerated);
   const activeTask = useExploreStore((s) => activeEid ? s.tasks[activeEid] : null);
 
   const [url, setUrl] = useState('');
   const [context, setContext] = useState('');
   const [maxPages, setMaxPages] = useState(12);
   const [loading, setLoading] = useState(false);
-  const [tab, setTab] = useState<'logs' | 'screenshots' | 'site'>('logs');
+  const [curating, setCurating] = useState(false);
+  const [generating, setGenerating] = useState(false);
+  const [tab, setTab] = useState<'logs' | 'screenshots' | 'site' | 'curation' | 'generated'>('logs');
 
   async function handleSubmit() {
     if (!url.trim()) return;
@@ -22,16 +34,39 @@ export function ExplorePage() {
     try {
       await startExplore(url, context || undefined, maxPages);
       setUrl('');
-    } catch (e) { console.error(e); }
+      toast.success('探索任务已启动');
+    } catch (e) { toast.error(`启动失败: ${e instanceof Error ? e.message : String(e)}`); }
     setLoading(false);
   }
 
   async function handleDelete(eid: string) {
     if (!confirm('确定删除？')) return;
-    try { await deleteExplore(eid); removeTask(eid); } catch (e) { console.error(e); }
+    try { await deleteExplore(eid); removeTask(eid); toast.success('已删除'); } catch (e) { toast.error(e instanceof Error ? e.message : String(e)); }
   }
 
-  const sorted = tasks.sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
+  async function handleCurate() {
+    if (!activeTask) return;
+    setCurating(true);
+    try {
+      const res = await curateExplore(activeTask.eid);
+      setCuration(activeTask.eid, normalizeCurationResult(res));
+      toast.success('策展完成');
+    } catch (e) { toast.error(`策展失败: ${e instanceof Error ? e.message : String(e)}`); }
+    setCurating(false);
+  }
+
+  async function handleGenerate() {
+    if (!activeTask) return;
+    setGenerating(true);
+    try {
+      const res = await runGenerate('explore', activeTask.eid);
+      setGenerated(activeTask.eid, normalizeGenerated(res));
+      toast.success('内容生成完成');
+    } catch (e) { toast.error(`生成失败: ${e instanceof Error ? e.message : String(e)}`); }
+    setGenerating(false);
+  }
+
+  const sorted = [...tasks].sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')));
 
   return (
     <div className="explore-page">
@@ -80,26 +115,25 @@ export function ExplorePage() {
                 截图 {activeTask.screenshots.length > 0 && `(${activeTask.screenshots.length})`}
               </button>
               <button className={`tab-btn ${tab === 'site' ? 'active' : ''}`} onClick={() => setTab('site')}>网站理解</button>
+              <button className={`tab-btn ${tab === 'curation' ? 'active' : ''}`} onClick={() => setTab('curation')}>
+                策展 {activeTask.curation && `(${activeTask.curation.cards.length})`}
+              </button>
+              <button className={`tab-btn ${tab === 'generated' ? 'active' : ''}`} onClick={() => setTab('generated')}>生成内容</button>
             </div>
 
             <div className="tab-content">
               {tab === 'logs' && (
-                <div className="log-viewer">
-                  {activeTask.logs.map((line, i) => <div key={i} className="log-line">{line}</div>)}
-                </div>
+                <LogViewer logs={activeTask.logs} isLive={activeTask.status === 'running'} />
               )}
+
               {tab === 'screenshots' && (
-                activeTask.screenshots.length === 0 ? <div className="empty-state">暂无截图</div> : (
-                  <div className="screenshot-grid">
-                    {activeTask.screenshots.map((f) => (
-                      <div key={f} className="screenshot-card">
-                        <img src={`/screenshots/${activeTask.eid}/${f}`} alt={f} loading="lazy" />
-                        <div className="screenshot-card-name">{f}</div>
-                      </div>
-                    ))}
-                  </div>
-                )
+                <ScreenshotReplay
+                  screenshots={activeTask.screenshots.map((f) => typeof f === 'string' ? f : f.filename)}
+                  screenshotPrefix={`/screenshots/explore_${activeTask.eid}`}
+                  logs={activeTask.logs}
+                />
               )}
+
               {tab === 'site' && (
                 activeTask.site_understanding ? (
                   <div className="site-understanding">
@@ -122,8 +156,53 @@ export function ExplorePage() {
                         ))}
                       </div>
                     )}
+                    {activeTask.visited_pages && activeTask.visited_pages.length > 0 && (
+                      <div style={{ marginTop: 16 }}>
+                        <h3 style={{ fontSize: 14, marginBottom: 8 }}>已访问页面 ({activeTask.visited_pages.length})</h3>
+                        <div className="visited-pages-table">
+                          <div className="visited-row visited-header">
+                            <span>页面</span><span>类型</span><span>分数</span>
+                          </div>
+                          {activeTask.visited_pages.map((p, i) => (
+                            <div key={i} className="visited-row">
+                              <span className="visited-url" title={p.url}>{p.title || p.url}</span>
+                              <span className="visited-type">{p.page_type}</span>
+                              <span className={`badge ${p.score >= 7 ? 'badge-done' : p.score >= 5 ? 'badge-running' : 'badge-failed'}`}>{p.score}</span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
                   </div>
                 ) : <div className="empty-state">暂无网站理解数据</div>
+              )}
+
+              {tab === 'curation' && (
+                activeTask.curation ? (
+                  <CurationView curation={activeTask.curation} screenshotPrefix={`/screenshots/explore_${activeTask.eid}`} />
+                ) : activeTask.status === 'done' ? (
+                  <div className="empty-state">
+                    <button className="btn-primary" onClick={handleCurate} disabled={curating}>
+                      {curating ? '策展中...' : '运行策展'}
+                    </button>
+                  </div>
+                ) : (
+                  <div className="empty-state">任务完成后可运行策展</div>
+                )
+              )}
+
+              {tab === 'generated' && (
+                activeTask.generated ? (
+                  <GeneratedView generated={activeTask.generated} source="explore" sourceId={activeTask.eid} />
+                ) : activeTask.curation ? (
+                  <div className="empty-state">
+                    <button className="btn-primary" onClick={handleGenerate} disabled={generating}>
+                      {generating ? '生成中...' : '生成内容'}
+                    </button>
+                  </div>
+                ) : (
+                  <div className="empty-state">请先运行策展</div>
+                )
               )}
             </div>
           </>

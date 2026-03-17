@@ -136,7 +136,7 @@ async def demo_traditional(out_dir: Path):
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True)
-        page = await browser.new_page(viewport={"width": 1280, "height": 800})
+        page = await browser.new_page(viewport={"width": 1920, "height": 1080})
 
         print("1. 打开 HackerNews...")
         await page.goto("https://news.ycombinator.com", timeout=30000)
@@ -170,7 +170,7 @@ async def demo_ai_native(out_dir: Path):
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True)
-        page = await browser.new_page(viewport={"width": 1280, "height": 800})
+        page = await browser.new_page(viewport={"width": 1920, "height": 1080})
 
         print("1. 打开 HackerNews...")
         await page.goto("https://news.ycombinator.com", timeout=30000)
@@ -212,7 +212,7 @@ async def demo_hybrid(out_dir: Path):
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True)
-        page = await browser.new_page(viewport={"width": 1280, "height": 800})
+        page = await browser.new_page(viewport={"width": 1920, "height": 1080})
 
         print("1. 打开 HackerNews...")
         await page.goto("https://news.ycombinator.com", timeout=30000)

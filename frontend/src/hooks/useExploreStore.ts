@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import type { ExploreTask } from '@/types/explore';
+import { normalizeExploreTask } from '@/utils/normalize';
 
 interface ExploreStore {
   tasks: Record<string, ExploreTask>;
@@ -20,12 +21,16 @@ export const useExploreStore = create<ExploreStore>((set) => ({
   activeEid: null,
 
   setSnapshot: (tasks) => set({
-    tasks: Object.fromEntries(tasks.map(t => [t.eid, { ...t, logs: t.logs || [], screenshots: t.screenshots || [] }])),
+    tasks: Object.fromEntries(tasks.map(t => {
+      const n = normalizeExploreTask(t);
+      return [n.eid, n];
+    })),
   }),
 
-  addTask: (task) => set((s) => ({
-    tasks: { ...s.tasks, [task.eid]: { ...task, logs: task.logs || [], screenshots: task.screenshots || [] } },
-  })),
+  addTask: (task) => set((s) => {
+    const n = normalizeExploreTask(task);
+    return { tasks: { ...s.tasks, [n.eid]: n } };
+  }),
 
   updateStatus: (eid, status, extra) => set((s) => {
     const t = s.tasks[eid];

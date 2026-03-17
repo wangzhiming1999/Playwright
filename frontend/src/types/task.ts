@@ -12,6 +12,8 @@ export interface Task {
   generated?: GeneratedContent;
   browser_mode?: string;
   created_at?: string;
+  started_at?: string;
+  finished_at?: string;
 }
 
 export interface CurationCard {
@@ -33,6 +35,7 @@ export interface GeneratedContent {
   ai_page?: {
     hero: { headline: string; subheadline: string; cta: string };
     features: { title: string; description: string; icon?: string }[];
+    social_proof?: string;
     faq: { question: string; answer: string }[];
   };
   tweets?: {

@@ -270,6 +270,7 @@ async def _update_task_status(task_id: str, status: str):
 
 async def _run_task(task_id: str, task: str):
     TASKS[task_id]["status"] = "running"
+    TASKS[task_id]["started_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
     save_task(TASKS[task_id])
     await _broadcast({"type": "status", "task_id": task_id, "data": "running"})
 
@@ -348,6 +349,8 @@ async def _run_task(task_id: str, task: str):
             "reason": str(e)[:500], "task": task,
         })
     finally:
+        TASKS[task_id]["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        save_task(TASKS[task_id])
         _CANCEL_EVENTS.pop(task_id, None)
 
 

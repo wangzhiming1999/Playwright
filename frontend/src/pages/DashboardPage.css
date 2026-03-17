@@ -36,6 +36,57 @@
   color: var(--text-primary);
 }
 
+.stat-sub {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-top: 4px;
+}
+
+/* Status distribution bar */
+.status-bar-section { margin-bottom: 32px; }
+.status-bar-section h2 { font-size: 18px; font-weight: 600; margin-bottom: 12px; }
+.status-bar {
+  display: flex;
+  height: 12px;
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--bg-tertiary);
+}
+.status-seg { min-width: 2px; transition: width 0.3s; }
+.seg-done { background: var(--green); }
+.seg-running { background: var(--accent); }
+.seg-pending { background: var(--text-muted); }
+.seg-failed { background: var(--red); }
+
+.status-legend {
+  display: flex;
+  gap: 16px;
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-right: 4px;
+  vertical-align: middle;
+}
+.dot-done { background: var(--green); }
+.dot-running { background: var(--accent); }
+.dot-pending { background: var(--text-muted); }
+.dot-failed { background: var(--red); }
+
+.recent-type-badge {
+  font-size: 11px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: var(--bg-tertiary);
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
 .recent-section h2 {
   font-size: 18px;
   font-weight: 600;
@@ -70,4 +121,26 @@
 .recent-time {
   font-size: 12px;
   color: var(--text-muted);
+}
+
+/* Charts */
+.charts-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 16px;
+  margin-bottom: 32px;
+}
+
+.chart-card {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 20px;
+}
+
+.chart-card h3 {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin-bottom: 16px;
 }

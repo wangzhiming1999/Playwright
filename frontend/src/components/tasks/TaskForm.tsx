@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { submitTasks } from '@/api/tasks';
+import { toast } from '@/utils/toast';
 
 export function TaskForm({ onSubmit }: { onSubmit?: () => void }) {
   const [text, setText] = useState('');
@@ -12,9 +13,10 @@ export function TaskForm({ onSubmit }: { onSubmit?: () => void }) {
     try {
       await submitTasks(tasks);
       setText('');
+      toast.success(`已提交 ${tasks.length} 个任务`);
       onSubmit?.();
     } catch (e) {
-      console.error('提交失败:', e);
+      toast.error(`提交失败: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
       setLoading(false);
     }

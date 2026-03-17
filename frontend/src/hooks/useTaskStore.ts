@@ -1,11 +1,13 @@
 import { create } from 'zustand';
 import type { Task, TaskStatus } from '@/types/task';
+import { normalizeTask } from '@/utils/normalize';
 
 interface TaskStore {
   tasks: Record<string, Task>;
   activeTaskId: string | null;
   searchQuery: string;
   statusFilter: TaskStatus | 'all';
+  selectedIds: Set<string>;
 
   setSnapshot: (tasks: Task[]) => void;
   addTask: (task: Task) => void;
@@ -20,6 +22,9 @@ interface TaskStore {
   setFilter: (status: TaskStatus | 'all') => void;
   setCuration: (taskId: string, curation: Task['curation']) => void;
   setGenerated: (taskId: string, generated: Task['generated']) => void;
+  toggleSelect: (taskId: string) => void;
+  clearSelection: () => void;
+  bulkRemove: (ids: string[]) => void;
 }
 
 export const useTaskStore = create<TaskStore>((set) => ({
@@ -27,13 +32,14 @@ export const useTaskStore = create<TaskStore>((set) => ({
   activeTaskId: null,
   searchQuery: '',
   statusFilter: 'all',
+  selectedIds: new Set(),
 
   setSnapshot: (tasks) => set({
-    tasks: Object.fromEntries(tasks.map(t => [t.id, { ...t, logs: t.logs || [], screenshots: t.screenshots || [] }])),
+    tasks: Object.fromEntries(tasks.map(t => [t.id, normalizeTask(t)])),
   }),
 
   addTask: (task) => set((s) => ({
-    tasks: { ...s.tasks, [task.id]: { ...task, logs: task.logs || [], screenshots: task.screenshots || [] } },
+    tasks: { ...s.tasks, [task.id]: normalizeTask(task) },
   })),
 
   updateStatus: (taskId, status, screenshots) => set((s) => {
@@ -68,7 +74,8 @@ export const useTaskStore = create<TaskStore>((set) => ({
   }),
 
   removeTask: (taskId) => set((s) => {
-    const { [taskId]: _, ...rest } = s.tasks;
+    const { [taskId]: _removed, ...rest } = s.tasks;
+    void _removed;
     return { tasks: rest, activeTaskId: s.activeTaskId === taskId ? null : s.activeTaskId };
   }),
 
@@ -86,5 +93,19 @@ export const useTaskStore = create<TaskStore>((set) => ({
     const t = s.tasks[taskId];
     if (!t) return s;
     return { tasks: { ...s.tasks, [taskId]: { ...t, generated } } };
+  }),
+
+  toggleSelect: (taskId) => set((s) => {
+    const next = new Set(s.selectedIds);
+    if (next.has(taskId)) next.delete(taskId); else next.add(taskId);
+    return { selectedIds: next };
+  }),
+
+  clearSelection: () => set({ selectedIds: new Set() }),
+
+  bulkRemove: (ids) => set((s) => {
+    const tasks = { ...s.tasks };
+    for (const id of ids) delete tasks[id];
+    return { tasks, selectedIds: new Set(), activeTaskId: ids.includes(s.activeTaskId || '') ? null : s.activeTaskId };
   }),
 }));

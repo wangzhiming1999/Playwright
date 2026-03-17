@@ -1,55 +1,64 @@
-import { useState, useRef, useEffect } from 'react';
+import { useState } from 'react';
 import { useTaskStore } from '@/hooks/useTaskStore';
-import { cancelTask, deleteTask, replyToTask } from '@/api/tasks';
+import { cancelTask, deleteTask, replyToTask, runCuration, runGenerate } from '@/api/tasks';
+import { toast } from '@/utils/toast';
+import { normalizeCurationResult, normalizeGenerated } from '@/utils/normalize';
+import { CurationView } from '@/components/CurationView';
+import { GeneratedView } from '@/components/GeneratedView';
+import { LogViewer } from '@/components/LogViewer';
+import { ScreenshotReplay } from '@/components/ScreenshotReplay';
 import './TaskDetail.css';
-
-function classifyLog(line: string) {
-  if (line.includes('>>>') || line.includes('[') && line.includes(']')) return 'log-action';
-  if (line.includes('✓') || line.includes('✅') || line.includes('成功')) return 'log-ok';
-  if (line.includes('⚠') || line.includes('WARNING')) return 'log-warn';
-  if (line.includes('❌') || line.includes('失败') || line.includes('ERROR')) return 'log-err';
-  if (line.includes('__PROGRESS__')) return 'log-progress';
-  return '';
-}
 
 export function TaskDetail() {
   const activeTaskId = useTaskStore((s) => s.activeTaskId);
   const task = useTaskStore((s) => activeTaskId ? s.tasks[activeTaskId] : null);
   const removeTask = useTaskStore((s) => s.removeTask);
-  const [tab, setTab] = useState<'logs' | 'screenshots'>('logs');
-  const [lightbox, setLightbox] = useState<string | null>(null);
+  const setCuration = useTaskStore((s) => s.setCuration);
+  const setGenerated = useTaskStore((s) => s.setGenerated);
+  const [tab, setTab] = useState<'logs' | 'screenshots' | 'curation' | 'generated'>('logs');
   const [reply, setReply] = useState('');
   const [replying, setReplying] = useState(false);
-  const logEndRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    logEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [task?.logs.length]);
+  const [curating, setCurating] = useState(false);
+  const [generating, setGenerating] = useState(false);
 
   if (!task) {
     return <div className="empty-state" style={{ height: '100%' }}>选择一个任务查看详情</div>;
   }
 
   async function handleCancel() {
-    try { await cancelTask(task!.id); } catch (e) { console.error(e); }
+    try { await cancelTask(task!.id); toast.success('已取消'); } catch (e) { toast.error(e instanceof Error ? e.message : String(e)); }
   }
 
   async function handleDelete() {
     if (!confirm('确定删除此任务？')) return;
-    try {
-      await deleteTask(task!.id);
-      removeTask(task!.id);
-    } catch (e) { console.error(e); }
+    try { await deleteTask(task!.id); removeTask(task!.id); toast.success('已删除'); } catch (e) { toast.error(e instanceof Error ? e.message : String(e)); }
   }
 
   async function handleReply() {
     if (!reply.trim()) return;
     setReplying(true);
-    try {
-      await replyToTask(task!.id, reply);
-      setReply('');
-    } catch (e) { console.error(e); }
+    try { await replyToTask(task!.id, reply); setReply(''); } catch (e) { toast.error(e instanceof Error ? e.message : String(e)); }
     setReplying(false);
+  }
+
+  async function handleCurate() {
+    setCurating(true);
+    try {
+      const res = await runCuration(task!.id);
+      setCuration(task!.id, normalizeCurationResult(res));
+      toast.success('策展完成');
+    } catch (e) { toast.error(`策展失败: ${e instanceof Error ? e.message : String(e)}`); }
+    setCurating(false);
+  }
+
+  async function handleGenerate() {
+    setGenerating(true);
+    try {
+      const res = await runGenerate('task', task!.id);
+      setGenerated(task!.id, normalizeGenerated(res));
+      toast.success('内容生成完成');
+    } catch (e) { toast.error(`生成失败: ${e instanceof Error ? e.message : String(e)}`); }
+    setGenerating(false);
   }
 
   const screenshotCount = task.screenshots.length;
@@ -91,52 +100,57 @@ export function TaskDetail() {
       )}
 
       <div className="tab-bar">
-        <button className={`tab-btn ${tab === 'logs' ? 'active' : ''}`} onClick={() => setTab('logs')}>
-          日志
-        </button>
+        <button className={`tab-btn ${tab === 'logs' ? 'active' : ''}`} onClick={() => setTab('logs')}>日志</button>
         <button className={`tab-btn ${tab === 'screenshots' ? 'active' : ''}`} onClick={() => setTab('screenshots')}>
           截图 {screenshotCount > 0 && `(${screenshotCount})`}
         </button>
+        <button className={`tab-btn ${tab === 'curation' ? 'active' : ''}`} onClick={() => setTab('curation')}>
+          策展 {task.curation && `(${task.curation.cards.length})`}
+        </button>
+        <button className={`tab-btn ${tab === 'generated' ? 'active' : ''}`} onClick={() => setTab('generated')}>生成内容</button>
       </div>
 
       <div className="tab-content">
         {tab === 'logs' && (
-          <div className="log-viewer">
-            {task.logs.filter(l => !l.startsWith('__PROGRESS__')).map((line, i) => (
-              <div key={i} className={`log-line ${classifyLog(line)}`}>{line}</div>
-            ))}
-            <div ref={logEndRef} />
-          </div>
+          <LogViewer logs={task.logs} isLive={task.status === 'running'} />
         )}
 
         {tab === 'screenshots' && (
-          <>
-            {screenshotCount === 0 ? (
-              <div className="empty-state">暂无截图</div>
-            ) : (
-              <div className="screenshot-grid">
-                {task.screenshots.map((filename) => (
-                  <div key={filename} className="screenshot-card" onClick={() => setLightbox(filename)}>
-                    <img src={`/screenshots/${task.id}/${filename}`} alt={filename} loading="lazy" />
-                    <div className="screenshot-card-name">{filename}</div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </>
+          <ScreenshotReplay
+            screenshots={task.screenshots}
+            screenshotPrefix={`/screenshots/${task.id}`}
+            logs={task.logs}
+          />
+        )}
+
+        {tab === 'curation' && (
+          task.curation ? (
+            <CurationView curation={task.curation} screenshotPrefix={`/screenshots/${task.id}`} />
+          ) : task.status === 'done' ? (
+            <div className="empty-state">
+              <button className="btn-primary" onClick={handleCurate} disabled={curating}>
+                {curating ? '策展中...' : '运行策展'}
+              </button>
+            </div>
+          ) : (
+            <div className="empty-state">任务完成后可运行策展</div>
+          )
+        )}
+
+        {tab === 'generated' && (
+          task.generated ? (
+            <GeneratedView generated={task.generated} source="task" sourceId={task.id} />
+          ) : task.curation ? (
+            <div className="empty-state">
+              <button className="btn-primary" onClick={handleGenerate} disabled={generating}>
+                {generating ? '生成中...' : '生成内容'}
+              </button>
+            </div>
+          ) : (
+            <div className="empty-state">请先运行策展</div>
+          )
         )}
       </div>
-
-      {lightbox && (
-        <div className="lightbox-overlay" onClick={() => setLightbox(null)}>
-          <button className="lightbox-close" onClick={() => setLightbox(null)}>×</button>
-          <img
-            src={`/screenshots/${task.id}/${lightbox}`}
-            alt={lightbox}
-            onClick={(e) => e.stopPropagation()}
-          />
-        </div>
-      )}
     </div>
   );
 }

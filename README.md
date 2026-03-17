@@ -5,7 +5,7 @@
 ## ✨ 核心特性
 
 - **视觉驱动操作** - LLM 直接"看"网页截图，通过视觉理解定位元素
-- **双 LLM 后端** - 支持 OpenAI (GPT-4o) 和 Anthropic (Claude)，一键切换
+- **多 LLM 后端** - 支持 OpenAI (GPT-4o)、Anthropic (Claude)、litellm（Gemini / Ollama / Azure 等 100+ 模型）
 - **智能任务分解** - 自动将复杂任务拆解为可执行步骤
 - **失败自愈** - 操作失败时 AI 自动分析原因并调整策略重试
 - **Human-in-the-loop** - 执行中可暂停向用户提问，获取必要信息
@@ -38,6 +38,8 @@ uvicorn app:app --reload --port 8000
 ```
 
 打开浏览器访问 [http://localhost:8000](http://localhost:8000)
+
+如需修改前端界面：进入 `frontend` 目录执行 `npm install` 与 `npm run build`，构建产物会输出到 `static/`。
 
 ### 方式二：Docker
 
@@ -119,18 +121,20 @@ skyvern/
 │   ├── tools.py            # 工具定义（LLM 可调用的 20+ 操作）
 │   ├── llm_helpers.py      # 任务分解、步骤验证、上下文压缩
 │   ├── page_utils.py       # 页面就绪等待、安全打印
+│   ├── error_recovery.py   # 失败分析与重试
+│   ├── circuit_breaker.py # 调用熔断
 │   └── chrome_detector.py  # Chrome/Edge 用户数据目录检测
 ├── app.py                  # FastAPI 后端服务
 ├── db.py                   # SQLite 数据持久化
-├── utils.py                # LLM 路由（OpenAI/Anthropic）、URL 验证
+├── utils.py                # LLM 路由（OpenAI/Anthropic/litellm）、URL 验证
 ├── page_annotator.py       # 页面元素标注（红框+编号）
 ├── explorer.py             # 网站探索爬虫
 ├── curator.py              # 截图策展（去重+打分）
 ├── content_gen.py          # 营销内容生成
 ├── site_understanding.py   # 网站结构分析
-├── static/
-│   └── index.html          # Web Dashboard
-├── tests/                  # 测试套件（8 个模块）
+├── frontend/               # Web Dashboard 源码（React + Vite，构建输出到 static/）
+├── static/                 # 前端构建产物（由 frontend 的 vite build 生成）
+├── tests/                  # 测试套件
 ├── data/
 │   └── tasks.db            # SQLite 数据库
 ├── screenshots/            # 任务截图存储
@@ -150,7 +154,7 @@ skyvern/
 |------|------|--------|
 | `OPENAI_API_KEY` | OpenAI API Key | - |
 | `ANTHROPIC_API_KEY` | Anthropic API Key | - |
-| `LLM_BACKEND` | LLM 后端选择 | `openai` |
+| `LLM_BACKEND` | LLM 后端：`openai` / `anthropic` / `litellm` | `openai` |
 | `API_KEY` | 服务端 API 认证密钥（可选） | - |
 | `HEADLESS` | 浏览器无头模式 | `false` |
 | `USE_PROXY` | 是否使用代理 | `false` |
@@ -281,13 +285,6 @@ pytest -k "test_validate_url"
 - [ ] YAML 工作流定义（声明式多步骤）
 - [ ] 多浏览器实例并行执行
 - [ ] 插件系统（自定义工具扩展）
-
-## 🧪 运行测试
-
-```bash
-pip install -r requirements-dev.txt
-pytest
-```
 
 ## 🤝 贡献指南
 

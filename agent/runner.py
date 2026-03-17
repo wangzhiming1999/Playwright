@@ -62,7 +62,7 @@ async def run_agent(
             if browser.contexts:
                 context = browser.contexts[0]
             else:
-                context = await browser.new_context(viewport={"width": 1280, "height": 800}, locale="zh-CN")
+                context = await browser.new_context(viewport={"width": 1920, "height": 1080}, locale="zh-CN")
 
         elif browser_mode == "user_chrome":
             # 用用户的 Chrome Profile 启动，继承所有登录态
@@ -80,7 +80,7 @@ async def run_agent(
                         channel="chrome",          # 用系统安装的 Chrome，不是 Playwright 内置的
                         headless=False,            # 用户 Profile 模式必须有头
                         args=["--profile-directory=" + profile],
-                        viewport={"width": 1280, "height": 800},
+                        viewport={"width": 1920, "height": 1080},
                         locale="zh-CN",
                         proxy={"server": "http://127.0.0.1:7897"} if os.environ.get("USE_PROXY") else None,
                     )
@@ -96,7 +96,7 @@ async def run_agent(
                 proxy={"server": "http://127.0.0.1:7897"} if os.environ.get("USE_PROXY") else None,
             )
             context = await browser.new_context(
-                viewport={"width": 1280, "height": 800},
+                viewport={"width": 1920, "height": 1080},
                 locale="zh-CN",
             )
 

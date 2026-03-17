@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { cleanup } from '@/api/tasks';
+import { toast } from '@/utils/toast';
 import './SettingsPage.css';
 
 export function SettingsPage() {
@@ -10,6 +11,7 @@ export function SettingsPage() {
 
   function handleSaveApiKey() {
     localStorage.setItem('api_key', apiKey);
+    toast.success('API Key 已保存');
     setSaving(true);
     setTimeout(() => setSaving(false), 1000);
   }
@@ -18,8 +20,11 @@ export function SettingsPage() {
     try {
       const result = await cleanup(keepLast);
       setCleanupResult(`已清理 ${result.deleted_tasks} 个任务`);
+      toast.success(`已清理 ${result.deleted_tasks} 个任务`);
     } catch (e) {
-      setCleanupResult(`清理失败: ${e}`);
+      const msg = e instanceof Error ? e.message : String(e);
+      setCleanupResult(`清理失败: ${msg}`);
+      toast.error(`清理失败: ${msg}`);
     }
   }
 

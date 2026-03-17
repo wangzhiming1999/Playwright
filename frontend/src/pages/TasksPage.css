@@ -18,3 +18,14 @@
   flex-direction: column;
   overflow: hidden;
 }
+
+@media (max-width: 1024px) {
+  .tasks-page {
+    grid-template-columns: 1fr;
+    grid-template-rows: 280px 1fr;
+  }
+  .tasks-sidebar {
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+  }
+}

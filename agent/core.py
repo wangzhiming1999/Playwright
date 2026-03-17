@@ -204,7 +204,7 @@ class BrowserAgent:
         viewport = self.page.viewport_size
         if not viewport:
             return "AI操作失败: 无法获取视口尺寸"
-        width, height = viewport.get('width', 1280), viewport.get('height', 800)
+        width, height = viewport.get('width', 1920), viewport.get('height', 1080)
 
         try:
             task_desc = prompt
@@ -967,7 +967,7 @@ class BrowserAgent:
                 viewport = self.page.viewport_size
                 if not viewport:
                     return "操作失败: 无法获取视口尺寸"
-                width, height = viewport.get('width', 1280), viewport.get('height', 800)
+                width, height = viewport.get('width', 1920), viewport.get('height', 1080)
 
                 type_hint = ""
                 if element_type == "image":
