@@ -27,6 +27,7 @@ from .action_registry import load_custom_actions, get_custom_tools
 from .cost_tracker import CostTracker
 from .a11y_tree import extract_a11y_tree, get_page_summary, should_use_screenshot
 from .model_router import select_model_tier
+from .memory import MemoryManager, format_memories_for_prompt, _extract_domain
 
 from utils import llm_chat
 from page_annotator import annotate_page
@@ -358,6 +359,18 @@ async def run_agent(
         ]
 
         await _log(f"\n🚀 开始执行任务: {task}\n")
+
+        # ── 记忆注入：检索相关历史经验 ──────────────────────────────────
+        _memory_mgr = MemoryManager()
+        _task_domain = _extract_domain(task)
+        try:
+            _relevant_memories = _memory_mgr.retrieve_relevant(task, domain=_task_domain, max_results=5)
+            if _relevant_memories:
+                _memory_text = format_memories_for_prompt(_relevant_memories)
+                messages[1]["content"] += f"\n\n{_memory_text}"
+                await _log(f"  [记忆] 已注入 {len(_relevant_memories)} 条相关经验")
+        except Exception as e:
+            await _log(f"  ⚠ [记忆] 检索失败: {e}")
 
         # ── 加载自定义 Actions ──────────────────────────────────────────
         custom_count = load_custom_actions("custom_actions")

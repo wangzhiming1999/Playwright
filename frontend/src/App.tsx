@@ -10,6 +10,8 @@ import { ExplorePage } from './pages/ExplorePage';
 import { WorkflowsPage } from './pages/WorkflowsPage';
 import { TemplatesPage } from './pages/TemplatesPage';
 import { SettingsPage } from './pages/SettingsPage';
+import { MemoryPage } from './pages/MemoryPage';
+import { RecordingsPage } from './pages/RecordingsPage';
 import './styles/globals.css';
 
 export default function App() {
@@ -30,6 +32,8 @@ export default function App() {
           <Route path="workflows/:id" element={<ErrorBoundary><WorkflowsPage /></ErrorBoundary>} />
           <Route path="templates" element={<ErrorBoundary><TemplatesPage /></ErrorBoundary>} />
           <Route path="templates/:templateId" element={<ErrorBoundary><TemplatesPage /></ErrorBoundary>} />
+          <Route path="memory" element={<ErrorBoundary><MemoryPage /></ErrorBoundary>} />
+          <Route path="recordings" element={<ErrorBoundary><RecordingsPage /></ErrorBoundary>} />
           <Route path="settings" element={<ErrorBoundary><SettingsPage /></ErrorBoundary>} />
           <Route path="*" element={<Navigate to="/dashboard" replace />} />
         </Route>

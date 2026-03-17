@@ -27,6 +27,12 @@ export function AppShell() {
           <Link to="/templates" className={location.pathname.startsWith('/templates') ? 'active' : ''}>
             模板市场
           </Link>
+          <Link to="/memory" className={location.pathname === '/memory' ? 'active' : ''}>
+            记忆
+          </Link>
+          <Link to="/recordings" className={location.pathname === '/recordings' ? 'active' : ''}>
+            录制
+          </Link>
           <Link to="/settings" className={location.pathname === '/settings' ? 'active' : ''}>
             设置
           </Link>

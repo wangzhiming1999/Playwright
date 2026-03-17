@@ -1,0 +1,60 @@
+.recordings-page { padding: 24px; max-width: 1200px; }
+.recordings-header h2 { margin: 0 0 4px; font-size: 1.4rem; }
+.recordings-desc { margin: 0 0 16px; color: var(--text-secondary); font-size: 0.85rem; }
+
+.recording-control-panel { border: 1px solid var(--border); border-radius: 10px; padding: 16px; margin-bottom: 20px; background: var(--bg-primary); }
+.recording-start-form { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.recording-start-form input,
+.recording-start-form select { padding: 8px 12px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg-primary); color: var(--text-primary); font-size: 0.85rem; }
+.recording-start-form input:first-child { width: 180px; }
+.recording-start-form input:nth-child(2) { flex: 1; min-width: 200px; }
+
+.btn-primary { padding: 8px 16px; background: var(--accent); color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 0.85rem; }
+.btn-primary:hover { opacity: 0.9; }
+.btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn-secondary { padding: 8px 16px; background: var(--bg-secondary); color: var(--text-primary); border: 1px solid var(--border); border-radius: 6px; cursor: pointer; font-size: 0.85rem; }
+.btn-stop { padding: 8px 16px; background: #dc2626; color: white; border: none; border-radius: 6px; cursor: pointer; }
+
+.recording-active { display: flex; align-items: center; gap: 12px; }
+.recording-indicator { font-weight: 600; animation: blink 1s infinite; }
+@keyframes blink { 50% { opacity: 0.5; } }
+
+.recording-timeline { margin-top: 16px; }
+.recording-timeline h3, .recording-timeline h4 { margin: 0 0 8px; font-size: 0.95rem; }
+.timeline-item { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-left: 2px solid var(--border); margin-left: 8px; font-size: 0.85rem; }
+.timeline-item:hover { background: var(--bg-secondary); }
+.timeline-step { width: 24px; height: 24px; border-radius: 50%; background: var(--accent); color: white; display: flex; align-items: center; justify-content: center; font-size: 0.7rem; flex-shrink: 0; }
+.timeline-icon { font-size: 1rem; }
+.timeline-type { font-weight: 600; min-width: 80px; }
+.timeline-text { color: var(--text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+.timeline-url { font-size: 0.75rem; color: var(--text-secondary); max-width: 150px; overflow: hidden; text-overflow: ellipsis; }
+
+.recording-detail { border: 1px solid var(--border); border-radius: 10px; padding: 16px; margin-bottom: 20px; background: var(--bg-primary); }
+.recording-detail-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+.recording-detail-header h3 { margin: 0; }
+.recording-detail-actions { display: flex; gap: 8px; }
+
+.recording-params { margin-bottom: 16px; padding: 12px; background: var(--bg-secondary); border-radius: 8px; }
+.recording-params h4 { margin: 0 0 8px; font-size: 0.85rem; }
+.param-item { display: flex; gap: 8px; align-items: center; padding: 4px 0; font-size: 0.8rem; }
+.param-key { font-weight: 600; font-family: monospace; }
+.param-type { color: var(--accent); font-size: 0.75rem; }
+.param-desc { color: var(--text-secondary); }
+.param-default { color: var(--text-secondary); font-style: italic; }
+
+.recordings-list-title { margin: 24px 0 12px; font-size: 1rem; }
+.recordings-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; }
+.recording-card { border: 1px solid var(--border); border-radius: 8px; padding: 12px; background: var(--bg-primary); cursor: pointer; transition: box-shadow 0.15s; }
+.recording-card:hover { box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
+.recording-card-header { display: flex; justify-content: space-between; margin-bottom: 6px; font-size: 0.8rem; }
+.recording-status { font-weight: 600; }
+.recording-date { color: var(--text-secondary); }
+.recording-card-title { font-weight: 600; font-size: 0.9rem; margin-bottom: 4px; }
+.recording-card-meta { font-size: 0.8rem; color: var(--text-secondary); display: flex; gap: 8px; margin-bottom: 8px; }
+.recording-url { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 200px; }
+.recording-card-actions { display: flex; justify-content: flex-end; }
+
+.recordings-loading, .recordings-empty { text-align: center; padding: 48px; color: var(--text-secondary); }
+
+.yaml-modal { width: 700px; }
+.yaml-preview { background: var(--bg-secondary); padding: 12px; border-radius: 8px; font-size: 0.8rem; max-height: 400px; overflow: auto; white-space: pre-wrap; }

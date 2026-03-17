@@ -22,6 +22,9 @@ from .watchdog import Watchdog, EventType
 from .action_registry import action, load_custom_actions, get_custom_tools, get_registry
 from .task_pool import TaskPool
 from .browser_pool import BrowserPool
+from .memory import MemoryManager
+from .recorder import ActionRecorder
+from .recording_converter import RecordingConverter
 
 __version__ = "0.1.0"
 
@@ -34,5 +37,8 @@ __all__ = [
     "action", "load_custom_actions", "get_custom_tools", "get_registry",
     "TaskPool",
     "BrowserPool",
+    "MemoryManager",
+    "ActionRecorder",
+    "RecordingConverter",
     "__version__",
 ]

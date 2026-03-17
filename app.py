@@ -35,6 +35,11 @@ from curator import curate
 from explorer import run_exploration
 from content_gen import generate_all
 from db import init_db, save_task, load_all_tasks, save_explore_task, load_all_explore_tasks, DB_PATH
+from db import (
+    init_memory_db, save_memory, load_memories, get_memory, delete_memory,
+    delete_memories_batch, update_memory_hit, get_memory_stats,
+    init_recording_db, save_recording, load_all_recordings, get_recording, delete_recording,
+)
 from utils import validate_url
 from workflow import (
     init_workflow_db, parse_workflow, validate_workflow,
@@ -112,6 +117,8 @@ Path("screenshots").mkdir(exist_ok=True)
 Path("static").mkdir(exist_ok=True)
 init_db()
 init_workflow_db()
+init_memory_db()
+init_recording_db()
 
 # 启动时扫描 workflows/ 目录，加载 YAML 工作流
 WORKFLOWS: dict[str, dict] = load_all_workflows()
@@ -438,6 +445,23 @@ async def _run_task(task_id: str, task: str):
         TASKS[task_id]["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
         save_task(TASKS[task_id])
         _CANCEL_EVENTS.pop(task_id, None)
+
+        # ── 记忆提取：任务完成后自动提取经验 ──
+        try:
+            from agent.memory import MemoryManager
+            _mem_mgr = MemoryManager()
+            _task_success = TASKS[task_id]["status"] == "done"
+            _task_logs = TASKS[task_id].get("logs", [])
+            _extracted = _mem_mgr.extract_memories(
+                task_id=task_id, task=task,
+                logs=_task_logs, success=_task_success,
+            )
+            if _extracted:
+                saved_ids = _mem_mgr.save_memories(_extracted)
+                if saved_ids:
+                    print(f"  [memory] 提取并保存 {len(saved_ids)} 条记忆 (task={task_id})")
+        except Exception as e:
+            print(f"  [memory] 提取失败: {e}")
 
 
 # ── API endpoints ─────────────────────────────────────────────────────────────
@@ -1545,6 +1569,282 @@ async def run_template(
 
     background_tasks.add_task(_execute)
     await _broadcast({"type": "workflow_started", "run_id": run_id, "workflow_id": wf_id})
+    return {"run_id": run_id, "workflow_id": wf_id}
+
+
+# ── Memory API ───────────────────────────────────────────────────────────────
+
+class MemoryUpdateRequest(BaseModel):
+    title: str | None = None
+    content: str | None = None  # JSON string
+
+
+@app.get("/memories")
+async def list_memories(domain: str = None, type: str = None, _=Depends(_verify_api_key)):
+    return load_memories(domain=domain, memory_type=type)
+
+
+@app.get("/memories/stats")
+async def memory_stats(_=Depends(_verify_api_key)):
+    return get_memory_stats()
+
+
+@app.get("/memories/{memory_id}")
+async def get_memory_detail(memory_id: str, _=Depends(_verify_api_key)):
+    m = get_memory(memory_id)
+    if not m:
+        raise HTTPException(404, "Memory not found")
+    return m
+
+
+@app.put("/memories/{memory_id}")
+async def update_memory_endpoint(memory_id: str, req: MemoryUpdateRequest, _=Depends(_verify_api_key)):
+    m = get_memory(memory_id)
+    if not m:
+        raise HTTPException(404, "Memory not found")
+    if req.title is not None:
+        m["title"] = req.title
+    if req.content is not None:
+        try:
+            m["content"] = json.loads(req.content)
+        except json.JSONDecodeError:
+            m["content"] = req.content
+    save_memory(m)
+    return {"ok": True}
+
+
+@app.delete("/memories/{memory_id}")
+async def delete_memory_endpoint(memory_id: str, _=Depends(_verify_api_key)):
+    if not delete_memory(memory_id):
+        raise HTTPException(404, "Memory not found")
+    return {"ok": True}
+
+
+class BatchDeleteMemoriesRequest(BaseModel):
+    ids: list[str]
+
+
+@app.post("/memories/batch-delete")
+async def batch_delete_memories(req: BatchDeleteMemoriesRequest, _=Depends(_verify_api_key)):
+    count = delete_memories_batch(req.ids)
+    return {"deleted": count}
+
+
+# ── Recording API ────────────────────────────────────────────────────────────
+
+_RECORDING_SESSIONS: dict[str, dict] = {}  # recording_id -> {recorder, page, browser, pw, ...}
+
+
+class RecordingStartRequest(BaseModel):
+    title: str = ""
+    start_url: str = "about:blank"
+    browser_mode: str = Field(default="builtin", pattern=r'^(builtin|cdp)$')
+    cdp_url: str = Field(default="http://localhost:9222", max_length=500)
+
+
+@app.post("/recordings/start")
+async def start_recording(req: RecordingStartRequest, background_tasks: BackgroundTasks, _=Depends(_verify_api_key)):
+    from agent.recorder import ActionRecorder
+    from playwright.async_api import async_playwright
+
+    recording_id = uuid.uuid4().hex[:12]
+
+    async def _launch():
+        pw = await async_playwright().__aenter__()
+        if req.browser_mode == "cdp":
+            browser = await pw.chromium.connect_over_cdp(req.cdp_url)
+            context = browser.contexts[0] if browser.contexts else await browser.new_context(
+                viewport={"width": 1920, "height": 1080}, locale="zh-CN"
+            )
+        else:
+            browser = await pw.chromium.launch(headless=False)
+            context = await browser.new_context(viewport={"width": 1920, "height": 1080}, locale="zh-CN")
+
+        page = await context.new_page()
+        if req.start_url and req.start_url != "about:blank":
+            await page.goto(req.start_url, wait_until="domcontentloaded", timeout=30000)
+
+        recorder = ActionRecorder(page)
+        await recorder.start()
+
+        _RECORDING_SESSIONS[recording_id] = {
+            "recorder": recorder, "page": page, "browser": browser,
+            "context": context, "pw": pw, "title": req.title,
+            "start_url": req.start_url,
+        }
+
+        # 实时推送录制的 action
+        async def _broadcast_actions():
+            last_count = 0
+            while recording_id in _RECORDING_SESSIONS:
+                actions = recorder._actions
+                if len(actions) > last_count:
+                    for a in actions[last_count:]:
+                        await _broadcast({
+                            "type": "recording_action",
+                            "recording_id": recording_id,
+                            "action": a,
+                        })
+                    last_count = len(actions)
+                await asyncio.sleep(0.5)
+
+        asyncio.create_task(_broadcast_actions())
+
+    await _launch()
+
+    save_recording({
+        "id": recording_id, "title": req.title, "start_url": req.start_url,
+        "actions": [], "parameters": [], "status": "recording",
+    })
+
+    return {"recording_id": recording_id, "status": "recording"}
+
+
+@app.post("/recordings/{recording_id}/stop")
+async def stop_recording(recording_id: str, _=Depends(_verify_api_key)):
+    session = _RECORDING_SESSIONS.pop(recording_id, None)
+    if not session:
+        raise HTTPException(404, "Recording session not found or already stopped")
+
+    recorder = session["recorder"]
+    actions = await recorder.stop()
+
+    # 关闭浏览器
+    try:
+        await session["browser"].close()
+    except Exception:
+        pass
+    try:
+        await session["pw"].__aexit__(None, None, None)
+    except Exception:
+        pass
+
+    # 自动检测参数
+    from agent.recording_converter import RecordingConverter
+    converter = RecordingConverter({"actions": actions})
+    parameters = converter._detect_parameters()
+
+    # 保存到数据库
+    save_recording({
+        "id": recording_id, "title": session.get("title", ""),
+        "start_url": session.get("start_url", ""),
+        "actions": actions, "parameters": parameters, "status": "completed",
+    })
+
+    return {"recording_id": recording_id, "actions": actions, "parameters": parameters, "status": "completed"}
+
+
+@app.get("/recordings")
+async def list_recordings(_=Depends(_verify_api_key)):
+    return load_all_recordings()
+
+
+@app.get("/recordings/{recording_id}")
+async def get_recording_detail(recording_id: str, _=Depends(_verify_api_key)):
+    r = get_recording(recording_id)
+    if not r:
+        raise HTTPException(404, "Recording not found")
+    return r
+
+
+@app.delete("/recordings/{recording_id}")
+async def delete_recording_endpoint(recording_id: str, _=Depends(_verify_api_key)):
+    _RECORDING_SESSIONS.pop(recording_id, None)
+    if not delete_recording(recording_id):
+        raise HTTPException(404, "Recording not found")
+    return {"ok": True}
+
+
+class RecordingConvertRequest(BaseModel):
+    title: str = ""
+    parameters: list[dict] = Field(default_factory=list)
+
+
+@app.post("/recordings/{recording_id}/convert")
+async def convert_recording(recording_id: str, req: RecordingConvertRequest, _=Depends(_verify_api_key)):
+    r = get_recording(recording_id)
+    if not r:
+        raise HTTPException(404, "Recording not found")
+
+    from agent.recording_converter import RecordingConverter
+    converter = RecordingConverter(r)
+    yaml_content = converter.to_workflow_yaml(
+        params=req.parameters if req.parameters else None,
+        title=req.title or r.get("title", ""),
+    )
+
+    # 保存为 workflow
+    wf_data = parse_workflow(yaml_content)
+    wf_id = uuid.uuid4().hex[:8]
+    wf = {
+        "id": wf_id,
+        "title": wf_data.get("title", req.title or "录制工作流"),
+        "description": wf_data.get("description", "从录制自动生成"),
+        "yaml_content": yaml_content,
+    }
+    save_workflow(wf)
+    WORKFLOWS[wf_id] = wf
+
+    # 更新录制记录
+    r["workflow_id"] = wf_id
+    r["status"] = "converted"
+    save_recording(r)
+
+    return {"workflow_id": wf_id, "yaml_content": yaml_content}
+
+
+class RecordingReplayRequest(BaseModel):
+    parameters: dict = Field(default_factory=dict)
+
+
+@app.post("/recordings/{recording_id}/replay")
+async def replay_recording(
+    recording_id: str, req: RecordingReplayRequest,
+    background_tasks: BackgroundTasks, _=Depends(_verify_api_key),
+):
+    r = get_recording(recording_id)
+    if not r:
+        raise HTTPException(404, "Recording not found")
+
+    # 如果还没转换，先转换
+    wf_id = r.get("workflow_id")
+    if not wf_id or wf_id not in WORKFLOWS:
+        from agent.recording_converter import RecordingConverter
+        converter = RecordingConverter(r)
+        yaml_content = converter.to_workflow_yaml()
+        wf_data = parse_workflow(yaml_content)
+        wf_id = uuid.uuid4().hex[:8]
+        wf = {
+            "id": wf_id,
+            "title": wf_data.get("title", r.get("title", "录制工作流")),
+            "description": "从录制自动生成",
+            "yaml_content": yaml_content,
+        }
+        save_workflow(wf)
+        WORKFLOWS[wf_id] = wf
+        r["workflow_id"] = wf_id
+        r["status"] = "converted"
+        save_recording(r)
+
+    # 运行 workflow（复用现有逻辑）
+    wf = WORKFLOWS[wf_id]
+    run_id = uuid.uuid4().hex[:12]
+    wf_data = parse_workflow(wf["yaml_content"])
+    errors = validate_workflow(wf_data)
+    if errors:
+        raise HTTPException(400, f"Workflow validation failed: {errors}")
+
+    engine = WorkflowEngine(
+        workflow=wf_data, parameters=req.parameters,
+        log_callback=_log_callback, screenshot_callback=_screenshot_callback,
+        ask_user_callback=None,
+    )
+
+    async def _execute():
+        result = await engine.run()
+        save_workflow_run(result)
+
+    background_tasks.add_task(_execute)
     return {"run_id": run_id, "workflow_id": wf_id}
 
 

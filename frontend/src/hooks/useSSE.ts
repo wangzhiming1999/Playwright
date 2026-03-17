@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react';
 import { useTaskStore } from './useTaskStore';
 import { useExploreStore } from './useExploreStore';
+import { useRecordingStore } from './useRecordingStore';
 
 export function useSSE() {
   const retryDelay = useRef(1000);
@@ -20,6 +21,7 @@ export function useSSE() {
 
           const ts = useTaskStore.getState();
           const es2 = useExploreStore.getState();
+          const rs = useRecordingStore.getState();
 
           switch (msg.type) {
             case 'snapshot':
@@ -60,6 +62,11 @@ export function useSSE() {
               break;
             case 'explore_log':
               es2.appendLog(msg.eid, msg.data);
+              break;
+            case 'recording_action':
+              if (msg.recording_id && msg.action) {
+                rs.appendAction(msg.recording_id, msg.action);
+              }
               break;
           }
         } catch {
