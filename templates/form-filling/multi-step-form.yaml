@@ -1,0 +1,37 @@
+template:
+  id: multi-step-form
+  category: form-filling
+  tags: [form, multi-step, wizard, automation]
+  icon: layers
+  difficulty: intermediate
+  estimated_time: "3-8 分钟"
+
+title: 多步表单填写
+description: 按步骤填写多页/多步表单（如申请向导），每步填写后点击「下一步」直至提交
+
+parameters:
+  - key: form_start_url
+    type: string
+    description: 表单入口 URL
+    required: true
+  - key: step_instructions
+    type: string
+    description: 各步填写说明（如：第1步填姓名和邮箱，第2步填地址，第3步确认并提交）
+    required: true
+  - key: max_steps
+    type: integer
+    description: 最大步数（防止死循环）
+    default: 10
+    required: false
+
+blocks:
+  - block_type: navigation
+    label: open_form
+    url: "{{ form_start_url }}"
+
+  - block_type: task
+    label: complete_form
+    task: |
+      按照以下说明逐步填写并提交多步表单：
+      {{ step_instructions }}
+      每步填完后点击「下一步」或「继续」，直到最后一步提交。最多执行 {{ max_steps }} 步。

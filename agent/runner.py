@@ -8,20 +8,127 @@ import base64
 import json
 import os
 import re
+from urllib.parse import urlparse, urlencode, parse_qs, urlunparse
 from pathlib import Path
 
 from playwright.async_api import async_playwright
 
 from .page_utils import _safe_print, _wait_for_page_ready
 from .core import BrowserAgent
-from .tools import TOOLS
-from .llm_helpers import _decompose_task, _verify_step, _compress_messages, _analyze_failure, trim_elements
+from .tools import TOOLS, TERMINATES_SEQUENCE
+from .llm_helpers import _decompose_task, _verify_step, _compress_messages, _analyze_failure, trim_elements, estimate_messages_tokens
 from .chrome_detector import _find_chrome_user_data_dir
 from .error_recovery import FailureTracker
 from .circuit_breaker import CircuitBreaker
+from .loop_detector import ActionLoopDetector
+from .plan_manager import PlanManager
+from .watchdog import Watchdog, EventType
+from .action_registry import load_custom_actions, get_custom_tools
 
 from utils import llm_chat
 from page_annotator import annotate_page
+
+
+async def _verify_done(agent, task: str, summary: str, _log, llm_chat_fn) -> bool:
+    """
+    完成前验证：截图 + GPT 判断是否真正满足用户需求。
+    每 15 秒检查一次，最多 3 次，防止页面还没渲染完就结束。
+    返回 True 表示验证通过。
+    """
+    for check_round in range(1, 4):
+        await _log(f"\n🔍 [完成验证] 第 {check_round}/3 次检查...")
+        try:
+            check_img = await agent.screenshot_base64(quality=75, full_page=True)
+            if not check_img:
+                await _log(f"  ⚠ 截图为空，跳过本轮验证")
+                if check_round < 3:
+                    await asyncio.sleep(15)
+                continue
+
+            # 额外截一张底部 viewport 截图，检测底部是否有 loading
+            bottom_img = None
+            try:
+                scroll_h = await agent.page.evaluate("() => document.body.scrollHeight")
+                vp_h = agent.page.viewport_size.get("height", 1080) if agent.page.viewport_size else 1080
+                if scroll_h > vp_h * 1.2:
+                    await agent.page.evaluate(f"window.scrollTo(0, {scroll_h})")
+                    await asyncio.sleep(0.5)
+                    bottom_img = await agent.screenshot_base64(quality=60)
+                    await agent.page.evaluate("window.scrollTo(0, 0)")
+            except Exception:
+                pass
+
+            image_parts = [
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{check_img}", "detail": "low"}},
+            ]
+            bottom_hint = ""
+            if bottom_img:
+                image_parts.append(
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{bottom_img}", "detail": "low"}},
+                )
+                bottom_hint = "第一张是完整页面截图，第二张是页面底部截图。请同时检查底部是否有未完成的内容。\n"
+
+            verify_resp = llm_chat_fn(
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                f"用户任务：{task}\n"
+                                f"Agent 认为已完成：{summary}\n\n"
+                                f"{bottom_hint}"
+                                "请观察截图，判断任务是否真正完成。注意：\n"
+                                "1. 如果页面有 loading/spinner/骨架屏，说明内容还在加载，未完成\n"
+                                "2. 如果是 AI 生成类任务，检查内容是否已经完整输出（不是只有开头几个字）\n"
+                                "3. 如果页面显示错误信息，说明任务失败\n"
+                                "4. 如果页面内容与任务目标明显不符，说明未完成\n"
+                                "5. 检查页面底部是否有 '加载更多'、spinner、或未完成的内容区块\n"
+                                "6. 如果是长内容页面，检查内容是否在中间截断（如只有标题没有正文）\n\n"
+                                '返回 JSON：{"done": true/false, "reason": "1句话说明判断依据"}'
+                            ),
+                        },
+                    ] + image_parts,
+                }],
+                response_format={"type": "json_object"},
+                max_tokens=150,
+            )
+            if not verify_resp.choices:
+                await _log(f"  ⚠ 验证 API 返回空，视为通过")
+                return True
+
+            try:
+                verify_data = json.loads(verify_resp.choices[0].message.content)
+            except json.JSONDecodeError:
+                await _log(f"  ⚠ 验证结果 JSON 解析失败，视为通过")
+                return True
+
+            is_done = verify_data.get("done", True)
+            reason = verify_data.get("reason", "")
+            await _log(f"  [完成验证] {'✅ 已完成' if is_done else '⏳ 未完成'} — {reason}")
+
+            if is_done:
+                return True
+            else:
+                if check_round < 3:
+                    await _log(f"  等待 15 秒后重新检查...")
+                    await asyncio.sleep(15)
+
+        except Exception as e:
+            await _log(f"  ⚠ 验证异常: {e}，视为通过")
+            return True
+
+    return False
+
+
+def _normalize_url(url: str) -> str:
+    """Normalize URL for comparison: strip fragment, sort query params."""
+    try:
+        parsed = urlparse(url)
+        query = urlencode(sorted(parse_qs(parsed.query, keep_blank_values=True).items()), doseq=True)
+        return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, query, ''))
+    except Exception:
+        return url
 
 
 async def run_agent(
@@ -137,11 +244,17 @@ async def run_agent(
 
         agent = BrowserAgent(page, screenshots_dir, log_fn=_log, screenshot_callback=screenshot_callback, task_id=task_id)
 
+        # ── Watchdog 事件架构 ──────────────────────────────────────────
+        watchdog = Watchdog(page, context, log_fn=_log, downloads_dir=str(screenshots_dir))
+        await watchdog.start()
+
         # 多 tab 支持：监听新页面，自动切换到最新打开的 tab
         async def _on_new_page(new_page):
             try:
                 await new_page.wait_for_load_state("domcontentloaded", timeout=10000)
                 agent.page = new_page
+                # 更新 watchdog 的 page 引用
+                watchdog.page = new_page
                 await _log(f"  [新标签页] 已切换到: {new_page.url}")
             except Exception as e:
                 await _log(f"  [新标签页] 切换失败: {e}")
@@ -167,11 +280,13 @@ async def run_agent(
             "你是一个网页操作助手。每次我会给你当前页面的截图，用视觉理解页面，调用工具完成用户任务。\n"
             "核心原则：仔细观察截图，理解页面布局和内容，再决定下一步操作。\n\n"
             "## 基本规则\n"
-            "1. 每次只调用一个工具\n"
-            "2. 操作元素优先用截图中的蓝色 index 编号，比文字更准确\n"
-            "3. 操作失败时换个方式重试（换 index、用 text、滚动页面、用 find_element 视觉定位），不要直接 done 放弃——除非连续5次都失败\n"
-            "4. 任务全部完成后先截图，再调用 done\n"
-            "5. 遇到登录页面，继续完成登录，不要放弃\n\n"
+            "1. 你可以一次返回多个工具调用（批量执行），系统会按顺序执行，遇到页面跳转自动中断剩余操作\n"
+            "2. 适合批量的场景：连续填写多个表单字段、先输入再按回车、先滚动再点击等不涉及页面跳转的连续操作\n"
+            "3. 不适合批量的场景：需要观察页面变化后再决定下一步的操作（如点击后需要看新页面）\n"
+            "4. 操作元素优先用截图中的蓝色 index 编号，比文字更准确\n"
+            "5. 操作失败时换个方式重试（换 index、用 text、滚动页面、用 find_element 视觉定位），不要直接 done 放弃——除非连续5次都失败\n"
+            "6. 任务全部完成后先截图，再调用 done\n"
+            "7. 遇到登录页面，继续完成登录，不要放弃\n\n"
             "## 查找和定位策略（重要）\n"
             "当任务要求找到页面上的特定内容（图片、文字、按钮等）时：\n"
             "1. 先仔细观察当前截图，看目标是否已经在可视区域内\n"
@@ -201,7 +316,16 @@ async def run_agent(
             "- 先观察当前视口，如果没找到就向下滚动\n"
             "- 每次滚动后仔细观察新截图中是否出现了目标\n"
             "- 如果滚动到底部还没找到，尝试回到顶部用 find_element 搜索\n"
-            "- 页面可能有懒加载，滚动后等待内容出现\n"
+            "- 页面可能有懒加载，滚动后等待内容出现\n\n"
+            "## 计划管理（可选）\n"
+            "系统会显示任务计划和每步状态（✅已完成/👉当前/⏳待做/⏭️已跳过）。\n"
+            "当你完成了某个步骤、需要跳过步骤、或发现需要新增步骤时，在回复的文本部分加入：\n"
+            "[PLAN_UPDATE]\n"
+            '{"completed": [1], "current": 2}\n'
+            "[/PLAN_UPDATE]\n"
+            "支持的字段（都是可选的）：completed(已完成步骤号列表), current(当前步骤号), "
+            "skip(跳过步骤号列表), add_after(在哪步后插入)+new_steps(新步骤描述列表), note(备注)\n"
+            "不需要每步都更新，只在计划状态变化时包含。\n"
         )
 
         messages = [
@@ -216,16 +340,26 @@ async def run_agent(
         ]
 
         await _log(f"\n🚀 开始执行任务: {task}\n")
+
+        # ── 加载自定义 Actions ──────────────────────────────────────────
+        custom_count = load_custom_actions("custom_actions")
+        custom_tools = get_custom_tools()
+        all_tools = TOOLS + custom_tools  # 合并内置 + 自定义工具
+        if custom_count > 0:
+            await _log(f"  [自定义 Action] 已加载 {custom_count} 个自定义工具")
+
         max_steps = 35
         fail_count = 0
         last_tool_name = None
         last_tool_pressed_enter = False
         _last_content_hash = None  # 用于截图复用：检测 DOM 是否变化
+        _pending_nudges: list[str] = []  # 缓存 nudge 消息，下一轮截图时注入（避免打断 tool_result 顺序）
 
-        # ── 智能错误恢复 + 熔断器 ──────────────────────────────────
+        # ── 智能错误恢复 + 熔断器 + 循环检测 ──────────────────────────────────
         failure_tracker = FailureTracker()
         llm_breaker = CircuitBreaker("llm_api", failure_threshold=3, cooldown=30.0,
                                      log_fn=lambda msg: asyncio.ensure_future(_log(msg)))
+        loop_detector = ActionLoopDetector(window_size=20)
 
         # ── 任务分解 ──────────────────────────────────────────────
         await _log("  [任务分解] 正在拆解任务步骤...")
@@ -239,55 +373,61 @@ async def run_agent(
             await _log("  [任务分解] 分解失败，使用自由模式执行")
 
         # 把任务步骤列表格式化成提示文字，注入到每步的 user message 里
-        steps_hint = ""
-        if task_steps:
-            steps_hint = "【任务步骤参考】\n" + "\n".join(
-                f"  {s.get('step', '?')}. {s.get('action', '')}（完成标志：{s.get('done_signal', '')}）"
-                for s in task_steps
-            ) + "\n按顺序完成以上步骤，每步完成后再进行下一步。\n"
+        plan_manager = PlanManager(task_steps)
 
-        # 全程监听网络请求，供 _wait_for_page_ready 使用
-        active_requests: set[str] = set()
-
-        def _on_request(req):
-            try:
-                if req.resource_type in ("fetch", "xhr", "websocket"):
-                    active_requests.add(req.url)
-            except Exception:
-                pass
-
-        def _on_response(resp):
-            try:
-                active_requests.discard(resp.url)
-            except Exception:
-                pass
-
-        def _on_request_failed(req):
-            try:
-                active_requests.discard(req.url)
-            except Exception:
-                pass
-
-        agent.page.on("request", _on_request)
-        agent.page.on("response", _on_response)
-        agent.page.on("requestfailed", _on_request_failed)
+        # 网络请求追踪：复用 Watchdog 的 _pending_requests（不再手动注册事件）
+        active_requests = watchdog._pending_requests
         agent._active_requests = active_requests  # 注入到 agent，供 wait 工具使用
 
         for step in range(max_steps):
-            # 广播步骤进度（前端可解析展示进度条）
-            total_steps = len(task_steps) if task_steps else max_steps
-            await _log(f"__PROGRESS__:{step+1}/{total_steps}")
-            # 步数预警：80% 时提醒 GPT 加速收尾
+            # ── 消费 Watchdog 事件 ──────────────────────────────────────
+            for evt in watchdog.drain_events():
+                if evt.type == EventType.PAGE_CRASHED:
+                    await _log("  ⚠ [Watchdog] 页面崩溃，尝试恢复...")
+                    try:
+                        page = await context.new_page()
+                        agent.page = page
+                        watchdog.page = page
+                        await _log("  [Watchdog] 已创建新页面")
+                    except Exception as e:
+                        await _log(f"  ❌ [Watchdog] 恢复失败: {e}，终止任务")
+                        task_reason = "页面崩溃且恢复失败"
+                        steps_executed = step
+                        break
+                elif evt.type == EventType.CAPTCHA_DETECTED:
+                    _pending_nudges.append(
+                        f"⚠️ 系统检测到验证码（{evt.data.get('source', 'unknown')}）。"
+                        "请调用 solve_captcha 尝试自动识别，失败则用 ask_user 请求人工协助。"
+                    )
+                elif evt.type == EventType.DOWNLOAD_COMPLETED:
+                    _pending_nudges.append(
+                        f"📥 下载完成: {evt.data.get('filename', '未知文件')} → {evt.data.get('path', '未知路径')}"
+                    )
+                elif evt.type == EventType.CONSOLE_ERROR:
+                    error_count = evt.data.get('count', 0)
+                    if error_count >= 10:
+                        _pending_nudges.append(
+                            f"⚠️ 页面控制台出现 {error_count} 个错误，页面可能存在问题。"
+                        )
+            else:
+                # for-else: 只有 break 时不执行这里（崩溃恢复失败时 break）
+                pass
+
+            # 广播步骤进度（基于计划完成度，而非循环计数）
+            if plan_manager.has_plan:
+                await _log(f"__PROGRESS__:{plan_manager.completed_count}/{plan_manager.total_steps}")
+            else:
+                await _log(f"__PROGRESS__:{step+1}/{max_steps}")
+            # 步数预警：80% 时提醒 GPT 加速收尾（缓存到 nudge，避免打断 tool_result）
             if step == int(max_steps * 0.8):
                 await _log(f"  ⚠ [预警] 已执行 {step+1}/{max_steps} 步，即将达到上限")
-                messages.append({
-                    "role": "user",
-                    "content": "⚠️ 注意：你已使用了大部分步数，请尽快完成任务。如果核心目标已达成，请截图并调用 done。"
-                })
+                _pending_nudges.append("⚠️ 注意：你已使用了大部分步数，请尽快完成任务。如果核心目标已达成，请截图并调用 done。")
 
             # 只在第一步和 navigate 后检查弹窗，避免干扰正常操作
             if step == 0:
                 await agent.dismiss_overlay()
+                # 首步主动检测 CAPTCHA
+                await watchdog.check_captcha()
 
             # 截图前确保页面就绪（统一使用 _wait_for_page_ready）
             await _wait_for_page_ready(agent.page, log_fn=_log, timeout_ms=10000, check_network=True, active_requests=active_requests)
@@ -337,6 +477,12 @@ async def run_agent(
                 except Exception as e:
                     await _log(f"  ⚠ 截图回调失败: {e}")
 
+            # 注入缓存的 nudge（循环检测/停滞检测），避免作为独立 user 消息打断 tool_result 顺序
+            nudge_text = ""
+            if _pending_nudges:
+                nudge_text = "\n".join(_pending_nudges) + "\n"
+                _pending_nudges.clear()
+
             messages.append({
                 "role": "user",
                 "content": [
@@ -344,9 +490,10 @@ async def run_agent(
                         "type": "text",
                         "text": (
                             f"第{step+1}步，当前页面截图（红框+编号标注了所有可交互元素）：\n"
-                            f"{steps_hint}"
+                            f"{nudge_text}"
+                            f"{plan_manager.format_hint()}"
                             f"元素列表: {elements_summary}\n"
-                            "根据截图判断当前状态，调用一个工具推进任务。"
+                            "根据截图判断当前状态，调用工具推进任务（可一次返回多个工具调用）。"
                             "操作时用元素的 index 编号，不要猜 selector 或坐标。"
                         ),
                     },
@@ -354,36 +501,53 @@ async def run_agent(
                 ],
             })
 
-            # 上下文压缩：硬上限 60 条防止压缩失败时无限增长
-            if len(messages) > 60:
+            # ── Token 级上下文压缩 ──────────────────────────────────────
+            # 硬上限：消息数 > 50 时强制截断（防止压缩失败时无限增长）
+            if len(messages) > 50:
                 await _log(f"  ⚠ [上下文] 消息数 {len(messages)} 超过硬上限，强制截断")
-                messages = [messages[0]] + messages[-20:]
+                messages = [messages[0]] + messages[-15:]
 
-            # 正常压缩：超过 24 条时压缩中间历史为摘要，保留最近 16 条
-            if len(messages) > 24:
-                messages = _compress_messages(messages, max_history=16)
-                await _log(f"  [上下文] 已压缩历史，当前 {len(messages)} 条消息")
+            # Token 级压缩：估算总 token 数，超过预算时智能压缩
+            current_tokens = estimate_messages_tokens(messages)
+            if current_tokens > 65000:  # 65k 触发压缩（20% 安全边际给 128k 上下文窗口）
+                await _log(f"  [上下文] 当前 {current_tokens} tokens，触发压缩...")
+                messages = _compress_messages(messages, max_tokens=65000, keep_recent=15)
 
-            # LLM 调用（带熔断保护）
-            if not llm_breaker.check():
-                await _log("  ⚠ LLM API 熔断中，等待冷却...")
-                await asyncio.sleep(llm_breaker.cooldown)
+            # LLM 调用（带指数退避重试 + 熔断保护）
+            _LLM_RETRY_DELAYS = [1.0, 3.0]  # 2 次重试: 1s, 3s
+            response = None
+            _llm_last_error = None
 
-            try:
-                response = llm_chat(
-                    messages=messages,
-                    tools=TOOLS,
-                    tool_choice="required",
-                    max_tokens=1000,
-                )
-                llm_breaker.record_success()
-            except Exception as e:
-                llm_breaker.record_failure()
-                await _log(f"  ❌ LLM API 调用失败: {e}")
-                if llm_breaker.state.value == "open":
-                    await _log(f"  ⚠ LLM API 熔断，等待 {llm_breaker.cooldown}s 后重试")
+            for _retry_idx in range(len(_LLM_RETRY_DELAYS) + 1):  # 0, 1, 2 = 初始 + 2 次重试
+                if not llm_breaker.check():
+                    await _log("  ⚠ LLM API 熔断中，等待冷却...")
                     await asyncio.sleep(llm_breaker.cooldown)
-                continue
+
+                try:
+                    response = llm_chat(
+                        messages=messages,
+                        tools=all_tools,
+                        tool_choice="required",
+                        max_tokens=2000,  # 增大以支持多 action 返回
+                    )
+                    llm_breaker.record_success()
+                    break  # 成功
+                except Exception as e:
+                    _llm_last_error = e
+                    if _retry_idx < len(_LLM_RETRY_DELAYS):
+                        delay = _LLM_RETRY_DELAYS[_retry_idx]
+                        await _log(f"  ⚠ LLM API 调用失败 (重试 {_retry_idx+1}/{len(_LLM_RETRY_DELAYS)}): {e}，{delay}s 后重试...")
+                        await asyncio.sleep(delay)
+                    else:
+                        # 所有重试耗尽，记录熔断器失败
+                        llm_breaker.record_failure()
+                        await _log(f"  ❌ LLM API 调用失败 (已重试{len(_LLM_RETRY_DELAYS)}次): {e}")
+                        if llm_breaker.state.value == "open":
+                            await _log(f"  ⚠ LLM API 熔断，等待 {llm_breaker.cooldown}s 后重试")
+                            await asyncio.sleep(llm_breaker.cooldown)
+
+            if response is None:
+                continue  # 跳到下一步
 
             if not response.choices:
                 await _log("⚠️ LLM API 返回空 choices，终止任务")
@@ -403,252 +567,228 @@ async def run_agent(
                 ]
             messages.append(msg_dict)
 
+            # ── 解析计划更新（从 msg.content 旁路） ──────────────────────
+            plan_changed = plan_manager.process_llm_content(msg.content)
+            if plan_changed:
+                await _log(f"  [计划更新] {json.dumps(plan_manager.to_log_dict(), ensure_ascii=False)}")
+
             if not msg.tool_calls:
                 await _log("GPT 没有返回工具调用，结束")
                 break
 
-            tool_call = msg.tool_calls[0]
-            tool_name = tool_call.function.name
+            # ── 多 Action 批量执行 ──────────────────────────────────────
+            # 顺序执行所有 tool_calls，遇到页面跳转/done/ask_user 自动中断剩余队列
+            await _log(f"\n>>> step={step+1} 收到 {len(msg.tool_calls)} 个 action")
 
-            try:
-                tool_args = json.loads(tool_call.function.arguments)
-            except json.JSONDecodeError as e:
-                await _log(f"❌ GPT 返回的 JSON 无效: {e}")
-                await _log(f"   原始内容: {tool_call.function.arguments[:200]}")
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": f"JSON 解析失败: {e}，请重新调用工具",
-                })
-                for tc in msg.tool_calls[1:]:
-                    messages.append({"role": "tool", "tool_call_id": tc.id, "content": "skipped"})
-                continue
+            url_before = agent.page.url  # 记录执行前的 URL，用于检测页面跳转
+            page_changed = False
+            should_break_outer = False  # 是否需要跳出外层 for step 循环
 
-            await _log(f"\n>>> step={step+1} tool={tool_name} args={json.dumps(tool_args, ensure_ascii=False)}")
+            for tc_idx, tool_call in enumerate(msg.tool_calls):
+                tool_name = tool_call.function.name
 
-            # 拦截：上一步是 type_text 且没有 press_enter，GPT 就直接 done 了——说明忘记提交
-            if tool_name == "done" and last_tool_name == "type_text" and not last_tool_pressed_enter:
-                await _log("  [拦截] 检测到输入后未提交就 done，强制要求先提交")
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": "操作被拦截：你刚刚输入了内容但还没有提交。请先点击提交/发送按钮（或用 press_enter=true），再等待生成完成，最后才能 done。",
-                })
-                for tc in msg.tool_calls[1:]:
-                    messages.append({"role": "tool", "tool_call_id": tc.id, "content": "skipped"})
-                continue
-
-            # done/screenshot 前强制等待内容稳定（主循环层面兜底）
-            if tool_name in ("done", "screenshot"):
-                await _log("  [wait_stable] 执行前等待内容稳定...")
-                wait_result = await _wait_for_page_ready(agent.page, log_fn=_log, timeout_ms=120000, check_network=True, active_requests=active_requests)
-                await _log(f"  [wait_stable] 结果: {wait_result}")
-
-            result = await agent.execute(tool_name, tool_args)
-            await _log(f"  result: {str(result)[:200]}")
-
-            # navigate 后自动检查弹窗
-            if tool_name == "navigate":
-                await agent.dismiss_overlay()
-
-            # click 成功后保存 cookies（不做 AI 验证，让 GPT 从下一步截图自己判断）
-            if tool_name == "click" and not result.startswith("操作失败"):
+                # 解析参数
                 try:
-                    cookies = await context.cookies()
-                    cookies_file.write_text(
-                        json.dumps(cookies, ensure_ascii=False, indent=2), encoding="utf-8"
-                    )
-                except Exception as e:
-                    await _log(f"  ⚠ 保存 cookies 失败: {e}")
-
-            if result == "__DONE__":
-                summary = tool_args.get("summary", "任务完成")
-
-                # ── 完成前验证：截图 + GPT 判断是否真正满足用户需求 ──
-                # 每 15 秒检查一次，最多 3 次，防止页面还没渲染完就结束
-                done_verified = False
-                for check_round in range(1, 4):
-                    await _log(f"\n🔍 [完成验证] 第 {check_round}/3 次检查...")
-                    try:
-                        # full_page 截图，确保长页面内容完整可见
-                        check_img = await agent.screenshot_base64(quality=75, full_page=True)
-                        if not check_img:
-                            await _log(f"  ⚠ 截图为空，跳过本轮验证")
-                            if check_round < 3:
-                                await asyncio.sleep(15)
-                            continue
-
-                        # 额外截一张底部 viewport 截图，检测底部是否有 loading
-                        bottom_img = None
-                        try:
-                            scroll_h = await agent.page.evaluate("() => document.body.scrollHeight")
-                            vp_h = agent.page.viewport_size.get("height", 1080) if agent.page.viewport_size else 1080
-                            if scroll_h > vp_h * 1.2:
-                                await agent.page.evaluate(f"window.scrollTo(0, {scroll_h})")
-                                await asyncio.sleep(0.5)
-                                bottom_img = await agent.screenshot_base64(quality=60)
-                                await agent.page.evaluate("window.scrollTo(0, 0)")
-                        except Exception:
-                            pass
-
-                        # 构建验证图片列表
-                        image_parts = [
-                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{check_img}", "detail": "low"}},
-                        ]
-                        bottom_hint = ""
-                        if bottom_img:
-                            image_parts.append(
-                                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{bottom_img}", "detail": "low"}},
-                            )
-                            bottom_hint = "第一张是完整页面截图，第二张是页面底部截图。请同时检查底部是否有未完成的内容。\n"
-
-                        verify_resp = llm_chat(
-                            messages=[{
-                                "role": "user",
-                                "content": [
-                                    {
-                                        "type": "text",
-                                        "text": (
-                                            f"用户任务：{task}\n"
-                                            f"Agent 认为已完成：{summary}\n\n"
-                                            f"{bottom_hint}"
-                                            "请观察截图，判断任务是否真正完成。注意：\n"
-                                            "1. 如果页面有 loading/spinner/骨架屏，说明内容还在加载，未完成\n"
-                                            "2. 如果是 AI 生成类任务，检查内容是否已经完整输出（不是只有开头几个字）\n"
-                                            "3. 如果页面显示错误信息，说明任务失败\n"
-                                            "4. 如果页面内容与任务目标明显不符，说明未完成\n"
-                                            "5. 检查页面底部是否有 '加载更多'、spinner、或未完成的内容区块\n"
-                                            "6. 如果是长内容页面，检查内容是否在中间截断（如只有标题没有正文）\n\n"
-                                            '返回 JSON：{"done": true/false, "reason": "1句话说明判断依据"}'
-                                        ),
-                                    },
-                                ] + image_parts,
-                            }],
-                            response_format={"type": "json_object"},
-                            max_tokens=150,
-                        )
-                        if not verify_resp.choices:
-                            await _log(f"  ⚠ 验证 API 返回空，视为通过")
-                            done_verified = True
-                            break
-
-                        try:
-                            verify_data = json.loads(verify_resp.choices[0].message.content)
-                        except json.JSONDecodeError:
-                            await _log(f"  ⚠ 验证结果 JSON 解析失败，视为通过")
-                            done_verified = True
-                            break
-
-                        is_done = verify_data.get("done", True)
-                        reason = verify_data.get("reason", "")
-                        await _log(f"  [完成验证] {'✅ 已完成' if is_done else '⏳ 未完成'} — {reason}")
-
-                        if is_done:
-                            done_verified = True
-                            break
-                        else:
-                            if check_round < 3:
-                                await _log(f"  等待 15 秒后重新检查...")
-                                await asyncio.sleep(15)
-
-                    except Exception as e:
-                        await _log(f"  ⚠ 验证异常: {e}，视为通过")
-                        done_verified = True
-                        break
-
-                if done_verified:
-                    await _log(f"\n✅ {summary}")
-                    task_success = True
-                    task_reason = summary
-                    steps_executed = step + 1
-                    for tc in msg.tool_calls[1:]:
-                        messages.append({"role": "tool", "tool_call_id": tc.id, "content": "skipped"})
-                    break
-                else:
-                    # 3 次验证都未通过，告诉 GPT 继续操作
-                    await _log(f"  ⚠ 3次验证均未通过，要求 agent 继续执行")
-                    result = (
-                        "任务尚未真正完成。页面内容仍在加载或结果不符合预期。"
-                        "请等待页面加载完成，或检查当前页面状态后继续操作。不要急于调用 done。"
-                    )
-
-            # ── 处理 ask_user：暂停并等待用户回答 ──────────────────────────
-            if result.startswith("__ASK_USER__:"):
-                parts = result.split("::", 1)
-                question = parts[0].replace("__ASK_USER__:", "").strip()
-                reason = parts[1].strip() if len(parts) > 1 else ""
-                if not question:
-                    question = "需要您的输入"
-
-                await _log(f"\n❓ [等待用户输入] {question}")
-                if reason:
-                    await _log(f"   原因: {reason}")
-
-                if ask_user_callback:
-                    try:
-                        user_answer = await ask_user_callback(task_id, question, reason)
-                        await _log(f"   用户回答: {user_answer}")
-                        result = f"用户回答: {user_answer}"
-                    except Exception as e:
-                        await _log(f"   ✗ 获取用户回答失败: {e}")
-                        result = "用户未回答，任务终止"
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "content": result,
-                        })
-                        for tc in msg.tool_calls[1:]:
-                            messages.append({"role": "tool", "tool_call_id": tc.id, "content": "skipped"})
-                        break
-                else:
-                    await _log("   ✗ 未配置 ask_user_callback，任务终止")
-                    result = "无法获取用户输入，任务终止"
+                    tool_args = json.loads(tool_call.function.arguments)
+                except json.JSONDecodeError as e:
+                    await _log(f"  [{tc_idx+1}/{len(msg.tool_calls)}] ❌ {tool_name} JSON 解析失败: {e}")
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tool_call.id,
-                        "content": result,
+                        "content": f"JSON 解析失败: {e}，请重新调用工具",
                     })
-                    for tc in msg.tool_calls[1:]:
-                        messages.append({"role": "tool", "tool_call_id": tc.id, "content": "skipped"})
+                    # 剩余 action 标记为 skipped
+                    for remaining_tc in msg.tool_calls[tc_idx+1:]:
+                        messages.append({"role": "tool", "tool_call_id": remaining_tc.id, "content": "skipped"})
                     break
 
-            # 失败计数 + 智能重试分析（使用 FailureTracker 替代全局计数器）
-            is_failure = (
-                result.startswith("操作失败") or
-                result.startswith("AI操作失败") or
-                result.startswith("AI 定位失败") or
-                result.startswith("输入失败")
-            )
-            if is_failure:
-                ft, ft_count, recovery_hint = failure_tracker.record_failure(tool_name, result)
-                await _log(f"  [失败追踪] {ft.value} #{ft_count} — {result[:80]}")
-                if recovery_hint:
-                    result += f"\n[恢复建议] {recovery_hint}"
-                    await _log(f"  [恢复建议] {recovery_hint}")
-                advice = _analyze_failure(tool_name, tool_args, result)
-                if advice:
-                    result += f"\n[AI建议] {advice}"
-                    await _log(f"  [AI建议] {advice}")
-            else:
-                if failure_tracker.total_consecutive > 0:
-                    await _log(f"  [失败追踪] 已重置（上次连续={failure_tracker.total_consecutive}）")
-                failure_tracker.record_success()
+                await _log(f"  [{tc_idx+1}/{len(msg.tool_calls)}] {tool_name}({json.dumps(tool_args, ensure_ascii=False)})")
 
-            # 记录上一步工具信息，供下一步拦截判断
-            last_tool_name = tool_name
-            last_tool_pressed_enter = (
-                tool_name == "type_text" and bool(tool_args.get("press_enter"))
-            )
+                # 记录到循环检测器
+                loop_detector.record_action(tool_name, tool_args)
 
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tool_call.id,
-                "content": result,
-            })
+                # 拦截：上一步是 type_text 且没有 press_enter，GPT 就直接 done 了——说明忘记提交
+                if tool_name == "done" and last_tool_name == "type_text" and not last_tool_pressed_enter:
+                    await _log("  [拦截] 检测到输入后未提交就 done，强制要求先提交")
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": "操作被拦截：你刚刚输入了内容但还没有提交。请先点击提交/发送按钮（或用 press_enter=true），再等待生成完成，最后才能 done。",
+                    })
+                    for remaining_tc in msg.tool_calls[tc_idx+1:]:
+                        messages.append({"role": "tool", "tool_call_id": remaining_tc.id, "content": "skipped"})
+                    break
 
-            # 补齐其余 tool_call 的 response
-            for tc in msg.tool_calls[1:]:
-                messages.append({"role": "tool", "tool_call_id": tc.id, "content": "skipped"})
+                # done/screenshot 前强制等待内容稳定（主循环层面兜底）
+                if tool_name in ("done", "screenshot"):
+                    await _log("  [wait_stable] 执行前等待内容稳定...")
+                    wait_result = await _wait_for_page_ready(agent.page, log_fn=_log, timeout_ms=120000, check_network=True, active_requests=active_requests)
+                    await _log(f"  [wait_stable] 结果: {wait_result}")
+
+                result = await agent.execute(tool_name, tool_args)
+                await _log(f"    result: {str(result)[:200]}")
+
+                # navigate 后自动检查弹窗 + CAPTCHA
+                if tool_name == "navigate":
+                    await agent.dismiss_overlay()
+                    await watchdog.check_captcha()
+
+                # click 成功后保存 cookies
+                if tool_name == "click" and not result.startswith("操作失败"):
+                    try:
+                        cookies = await context.cookies()
+                        cookies_file.write_text(
+                            json.dumps(cookies, ensure_ascii=False, indent=2), encoding="utf-8"
+                        )
+                    except Exception as e:
+                        await _log(f"  ⚠ 保存 cookies 失败: {e}")
+
+                # ── 处理 __DONE__ ──────────────────────────────────────
+                if result == "__DONE__":
+                    summary = tool_args.get("summary", "任务完成")
+                    done_verified = await _verify_done(agent, task, summary, _log, llm_chat)
+                    if done_verified:
+                        await _log(f"\n✅ {summary}")
+                        task_success = True
+                        task_reason = summary
+                        steps_executed = step + 1
+                        messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": result})
+                        for remaining_tc in msg.tool_calls[tc_idx+1:]:
+                            messages.append({"role": "tool", "tool_call_id": remaining_tc.id, "content": "skipped"})
+                        should_break_outer = True
+                        break
+                    else:
+                        await _log(f"  ⚠ 验证未通过，要求 agent 继续执行")
+                        result = (
+                            "任务尚未真正完成。页面内容仍在加载或结果不符合预期。"
+                            "请等待页面加载完成，或检查当前页面状态后继续操作。不要急于调用 done。"
+                        )
+
+                # ── 处理 ask_user ──────────────────────────────────────
+                if result.startswith("__ASK_USER__:"):
+                    parts = result.split("::", 1)
+                    question = parts[0].replace("__ASK_USER__:", "").strip()
+                    reason = parts[1].strip() if len(parts) > 1 else ""
+                    if not question:
+                        question = "需要您的输入"
+
+                    await _log(f"\n❓ [等待用户输入] {question}")
+                    if reason:
+                        await _log(f"   原因: {reason}")
+
+                    if ask_user_callback:
+                        try:
+                            user_answer = await ask_user_callback(task_id, question, reason)
+                            await _log(f"   用户回答: {user_answer}")
+                            result = f"用户回答: {user_answer}"
+                        except Exception as e:
+                            await _log(f"   ✗ 获取用户回答失败: {e}")
+                            result = "用户未回答，任务终止"
+                            messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": result})
+                            for remaining_tc in msg.tool_calls[tc_idx+1:]:
+                                messages.append({"role": "tool", "tool_call_id": remaining_tc.id, "content": "skipped"})
+                            should_break_outer = True
+                            break
+                    else:
+                        await _log("   ✗ 未配置 ask_user_callback，任务终止")
+                        result = "无法获取用户输入，任务终止"
+                        messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": result})
+                        for remaining_tc in msg.tool_calls[tc_idx+1:]:
+                            messages.append({"role": "tool", "tool_call_id": remaining_tc.id, "content": "skipped"})
+                        should_break_outer = True
+                        break
+
+                # 失败计数 + 智能重试分析
+                is_failure = (
+                    result.startswith("操作失败") or
+                    result.startswith("AI操作失败") or
+                    result.startswith("AI 定位失败") or
+                    result.startswith("输入失败")
+                )
+                if is_failure:
+                    ft, ft_count, recovery_hint = failure_tracker.record_failure(tool_name, result)
+                    await _log(f"  [失败追踪] {ft.value} #{ft_count} — {result[:80]}")
+                    if recovery_hint:
+                        result += f"\n[恢复建议] {recovery_hint}"
+                        await _log(f"  [恢复建议] {recovery_hint}")
+                    advice = _analyze_failure(tool_name, tool_args, result)
+                    if advice:
+                        result += f"\n[AI建议] {advice}"
+                        await _log(f"  [AI建议] {advice}")
+                else:
+                    if failure_tracker.total_consecutive > 0:
+                        await _log(f"  [失败追踪] 已重置（上次连续={failure_tracker.total_consecutive}）")
+                    failure_tracker.record_success()
+
+                # 记录上一步工具信息，供下一步拦截判断
+                last_tool_name = tool_name
+                last_tool_pressed_enter = (
+                    tool_name == "type_text" and bool(tool_args.get("press_enter"))
+                )
+
+                # 记录本次 action 的 tool result
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": result,
+                })
+
+                # ── 页面跳转检测：中断剩余 action 队列 ──────────────────
+                if tool_name in TERMINATES_SEQUENCE and tc_idx < len(msg.tool_calls) - 1:
+                    try:
+                        url_after = agent.page.url
+                    except Exception:
+                        url_after = url_before
+
+                    # URL 规范化比较（去 fragment、排序 query params）
+                    url_changed = _normalize_url(url_after) != _normalize_url(url_before)
+
+                    # SPA 检测：URL 不变时检查 DOM 内容 hash
+                    dom_changed = False
+                    if not url_changed:
+                        try:
+                            dom_hash = await agent.page.evaluate(
+                                "() => document.title + '|' + document.body.innerText.substring(0, 500).length"
+                            )
+                            if hasattr(agent, '_last_dom_hash') and agent._last_dom_hash is not None and dom_hash != agent._last_dom_hash:
+                                dom_changed = True
+                            agent._last_dom_hash = dom_hash
+                        except Exception:
+                            pass
+
+                    if url_changed or dom_changed:
+                        page_changed = True
+                        skipped_count = len(msg.tool_calls) - tc_idx - 1
+                        change_type = "URL 变化" if url_changed else "DOM 内容变化"
+                        await _log(f"  [multi_act] {change_type} ({url_before} → {url_after})，跳过剩余 {skipped_count} 个 action")
+                        for remaining_tc in msg.tool_calls[tc_idx+1:]:
+                            messages.append({"role": "tool", "tool_call_id": remaining_tc.id, "content": f"skipped: 页面已变化（{change_type}），后续操作取消"})
+                        break
+                    url_before = url_after  # 更新 URL 基准
+
+            # 如果内层 break 要求跳出外层循环
+            if should_break_outer:
+                break
+
+            # ── 循环检测：注入 nudge 到下一轮上下文 ──────────────────────
+            try:
+                _page_url = agent.page.url
+                _page_len = await agent.page.evaluate("() => document.body.innerText.length")
+            except Exception:
+                _page_url = ""
+                _page_len = 0
+            loop_detector.record_page_fingerprint(_page_url, _page_len)
+
+            is_loop, loop_nudge = loop_detector.check_loop()
+            if is_loop:
+                await _log(f"  [循环检测] {loop_nudge}")
+                _pending_nudges.append(loop_nudge)
+
+            # ── 计划停滞检测 ──────────────────────────────────────────
+            stall_nudge = plan_manager.check_stall(step)
+            if stall_nudge:
+                await _log(f"  [计划停滞] {stall_nudge}")
+                _pending_nudges.append(stall_nudge)
 
             # 检查是否应该终止（基于 FailureTracker 的分类计数）
             should_abort, abort_reason = failure_tracker.should_abort()
@@ -661,6 +801,9 @@ async def run_agent(
             await _log("\n⚠️  达到最大步数限制")
             task_reason = f"达到最大步数限制({max_steps}步)"
             steps_executed = max_steps
+
+        # 停止 Watchdog
+        await watchdog.stop()
 
         # builtin 模式保存 cookies；user_chrome/cdp 模式不需要（浏览器本身保存）
         if browser_mode == "builtin":

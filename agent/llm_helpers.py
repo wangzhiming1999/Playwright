@@ -1,4 +1,4 @@
-"""LLM 辅助函数：任务分解、步骤验证、上下文压缩、失败分析"""
+"""LLM 辅助函数：任务分解、步骤验证、上下文压缩、失败分析、Token 估算"""
 
 import base64
 import json
@@ -8,6 +8,53 @@ from json_repair import repair_json
 
 from .page_utils import _safe_print
 from utils import llm_chat
+
+
+# ── Token 估算 ────────────────────────────────────────────────────────────────
+
+# OpenAI vision token 估算常量（参考官方文档）
+_IMG_TOKENS_HIGH = 1105    # high detail: 85 base + 170 * 6 tiles (typical 1920x1080)
+_IMG_TOKENS_LOW = 85       # low detail: 固定 85 tokens
+_CHARS_PER_TEXT_TOKEN = 3  # 中英文混合平均约 3 字符/token
+
+
+def estimate_message_tokens(msg: dict) -> int:
+    """
+    估算单条消息的 token 数。
+    - 文本：字符数 / 3
+    - 图片：按 detail 级别估算（high ~1105, low ~85）
+    - tool_calls：按 JSON 字符数估算
+    - 消息开销：每条消息固定 4 tokens
+    """
+    tokens = 4  # 每条消息的固定开销（role + 分隔符）
+
+    content = msg.get("content", "")
+    if isinstance(content, str):
+        tokens += max(1, len(content) // _CHARS_PER_TEXT_TOKEN)
+    elif isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text":
+                text = block.get("text", "")
+                tokens += max(1, len(text) // _CHARS_PER_TEXT_TOKEN)
+            elif block.get("type") == "image_url":
+                detail = block.get("image_url", {}).get("detail", "high")
+                tokens += _IMG_TOKENS_HIGH if detail == "high" else _IMG_TOKENS_LOW
+
+    # tool_calls 的 token 开销
+    for tc in msg.get("tool_calls", []):
+        func = tc.get("function", {})
+        tokens += max(1, len(func.get("name", "")) // _CHARS_PER_TEXT_TOKEN)
+        tokens += max(1, len(func.get("arguments", "")) // _CHARS_PER_TEXT_TOKEN)
+        tokens += 10  # tool_call 结构开销
+
+    return tokens
+
+
+def estimate_messages_tokens(messages: list[dict]) -> int:
+    """估算整个消息列表的总 token 数。"""
+    return sum(estimate_message_tokens(m) for m in messages)
 
 
 # ── JSON 容错解析 ─────────────────────────────────────────────────────────────
@@ -263,47 +310,90 @@ async def _verify_step(page, expected: str, done_signal: str) -> tuple[bool, str
         return False, "", str(e)
 
 
-# ── 上下文压缩 ────────────────────────────────────────────────────────────────
+# ── 上下文压缩（Token 级智能压缩）────────────────────────────────────────────
 
-def _compress_messages(messages: list, max_history: int = 16) -> list:
+def _compress_messages(messages: list, max_tokens: int = 100000, keep_recent: int = 12) -> list:
     """
-    消息超出限制时，把中间的历史压缩成一条摘要，保留：
-    - messages[0]: system prompt
-    - messages[1]: 原始任务
-    - 一条压缩摘要（assistant role）
-    - 最近 max_history 条消息
+    基于 token 估算的智能消息压缩。
+
+    策略：
+    1. 估算当前总 token 数，未超限则直接返回
+    2. 超限时，保留：
+       - messages[0]: system prompt（必须保留）
+       - messages[1]: 原始任务（必须保留）
+       - 最近 keep_recent 条消息（保持上下文连贯）
+       - 中间历史压缩为一条文本摘要（丢弃所有截图，节省大量 token）
+    3. 压缩后的摘要用 mini 模型生成，成本低
+
+    参数：
+    - max_tokens: token 预算上限，默认 100k（GPT-4o 128k 留 28k 余量）
+    - keep_recent: 保留最近 N 条消息，默认 12（约 6 轮对话）
     """
-    if len(messages) <= max_history + 2:
+    total_tokens = estimate_messages_tokens(messages)
+
+    # 未超限，直接返回
+    if total_tokens <= max_tokens:
         return messages
 
-    to_compress = messages[2: -max_history]
+    # 消息太少，无法压缩
+    if len(messages) <= keep_recent + 2:
+        _safe_print(f"  [上下文压缩] 消息数 {len(messages)} 太少，无法压缩（总 tokens: {total_tokens}）")
+        return messages
+
+    # 计算需要压缩的中间部分
+    to_compress = messages[2: -keep_recent]
     if not to_compress:
         return messages
 
+    # 提取文本内容（丢弃图片，节省 token）
     history_text = []
     for m in to_compress:
         role = m.get("role", "")
         content = m.get("content", "")
+
+        # 提取文本部分
         if isinstance(content, list):
-            text_parts = [p["text"] for p in content if isinstance(p, dict) and p.get("type") == "text"]
+            text_parts = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    text_parts.append(block["text"])
             content = " ".join(text_parts)
+
         if isinstance(content, str) and content.strip():
-            history_text.append(f"[{role}] {content[:200]}")
+            # 截断过长的内容
+            truncated = content[:300] + "..." if len(content) > 300 else content
+            history_text.append(f"[{role}] {truncated}")
+
+        # 记录 tool_calls（重要操作历史）
+        if m.get("tool_calls"):
+            for tc in m["tool_calls"]:
+                func = tc.get("function", {})
+                tool_name = func.get("name", "")
+                tool_args = func.get("arguments", "{}")
+                try:
+                    args_obj = json.loads(tool_args) if isinstance(tool_args, str) else tool_args
+                    args_str = json.dumps(args_obj, ensure_ascii=False)[:100]
+                except Exception:
+                    args_str = str(tool_args)[:100]
+                history_text.append(f"[action] {tool_name}({args_str})")
 
     if not history_text:
-        return messages[:2] + messages[-max_history:]
+        # 没有可压缩的文本，直接截断
+        _safe_print(f"  [上下文压缩] 无文本可压缩，强制截断")
+        return messages[:2] + messages[-keep_recent:]
 
+    # 用 mini 模型生成摘要
     try:
         resp = llm_chat(
             model="mini",
             messages=[{
                 "role": "user",
                 "content": (
-                    "以下是网页操作的历史记录，请用 2-4 句话总结已完成的操作和当前状态：\n\n"
-                    + "\n".join(history_text[-30:])
+                    "以下是网页操作的历史记录，请用 3-5 句话总结已完成的关键操作和当前状态：\n\n"
+                    + "\n".join(history_text[-40:])  # 只取最近 40 条，避免摘要输入过长
                 ),
             }],
-            max_tokens=200,
+            max_tokens=250,
         )
         if resp.choices:
             summary = resp.choices[0].message.content.strip()
@@ -311,13 +401,23 @@ def _compress_messages(messages: list, max_history: int = 16) -> list:
             summary = f"已执行 {len(to_compress)//2} 步操作"
     except Exception as e:
         _safe_print(f"  [上下文压缩] 摘要生成失败: {e}")
-        summary = f"已执行 {len(to_compress)//2} 步操作"
+        summary = f"已执行 {len(to_compress)//2} 步操作，包含 {len([m for m in to_compress if 'image_url' in str(m)])} 张截图"
 
     summary_msg = {
         "role": "assistant",
         "content": f"[历史摘要] {summary}",
     }
-    return messages[:2] + [summary_msg] + messages[-max_history:]
+
+    compressed = messages[:2] + [summary_msg] + messages[-keep_recent:]
+    compressed_tokens = estimate_messages_tokens(compressed)
+
+    _safe_print(
+        f"  [上下文压缩] {len(messages)} 条消息 ({total_tokens} tokens) "
+        f"→ {len(compressed)} 条消息 ({compressed_tokens} tokens)，"
+        f"节省 {total_tokens - compressed_tokens} tokens"
+    )
+
+    return compressed
 
 
 # ── 失败模式识别 + 智能重试分析 ──────────────────────────────────────────────

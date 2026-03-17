@@ -23,6 +23,7 @@ export default defineConfig({
       '/export': 'http://127.0.0.1:8000',
       '/workflows': 'http://127.0.0.1:8000',
       '/workflow-runs': 'http://127.0.0.1:8000',
+      '/templates': 'http://127.0.0.1:8000',
       '/cleanup': 'http://127.0.0.1:8000',
       '/health': 'http://127.0.0.1:8000',
     },

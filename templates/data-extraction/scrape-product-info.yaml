@@ -1,0 +1,46 @@
+template:
+  id: scrape-product-info
+  category: data-extraction
+  tags: [scraping, e-commerce, product]
+  icon: package
+  difficulty: beginner
+  estimated_time: "2-5 分钟"
+
+title: 商品信息抓取
+description: 从电商网站抓取商品名称、价格、评分、库存等信息，支持自定义提取字段
+
+parameters:
+  - key: product_url
+    type: string
+    description: 商品页面 URL
+    required: true
+  - key: fields
+    type: string
+    description: 要提取的字段（逗号分隔）
+    default: "名称,价格,评分,库存"
+    required: false
+
+blocks:
+  - block_type: navigation
+    label: open_product
+    url: "{{ product_url }}"
+    goal: "打开商品页面"
+
+  - block_type: extraction
+    label: extract_info
+    data_extraction_goal: "提取商品的{{ fields }}"
+    data_schema:
+      type: object
+      properties:
+        name:
+          type: string
+          description: 商品名称
+        price:
+          type: string
+          description: 商品价格
+        rating:
+          type: string
+          description: 商品评分
+        stock:
+          type: string
+          description: 库存状态

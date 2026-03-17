@@ -1,0 +1,31 @@
+template:
+  id: site-login
+  category: login-session
+  tags: [login, authentication, session]
+  icon: lock
+  difficulty: beginner
+  estimated_time: "1-2 分钟"
+
+title: 网站登录
+description: 自动登录指定网站，使用环境变量中存储的凭据
+
+parameters:
+  - key: login_url
+    type: string
+    description: 登录页面 URL
+    required: true
+  - key: credentials
+    type: string
+    description: 凭据环境变量名（对应 .env 中的 CRED_xxx）
+    default: "default"
+    required: false
+
+blocks:
+  - block_type: login
+    label: do_login
+    url: "{{ login_url }}"
+    credentials: "{{ credentials }}"
+
+  - block_type: task
+    label: verify_login
+    task: "确认登录是否成功，截图保存当前页面状态"

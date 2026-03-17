@@ -1,0 +1,31 @@
+template:
+  id: download-files
+  category: file-operations
+  tags: [download, files, batch]
+  icon: download
+  difficulty: intermediate
+  estimated_time: "3-8 分钟"
+
+title: 批量文件下载
+description: 访问指定页面，找到目标文件并下载
+
+parameters:
+  - key: page_url
+    type: string
+    description: 包含下载链接的页面 URL
+    required: true
+  - key: download_goal
+    type: string
+    description: 要下载的文件描述
+    default: "页面上的所有 PDF 文件"
+    required: false
+
+blocks:
+  - block_type: navigation
+    label: open_page
+    url: "{{ page_url }}"
+
+  - block_type: task
+    label: find_and_download
+    task: "在页面上找到{{ download_goal }}，逐一点击下载。如果需要确认下载，请点击确认。"
+    max_retries: 1

@@ -1,0 +1,48 @@
+template:
+  id: extract-article
+  category: data-extraction
+  tags: [article, content, blog, extraction]
+  icon: file-text
+  difficulty: beginner
+  estimated_time: "2-4 分钟"
+
+title: 文章正文提取
+description: 从文章页/博客页提取标题、正文、作者、发布时间等，输出结构化数据便于存档或二次加工
+
+parameters:
+  - key: article_url
+    type: string
+    description: 文章页面 URL
+    required: true
+  - key: include_metadata
+    type: boolean
+    description: 是否提取作者、发布时间等元数据
+    default: true
+    required: false
+
+blocks:
+  - block_type: navigation
+    label: open_article
+    url: "{{ article_url }}"
+
+  - block_type: extraction
+    label: extract_article
+    data_extraction_goal: "提取文章标题和正文内容；若页面有作者、发布时间、标签等元数据也一并提取"
+    data_schema:
+      type: object
+      properties:
+        title:
+          type: string
+          description: 文章标题
+        content:
+          type: string
+          description: 正文纯文本
+        author:
+          type: string
+          description: 作者（如有）
+        published_at:
+          type: string
+          description: 发布时间（如有）
+        tags:
+          type: array
+          description: 标签或分类（如有）

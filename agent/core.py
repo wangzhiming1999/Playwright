@@ -9,6 +9,7 @@ from page_annotator import get_element_coords
 
 from .page_utils import _safe_print, _wait_for_page_ready
 from .llm_helpers import robust_json_loads
+from .action_registry import is_custom_action, execute_custom_action
 from utils import llm_chat as _llm_chat
 
 
@@ -555,12 +556,27 @@ class BrowserAgent:
 
             elif tool_name == "press_key":
                 key = args.get("key", "")
+                modifiers = args.get("modifiers", [])
                 if not key:
                     return "操作失败: key 参数不能为空"
+                valid_modifiers = {"Control", "Shift", "Alt", "Meta"}
+                modifiers = [m for m in modifiers if m in valid_modifiers]
                 try:
+                    for mod in modifiers:
+                        await page.keyboard.down(mod)
                     await page.keyboard.press(key)
+                    for mod in reversed(modifiers):
+                        await page.keyboard.up(mod)
+                    if modifiers:
+                        combo = "+".join(modifiers + [key])
+                        return f"已按下组合键 {combo}"
                     return f"已按下 {key}"
                 except Exception as e:
+                    for mod in reversed(modifiers):
+                        try:
+                            await page.keyboard.up(mod)
+                        except Exception:
+                            pass
                     return f"操作失败: 按键 {key} 失败 — {e}"
 
             elif tool_name == "done":
@@ -653,6 +669,77 @@ class BrowserAgent:
                         return f"操作失败: hover '{text}' 失败 — {e}"
 
                 return "操作失败: 需要提供 index 或 text 参数"
+
+            elif tool_name == "right_click":
+                index = args.get("index")
+                text = args.get("text")
+
+                if index is not None:
+                    try:
+                        el_info = await get_element_coords(page, index)
+                        if el_info:
+                            x, y = el_info["x"], el_info["y"]
+                            method = el_info.get("method", "skyvern-id")
+                            await self._log(f"  [右键] #{index} → ({x}, {y}) method={method}")
+                            await page.mouse.click(x, y, button="right")
+                            await asyncio.sleep(0.3)
+                            return f"右键点击成功 #{index} ({x}, {y})"
+                        elif not text:
+                            return f"操作失败: index={index} 定位失败且未提供 text"
+                    except Exception as e:
+                        if not text:
+                            return f"操作失败: {e}"
+
+                if text:
+                    try:
+                        el = page.get_by_text(text, exact=False).first
+                        bbox = await el.bounding_box(timeout=10000)
+                        if bbox:
+                            x = int(bbox["x"] + bbox["width"] / 2)
+                            y = int(bbox["y"] + bbox["height"] / 2)
+                            await page.mouse.click(x, y, button="right")
+                            await asyncio.sleep(0.3)
+                            return f"右键点击成功 '{text}'"
+                        else:
+                            return f"操作失败: 元素 '{text}' 无法获取位置"
+                    except Exception as e:
+                        return f"操作失败: right_click '{text}' 失败 — {e}"
+
+                return "操作失败: 需要提供 index 或 text 参数"
+
+            elif tool_name == "switch_iframe":
+                iframe_index = args.get("index", 0)
+                if iframe_index == 0:
+                    # 回到主页面
+                    self._active_frame = None
+                    await self._log("  [iframe] 已切换回主页面")
+                    return "已切换回主页面"
+                try:
+                    el_info = await get_element_coords(page, iframe_index)
+                    if not el_info:
+                        return f"操作失败: index={iframe_index} 定位失败"
+                    # 尝试通过 skyvern-id 或坐标找到 iframe 元素
+                    iframe_el = None
+                    sid = el_info.get("skyvern_id")
+                    if sid:
+                        iframe_el = await page.query_selector(f"[skyvern-id='{sid}']")
+                    if not iframe_el:
+                        # 通过坐标找最近的 iframe
+                        x, y = el_info["x"], el_info["y"]
+                        iframe_el = await page.evaluate_handle(
+                            f"document.elementFromPoint({x}, {y})"
+                        )
+                        iframe_el = iframe_el.as_element()
+                    if not iframe_el:
+                        return f"操作失败: 无法定位 iframe 元素 #{iframe_index}"
+                    frame = await iframe_el.content_frame()
+                    if not frame:
+                        return f"操作失败: 元素 #{iframe_index} 不是 iframe"
+                    self._active_frame = frame
+                    await self._log(f"  [iframe] 已切换到 iframe #{iframe_index}, url={frame.url[:80]}")
+                    return f"已切换到 iframe #{iframe_index}"
+                except Exception as e:
+                    return f"操作失败: switch_iframe 失败 — {e}"
 
             elif tool_name == "select_option":
                 index = args.get("index")
@@ -1201,6 +1288,16 @@ class BrowserAgent:
 
                 except Exception as e:
                     return f"操作失败: scroll_to_text 失败 — {e}"
+
+            # ── 自定义 Action fallback ──────────────────────────────────
+            elif is_custom_action(tool_name):
+                return await execute_custom_action(
+                    tool_name,
+                    args,
+                    page=page,
+                    agent=self,
+                    log_fn=self._log,
+                )
 
         except Exception as e:
             return f"操作失败: {e}"

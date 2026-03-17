@@ -1,0 +1,30 @@
+template:
+  id: submit-application
+  category: form-filling
+  tags: [form, application, multi-step]
+  icon: clipboard
+  difficulty: intermediate
+  estimated_time: "5-10 分钟"
+
+title: 申请表提交
+description: 自动填写并提交多字段申请表，支持 JSON 格式的表单数据
+
+parameters:
+  - key: form_url
+    type: string
+    description: 申请表页面 URL
+    required: true
+  - key: form_data
+    type: json
+    description: "表单数据（JSON 格式，如 {\"name\": \"张三\", \"phone\": \"13800138000\"}）"
+    required: true
+
+blocks:
+  - block_type: navigation
+    label: open_form
+    url: "{{ form_url }}"
+
+  - block_type: task
+    label: fill_and_submit
+    task: "找到申请表单，根据以下数据逐一填写所有字段：{{ form_data }}。所有字段填写完成后，点击提交按钮。如果有必填字段未提供数据，请跳过。"
+    max_retries: 1

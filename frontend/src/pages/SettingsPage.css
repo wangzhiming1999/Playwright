@@ -35,4 +35,25 @@
   display: flex;
   align-items: center;
   gap: 12px;
+  flex-wrap: wrap;
 }
+
+.browser-mode-option {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 12px 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+  min-width: 140px;
+}
+.browser-mode-option:hover { border-color: var(--accent); }
+.browser-mode-option.active {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+}
+.browser-mode-option input[type="radio"] { display: none; }
+.browser-mode-label { font-size: 14px; font-weight: 600; }
+.browser-mode-desc { font-size: 12px; color: var(--text-secondary); }

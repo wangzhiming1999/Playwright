@@ -8,6 +8,7 @@ import { TasksPage } from './pages/TasksPage';
 import { DashboardPage } from './pages/DashboardPage';
 import { ExplorePage } from './pages/ExplorePage';
 import { WorkflowsPage } from './pages/WorkflowsPage';
+import { TemplatesPage } from './pages/TemplatesPage';
 import { SettingsPage } from './pages/SettingsPage';
 import './styles/globals.css';
 
@@ -27,6 +28,8 @@ export default function App() {
           <Route path="explore/:eid" element={<ErrorBoundary><ExplorePage /></ErrorBoundary>} />
           <Route path="workflows" element={<ErrorBoundary><WorkflowsPage /></ErrorBoundary>} />
           <Route path="workflows/:id" element={<ErrorBoundary><WorkflowsPage /></ErrorBoundary>} />
+          <Route path="templates" element={<ErrorBoundary><TemplatesPage /></ErrorBoundary>} />
+          <Route path="templates/:templateId" element={<ErrorBoundary><TemplatesPage /></ErrorBoundary>} />
           <Route path="settings" element={<ErrorBoundary><SettingsPage /></ErrorBoundary>} />
           <Route path="*" element={<Navigate to="/dashboard" replace />} />
         </Route>

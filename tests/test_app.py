@@ -94,7 +94,7 @@ def test_index_returns_html(client):
 def test_list_tasks_empty(client):
     r = client.get("/tasks")
     assert r.status_code == 200
-    assert r.json() == []
+    assert r.json()["tasks"] == []
 
 
 def test_list_tasks_after_submit(client):
@@ -105,7 +105,7 @@ def test_list_tasks_after_submit(client):
     assert len(ids) == 1
 
     r = client.get("/tasks")
-    tasks = r.json()
+    tasks = r.json()["tasks"]
     assert len(tasks) == 1
     assert tasks[0]["status"] == "pending"
 

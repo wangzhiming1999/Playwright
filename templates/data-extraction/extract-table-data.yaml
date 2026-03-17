@@ -1,0 +1,42 @@
+template:
+  id: extract-table-data
+  category: data-extraction
+  tags: [scraping, table, structured-data]
+  icon: table
+  difficulty: intermediate
+  estimated_time: "3-8 分钟"
+
+title: 表格数据提取
+description: 从网页中提取表格数据，自动识别表格结构并输出为结构化 JSON
+
+parameters:
+  - key: page_url
+    type: string
+    description: 包含表格的页面 URL
+    required: true
+  - key: table_description
+    type: string
+    description: 表格描述（帮助定位正确的表格）
+    default: "页面中的主要数据表格"
+    required: false
+
+blocks:
+  - block_type: navigation
+    label: open_page
+    url: "{{ page_url }}"
+
+  - block_type: extraction
+    label: extract_table
+    data_extraction_goal: "找到{{ table_description }}，提取所有行和列的数据"
+    data_schema:
+      type: object
+      properties:
+        headers:
+          type: array
+          description: 表头列名
+        rows:
+          type: array
+          description: 每行数据
+        total_rows:
+          type: integer
+          description: 总行数

@@ -1,0 +1,59 @@
+template:
+  id: price-monitor
+  category: monitoring
+  tags: [monitoring, price, e-commerce]
+  icon: eye
+  difficulty: intermediate
+  estimated_time: "3-5 分钟"
+
+title: 商品价格监控
+description: 访问商品页面，提取当前价格并与目标价格对比，适合定期运行检查降价
+
+parameters:
+  - key: product_url
+    type: string
+    description: 商品页面 URL
+    required: true
+  - key: target_price
+    type: float
+    description: 目标价格（低于此价格时标记为降价）
+    required: true
+  - key: product_name
+    type: string
+    description: 商品名称（用于结果标识）
+    default: "目标商品"
+    required: false
+
+blocks:
+  - block_type: navigation
+    label: open_product
+    url: "{{ product_url }}"
+
+  - block_type: extraction
+    label: get_price
+    data_extraction_goal: "提取「{{ product_name }}」的当前售价"
+    data_schema:
+      type: object
+      properties:
+        price:
+          type: string
+          description: 当前价格
+        currency:
+          type: string
+          description: 货币单位
+
+  - block_type: code
+    label: check_price
+    code: |
+      import json
+      price_str = outputs.get("get_price", {}).get("price", "0")
+      price = float(''.join(c for c in price_str if c.isdigit() or c == '.') or '0')
+      target = float("{{ target_price }}")
+      result = {
+        "product": "{{ product_name }}",
+        "current_price": price,
+        "target_price": target,
+        "is_below_target": price <= target,
+        "message": f"当前价格 {price}，{'已降至目标价格以下！' if price <= target else '尚未降价'}"
+      }
+      output = json.dumps(result, ensure_ascii=False)

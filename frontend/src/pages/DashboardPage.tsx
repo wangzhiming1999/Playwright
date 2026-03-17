@@ -1,6 +1,7 @@
-import { useMemo } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useTaskStore } from '@/hooks/useTaskStore';
 import { useExploreStore } from '@/hooks/useExploreStore';
+import { getPool } from '@/api/tasks';
 import { DonutChart } from '@/components/charts/DonutChart';
 import { BarChart } from '@/components/charts/BarChart';
 import { TimelineChart } from '@/components/charts/TimelineChart';
@@ -12,6 +13,15 @@ export function DashboardPage() {
   const tasks = useMemo(() => Object.values(tasksMap), [tasksMap]);
   const exploreMap = useExploreStore((s) => s.tasks);
   const explores = useMemo(() => Object.values(exploreMap), [exploreMap]);
+
+  // Pool 状态
+  const [pool, setPool] = useState({ max_workers: 0, running: 0, queued: 0, completed: 0, failed: 0 });
+  useEffect(() => {
+    const fetchPool = () => getPool().then(setPool).catch(() => {});
+    fetchPool();
+    const timer = setInterval(fetchPool, 10000);
+    return () => clearInterval(timer);
+  }, []);
 
   const total = tasks.length;
   const pending = tasks.filter((t) => t.status === 'pending').length;
@@ -109,6 +119,11 @@ export function DashboardPage() {
           <div className="stat-label">探索任务</div>
           <div className="stat-value">{expTotal}</div>
           <div className="stat-sub">{expRunning} 运行中 / {expDone} 完成</div>
+        </div>
+        <div className="stat-card">
+          <div className="stat-label">任务池</div>
+          <div className="stat-value">{pool.running}<span style={{ fontSize: 14, fontWeight: 400, color: 'var(--text-secondary)' }}>/{pool.max_workers}</span></div>
+          <div className="stat-sub">{pool.queued} 排队 / {pool.completed} 已完成</div>
         </div>
       </div>
 

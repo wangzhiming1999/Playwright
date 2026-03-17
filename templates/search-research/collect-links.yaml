@@ -1,0 +1,48 @@
+template:
+  id: collect-links
+  category: search-research
+  tags: [links, collection, crawling, research]
+  icon: link
+  difficulty: beginner
+  estimated_time: "2-5 分钟"
+
+title: 收集链接
+description: 在当前页面或指定页面中，按描述收集符合条件的链接（如某区块内的所有文章链接）
+
+parameters:
+  - key: page_url
+    type: string
+    description: 要收集链接的页面 URL
+    required: true
+  - key: link_description
+    type: string
+    description: 要收集的链接描述（如「正文区域内的所有文章链接」「侧边栏的导航链接」）
+    default: "页面中所有内容类链接"
+    required: false
+  - key: max_links
+    type: integer
+    description: 最多收集条数
+    default: 50
+    required: false
+
+blocks:
+  - block_type: navigation
+    label: open_page
+    url: "{{ page_url }}"
+
+  - block_type: extraction
+    label: collect_links
+    data_extraction_goal: "找到{{ link_description }}，提取最多 {{ max_links }} 条，每条包含链接 URL 和可见的锚文本"
+    data_schema:
+      type: object
+      properties:
+        links:
+          type: array
+          items:
+            type: object
+            properties:
+              url:
+                type: string
+              text:
+                type: string
+                description: 锚文本

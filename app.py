@@ -5,9 +5,11 @@ Run: uvicorn app:app --reload --port 8000
 
 import asyncio
 import concurrent.futures
+import hmac
 import io
 import json
 import os
+import re
 import shutil
 import sqlite3
 import sys
@@ -23,9 +25,10 @@ from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
 from agent import run_agent
+from agent.task_pool import TaskPool
 from curator import curate
 from explorer import run_exploration
 from content_gen import generate_all
@@ -38,10 +41,12 @@ from workflow import (
     scan_workflow_directory,
     WorkflowEngine, WorkflowCreateRequest, WorkflowRunRequest,
 )
+from template_loader import scan_templates, TEMPLATE_CATEGORIES
 
 # ── Configuration constants ───────────────────────────────────────────────────
 
-_AGENT_THREAD_WORKERS = 4
+_AGENT_THREAD_WORKERS = int(os.getenv("AGENT_WORKERS", "4"))
+_MAX_CONCURRENT_TASKS = int(os.getenv("MAX_CONCURRENT_TASKS", "3"))
 _CALLBACK_TIMEOUT = 30      # seconds for cross-thread future.result()
 _BROADCAST_TIMEOUT = 5
 _USER_REPLY_TIMEOUT = 300   # 5 minutes
@@ -74,9 +79,11 @@ app.add_middleware(
 
 async def _verify_api_key(x_api_key: str | None = Header(default=None)):
     """Optional API key check. If API_KEY env var is not set, auth is skipped."""
-    if API_KEY and x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+    if API_KEY:
+        if not x_api_key or not hmac.compare_digest(x_api_key, API_KEY):
+            raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
+SCREENSHOTS_ROOT = Path("screenshots").resolve()
 Path("screenshots").mkdir(exist_ok=True)
 Path("static").mkdir(exist_ok=True)
 init_db()
@@ -88,10 +95,15 @@ _loaded_wfs = scan_workflow_directory()
 for wf in _loaded_wfs:
     WORKFLOWS[wf["id"]] = wf
 
+TEMPLATES: dict[str, dict] = scan_templates()
+
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # 专用线程池：在独立线程里用 ProactorEventLoop 跑 Playwright，避免 Windows 上主循环的 NotImplementedError
 _agent_executor = concurrent.futures.ThreadPoolExecutor(max_workers=_AGENT_THREAD_WORKERS, thread_name_prefix="playwright_agent")
+
+# 并行任务执行池：Semaphore 控制最大并发浏览器数
+_task_pool = TaskPool(max_workers=_MAX_CONCURRENT_TASKS)
 
 # ── In-memory store (backed by SQLite) ────────────────────────────────────────
 
@@ -357,12 +369,20 @@ async def _run_task(task_id: str, task: str):
 # ── API endpoints ─────────────────────────────────────────────────────────────
 
 class RunRequest(BaseModel):
-    tasks: list[str]
-    browser_mode: str = "builtin"   # "builtin" | "user_chrome" | "cdp"
-    cdp_url: str = "http://localhost:9222"
-    chrome_profile: str = "Default"
-    webhook_url: str = ""           # 任务完成/失败时 POST 回调
-    timeout: int = 0                # 单任务超时秒数，0 表示不限
+    tasks: list[str] = Field(max_length=50)
+    browser_mode: str = Field(default="builtin", pattern=r'^(builtin|user_chrome|cdp)$')
+    cdp_url: str = Field(default="http://localhost:9222", max_length=500)
+    chrome_profile: str = Field(default="Default", max_length=100)
+    webhook_url: str = Field(default="", max_length=500)
+    timeout: int = Field(default=0, ge=0, le=3600)
+
+    @field_validator('tasks')
+    @classmethod
+    def validate_task_texts(cls, v):
+        for i, text in enumerate(v):
+            if len(text) > 10000:
+                raise ValueError(f'Task {i} exceeds 10000 character limit')
+        return v
 
 
 @app.get("/")
@@ -372,17 +392,39 @@ def index():
 
 @app.get("/health")
 def health_check():
-    return {"status": "ok", "tasks": len(TASKS), "explore_tasks": len(EXPLORE_TASKS)}
+    return {"status": "ok", "tasks": len(TASKS), "explore_tasks": len(EXPLORE_TASKS), "pool": _task_pool.stats_dict()}
+
+
+@app.get("/pool")
+def pool_status(_: None = Depends(_verify_api_key)):
+    """查询并行任务池状态：并发数、运行中/排队/已完成任务数。"""
+    return _task_pool.stats_dict()
+
+
+class PoolResizeRequest(BaseModel):
+    max_workers: int
+
+
+@app.put("/pool")
+def pool_resize(req: PoolResizeRequest, _: None = Depends(_verify_api_key)):
+    """动态调整最大并发浏览器数。"""
+    if req.max_workers < 1 or req.max_workers > 10:
+        raise HTTPException(status_code=400, detail="max_workers must be 1-10")
+    old = _task_pool.max_workers
+    _task_pool.resize(req.max_workers)
+    return {"old_max_workers": old, "new_max_workers": req.max_workers, "pool": _task_pool.stats_dict()}
 
 
 @app.get("/screenshots/{task_id}/{filename}")
 async def serve_screenshot(task_id: str, filename: str, _: None = Depends(_verify_api_key)):
-    if ".." in task_id or ".." in filename or "/" in filename or "\\" in filename:
+    if not re.fullmatch(r'[a-zA-Z0-9_-]+', task_id) or not re.fullmatch(r'[a-zA-Z0-9_.-]+', filename):
         raise HTTPException(status_code=400, detail="invalid path")
-    path = Path("screenshots") / task_id / filename
-    if not path.exists() or not path.is_file():
+    resolved = (SCREENSHOTS_ROOT / task_id / filename).resolve()
+    if not resolved.is_relative_to(SCREENSHOTS_ROOT):
+        raise HTTPException(status_code=400, detail="invalid path")
+    if not resolved.exists() or not resolved.is_file():
         raise HTTPException(status_code=404, detail="screenshot not found")
-    return FileResponse(str(path))
+    return FileResponse(str(resolved))
 
 
 @app.post("/run")
@@ -410,21 +452,60 @@ async def submit_tasks(req: RunRequest, background_tasks: BackgroundTasks, _: No
         ids.append(tid)
         task_texts.append(task_text)
 
-    async def run_all():
-        await asyncio.gather(*[_run_task(tid, t) for tid, t in zip(ids, task_texts)])
-
-    background_tasks.add_task(run_all)
+    # 通过 TaskPool 提交任务（Semaphore 控制并发）
+    for tid, t in zip(ids, task_texts):
+        await _task_pool.submit(tid, _run_task, t)
 
     # broadcast new pending tasks
     for tid, t in zip(ids, task_texts):
         await _broadcast({"type": "new_task", "task": TASKS[tid]})
 
-    return {"task_ids": ids}
+    return {"task_ids": ids, "pool": _task_pool.stats_dict()}
 
 
 @app.get("/tasks")
-def list_tasks():
-    return list(TASKS.values())
+def list_tasks(
+    status: str | None = None,
+    q: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+    _: None = Depends(_verify_api_key),
+):
+    """列出任务，支持分页和过滤。"""
+    limit = max(1, min(limit, 200))
+    offset = max(0, offset)
+    all_tasks = list(TASKS.values())
+    # 按 created_at 倒序
+    all_tasks.sort(key=lambda t: t.get("created_at", 0), reverse=True)
+    if status:
+        all_tasks = [t for t in all_tasks if t.get("status") == status]
+    if q:
+        q_lower = q.lower()
+        all_tasks = [t for t in all_tasks if q_lower in t.get("task", "").lower()]
+    total = len(all_tasks)
+    return {"tasks": all_tasks[offset:offset + limit], "total": total, "limit": limit, "offset": offset}
+
+
+class BatchDeleteRequest(BaseModel):
+    task_ids: list[str] = Field(max_length=100)
+
+
+@app.post("/tasks/batch-delete")
+async def batch_delete_tasks(req: BatchDeleteRequest, _: None = Depends(_verify_api_key)):
+    """批量删除任务。"""
+    deleted = []
+    for task_id in req.task_ids:
+        if task_id not in TASKS:
+            continue
+        TASKS.pop(task_id)
+        shot_dir = Path(f"screenshots/{task_id}")
+        if shot_dir.exists():
+            shutil.rmtree(shot_dir, ignore_errors=True)
+        deleted.append(task_id)
+    if deleted:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.executemany("DELETE FROM tasks WHERE id=?", [(tid,) for tid in deleted])
+    return {"deleted": len(deleted), "deleted_ids": deleted}
 
 
 @app.post("/tasks/{task_id}/cancel")
@@ -515,6 +596,44 @@ async def reply_to_task(task_id: str, answer: str = ""):
     entry["event"].set()  # 唤醒 agent 线程
 
     return {"ok": True, "answer": answer}
+
+
+@app.get("/tasks/{task_id}")
+def get_task(task_id: str, _: None = Depends(_verify_api_key)):
+    """获取单个任务详情。"""
+    if task_id not in TASKS:
+        raise HTTPException(status_code=404, detail="task not found")
+    return TASKS[task_id]
+
+
+@app.post("/tasks/{task_id}/retry")
+async def retry_task(task_id: str, _: None = Depends(_verify_api_key)):
+    """重试任务：用原始参数创建新任务。"""
+    if task_id not in TASKS:
+        raise HTTPException(status_code=404, detail="task not found")
+    original = TASKS[task_id]
+    if original["status"] not in ("done", "failed", "cancelled"):
+        raise HTTPException(status_code=400, detail=f"task is still {original['status']}, cannot retry")
+
+    new_id = uuid.uuid4().hex[:8]
+    TASKS[new_id] = {
+        "id": new_id,
+        "task": original["task"],
+        "status": "pending",
+        "logs": [],
+        "screenshots": [],
+        "browser_mode": original.get("browser_mode", "builtin"),
+        "cdp_url": original.get("cdp_url", "http://localhost:9222"),
+        "chrome_profile": original.get("chrome_profile", "Default"),
+        "webhook_url": original.get("webhook_url", ""),
+        "timeout": original.get("timeout", 0),
+        "created_at": time.time(),
+        "retry_of": task_id,
+    }
+    save_task(TASKS[new_id])
+    await _task_pool.submit(new_id, _run_task, original["task"])
+    await _broadcast({"type": "new_task", "task": TASKS[new_id]})
+    return {"task_id": new_id, "retry_of": task_id}
 
 
 # ── Curation endpoint ─────────────────────────────────────────────────────────
@@ -1206,6 +1325,117 @@ def get_workflow_run(run_id: str, _: None = Depends(_verify_api_key)):
     if not run:
         raise HTTPException(status_code=404, detail="workflow run not found")
     return run
+
+
+# ── Template Marketplace endpoints ───────────────────────────────────────────
+
+@app.get("/templates")
+def list_templates(category: str | None = None, _: None = Depends(_verify_api_key)):
+    templates = list(TEMPLATES.values())
+    if category:
+        templates = [t for t in templates if t.get("category") == category]
+    # Don't send yaml_source in list view
+    return [{k: v for k, v in t.items() if k != "yaml_source"} for t in templates]
+
+
+@app.get("/templates/categories")
+def list_template_categories(_: None = Depends(_verify_api_key)):
+    counts: dict[str, int] = {}
+    for t in TEMPLATES.values():
+        cat = t.get("category", "")
+        counts[cat] = counts.get(cat, 0) + 1
+    return [
+        {"id": cid, "label": info["label"], "icon": info["icon"], "count": counts.get(cid, 0)}
+        for cid, info in TEMPLATE_CATEGORIES.items()
+        if counts.get(cid, 0) > 0
+    ]
+
+
+@app.get("/templates/{template_id}")
+def get_template(template_id: str, _: None = Depends(_verify_api_key)):
+    tpl = TEMPLATES.get(template_id)
+    if not tpl:
+        raise HTTPException(status_code=404, detail="template not found")
+    return tpl
+
+
+@app.post("/templates/{template_id}/instantiate")
+def instantiate_template(template_id: str, _: None = Depends(_verify_api_key)):
+    tpl = TEMPLATES.get(template_id)
+    if not tpl:
+        raise HTTPException(status_code=404, detail="template not found")
+    try:
+        wf_def = parse_workflow(tpl["yaml_source"])
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    wf_id = uuid.uuid4().hex[:8]
+    wf_dict = {
+        "id": wf_id,
+        "title": wf_def.title,
+        "description": wf_def.description,
+        "yaml_source": tpl["yaml_source"],
+        "parameters": [p.model_dump() for p in wf_def.parameters],
+        "blocks": [b.model_dump() for b in wf_def.blocks],
+        "source_type": "template",
+        "source_path": template_id,
+    }
+    save_workflow(wf_dict)
+    WORKFLOWS[wf_id] = wf_dict
+    return {"id": wf_id, "title": wf_dict["title"]}
+
+
+class TemplateRunRequest(BaseModel):
+    parameters: dict = {}
+    browser_mode: str = "builtin"
+    cdp_url: str = "http://localhost:9222"
+    chrome_profile: str = "Default"
+    webhook_url: str = ""
+    timeout: int = 0
+
+
+@app.post("/templates/{template_id}/run")
+async def run_template(
+    template_id: str, req: TemplateRunRequest,
+    background_tasks: BackgroundTasks, _: None = Depends(_verify_api_key),
+):
+    tpl = TEMPLATES.get(template_id)
+    if not tpl:
+        raise HTTPException(status_code=404, detail="template not found")
+    # Create ephemeral workflow
+    try:
+        wf_def = parse_workflow(tpl["yaml_source"])
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    wf_id = f"tpl_{uuid.uuid4().hex[:8]}"
+    wf_dict = {
+        "id": wf_id,
+        "title": wf_def.title,
+        "description": wf_def.description,
+        "yaml_source": tpl["yaml_source"],
+        "parameters": [p.model_dump() for p in wf_def.parameters],
+        "blocks": [b.model_dump() for b in wf_def.blocks],
+        "source_type": "template",
+        "source_path": template_id,
+    }
+    save_workflow(wf_dict)
+    WORKFLOWS[wf_id] = wf_dict
+    # Run it (reuse workflow run logic)
+    run_id = uuid.uuid4().hex[:12]
+    run_record = {
+        "id": run_id, "workflow_id": wf_id, "status": "pending",
+        "parameters": req.parameters, "block_results": {},
+        "current_block": None, "logs": [], "error": None,
+        "started_at": None, "finished_at": None,
+    }
+    save_workflow_run(run_record)
+
+    async def _execute():
+        engine = WorkflowEngine(wf_dict, req.parameters, run_id)
+        await engine.run()
+
+    background_tasks.add_task(_execute)
+    await _broadcast({"type": "workflow_started", "run_id": run_id, "workflow_id": wf_id})
+    return {"run_id": run_id, "workflow_id": wf_id}
 
 
 # ── SPA fallback: React Router 需要所有非 API 路径返回 index.html ──────────

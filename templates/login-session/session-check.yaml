@@ -1,0 +1,58 @@
+template:
+  id: session-check
+  category: login-session
+  tags: [login, session, verification]
+  icon: shield
+  difficulty: beginner
+  estimated_time: "1-2 分钟"
+
+title: 登录状态检查
+description: 访问网站检查是否已登录，未登录则自动执行登录流程
+
+parameters:
+  - key: site_url
+    type: string
+    description: 网站首页或需要登录才能访问的页面 URL
+    required: true
+  - key: credentials
+    type: string
+    description: 凭据环境变量名
+    default: "default"
+    required: false
+  - key: check_element
+    type: string
+    description: 用于判断已登录的页面元素描述
+    default: "用户头像或用户名"
+    required: false
+
+blocks:
+  - block_type: navigation
+    label: open_site
+    url: "{{ site_url }}"
+
+  - block_type: extraction
+    label: check_login_status
+    data_extraction_goal: "检查页面上是否存在{{ check_element }}，判断当前是否已登录"
+    data_schema:
+      type: object
+      properties:
+        is_logged_in:
+          type: boolean
+          description: 是否已登录
+        username:
+          type: string
+          description: 当前登录的用户名（如果已登录）
+
+  - block_type: conditional
+    label: need_login
+    condition: "not outputs.get('check_login_status', {}).get('is_logged_in', False)"
+    then_blocks:
+      - block_type: login
+        label: do_login
+        url: "{{ site_url }}"
+        credentials: "{{ credentials }}"
+    else_blocks: []
+
+  - block_type: task
+    label: done_check
+    task: "截图保存当前页面，确认登录状态"

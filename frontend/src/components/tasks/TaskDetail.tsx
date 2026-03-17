@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { useTaskStore } from '@/hooks/useTaskStore';
-import { cancelTask, deleteTask, replyToTask, runCuration, runGenerate } from '@/api/tasks';
+import { cancelTask, deleteTask, replyToTask, runCuration, runGenerate, retryTask } from '@/api/tasks';
 import { toast } from '@/utils/toast';
 import { normalizeCurationResult, normalizeGenerated } from '@/utils/normalize';
 import { CurationView } from '@/components/CurationView';
@@ -32,6 +32,13 @@ export function TaskDetail() {
   async function handleDelete() {
     if (!confirm('确定删除此任务？')) return;
     try { await deleteTask(task!.id); removeTask(task!.id); toast.success('已删除'); } catch (e) { toast.error(e instanceof Error ? e.message : String(e)); }
+  }
+
+  async function handleRetry() {
+    try {
+      const res = await retryTask(task!.id);
+      toast.success(`已重新提交，新任务 ID: ${res.task_id}`);
+    } catch (e) { toast.error(e instanceof Error ? e.message : String(e)); }
   }
 
   async function handleReply() {
@@ -71,6 +78,9 @@ export function TaskDetail() {
         <div className="task-detail-actions">
           {task.status === 'running' && (
             <button className="btn-ghost" onClick={handleCancel}>取消</button>
+          )}
+          {(task.status === 'failed' || task.status === 'cancelled') && (
+            <button className="btn-primary" onClick={handleRetry} style={{ padding: '6px 12px', fontSize: 12 }}>重试</button>
           )}
           <button className="btn-danger" onClick={handleDelete} style={{ padding: '6px 12px', fontSize: 12 }}>删除</button>
         </div>

@@ -11,6 +11,8 @@
 - **Human-in-the-loop** - 执行中可暂停向用户提问，获取必要信息
 - **2FA / 验证码** - 支持 TOTP 两步验证和图形验证码识别
 - **文件操作** - 文件上传、下载、拖拽
+- **YAML 工作流** - 声明式多步骤工作流，可视化编辑与运行
+- **模板市场** - 预置模板（登录、数据提取、表单填写、监控等），一键实例化与运行
 - **实时监控** - Web Dashboard + SSE 实时推送任务状态和日志
 - **Webhook 回调** - 任务完成/失败时自动通知外部系统
 - **断点续跑** - 从检查点恢复中断的任务
@@ -60,12 +62,18 @@ docker-compose up
 
 ### Web UI 模式（推荐）
 
-1. 在浏览器中打开 `http://localhost:8000`
-2. 在输入框中输入任务，例如：
-   - `打开 https://example.com 并截图`
-   - `搜索 felo.ai 上关于 AI 的最新新闻`
-   - `打开 GitHub，找到 Trending 页面，截图前 5 个项目`
-3. 点击"提交任务"，实时查看执行日志和截图
+在浏览器中打开 `http://localhost:8000`，主要页面：
+
+| 页面 | 说明 |
+|------|------|
+| **Dashboard** | 概览与快捷入口 |
+| **任务** | 提交自然语言任务，实时查看执行日志和截图 |
+| **网站探索** | 爬取网站、策展截图、生成营销内容 |
+| **工作流** | 编辑 YAML 工作流、运行并查看历史 |
+| **模板市场** | 浏览/运行预置模板（登录、数据提取、表单、监控等） |
+| **设置** | 主题、API 等配置 |
+
+任务示例：`打开 https://example.com 并截图`、`打开 GitHub Trending 页面截图前 5 个项目`
 
 ### API 模式
 
@@ -122,8 +130,24 @@ skyvern/
 │   ├── llm_helpers.py      # 任务分解、步骤验证、上下文压缩
 │   ├── page_utils.py       # 页面就绪等待、安全打印
 │   ├── error_recovery.py   # 失败分析与重试
-│   ├── circuit_breaker.py # 调用熔断
+│   ├── circuit_breaker.py  # 调用熔断
 │   └── chrome_detector.py  # Chrome/Edge 用户数据目录检测
+├── workflow/               # YAML 工作流引擎
+│   ├── models.py           # 工作流/Block/参数 Pydantic 模型
+│   ├── parser.py           # YAML 解析与校验
+│   ├── engine.py           # WorkflowEngine 顺序执行
+│   ├── blocks.py           # 12 种 block 执行器
+│   ├── context.py          # 参数与 Jinja2 上下文
+│   ├── db.py / loader.py   # 工作流持久化与目录扫描
+├── templates/              # 模板市场 YAML（按分类存放，20+ 模板）
+│   ├── login-session/      # 登录、会话检查、会话保活
+│   ├── data-extraction/    # 表格/商品/文章/列表数据提取
+│   ├── form-filling/       # 表单填写、多步表单、申请提交
+│   ├── monitoring/         # 价格监控、页面变更、可用性检测、关键词监控
+│   ├── file-operations/    # 文件下载、上传并提交
+│   ├── search-research/    # 搜索汇总、收集链接、多商品比价
+│   └── integration/       # 集成通知（如执行任务后 Webhook）
+├── workflows/              # 用户工作流示例（_examples 等）
 ├── app.py                  # FastAPI 后端服务
 ├── db.py                   # SQLite 数据持久化
 ├── utils.py                # LLM 路由（OpenAI/Anthropic/litellm）、URL 验证
@@ -132,16 +156,16 @@ skyvern/
 ├── curator.py              # 截图策展（去重+打分）
 ├── content_gen.py          # 营销内容生成
 ├── site_understanding.py   # 网站结构分析
-├── frontend/               # Web Dashboard 源码（React + Vite，构建输出到 static/）
-├── static/                 # 前端构建产物（由 frontend 的 vite build 生成）
+├── template_loader.py       # 扫描 templates/ 加载模板列表
+├── frontend/               # Web Dashboard（React + Vite → static/）
+├── static/                 # 前端构建产物
 ├── tests/                  # 测试套件
-├── data/
-│   └── tasks.db            # SQLite 数据库
-├── screenshots/            # 任务截图存储
-├── Dockerfile              # 容器化构建
-├── docker-compose.yml      # Docker Compose 编排
-├── pyproject.toml          # 项目元数据 & 版本号
-└── requirements.txt        # Python 依赖
+├── data/                   # tasks.db、工作流 DB 等
+├── screenshots/             # 任务截图
+├── Dockerfile
+├── docker-compose.yml
+├── pyproject.toml
+└── requirements.txt
 ```
 
 ## 🔧 高级配置
@@ -247,10 +271,31 @@ pytest -k "test_validate_url"
   }
   ```
 
+### 工作流
+
+- `GET /workflows` - 列出所有工作流
+- `GET /workflows/{wf_id}` - 获取工作流详情
+- `POST /workflows` - 创建工作流（YAML）
+- `PUT /workflows/{wf_id}` - 更新工作流
+- `DELETE /workflows/{wf_id}` - 删除工作流
+- `POST /workflows/{wf_id}/run` - 运行工作流
+- `GET /workflows/{wf_id}/runs` - 工作流运行历史
+- `GET /workflow-runs/{run_id}` - 获取单次运行详情
+
+### 模板市场
+
+- `GET /templates` - 列出模板（可选 `?category=xxx`）
+- `GET /templates/categories` - 模板分类及数量
+- `GET /templates/{template_id}` - 获取模板详情
+- `POST /templates/{template_id}/instantiate` - 实例化为新工作流
+- `POST /templates/{template_id}/run` - 直接运行模板
+
+模板分类：登录会话、数据提取、表单填写、监控检测、文件操作、搜索研究、**集成通知**（Webhook 等）。
+
 ### 导出
 
-- `GET /export/{source}/{id}/json` - 导出为 JSON
-- `GET /export/{source}/{id}/zip` - 导出为 ZIP
+- `GET /export/{source}/{source_id}/json` - 导出为 JSON
+- `GET /export/{source}/{source_id}/zip` - 导出为 ZIP
 
 ### 静态资源
 
@@ -278,13 +323,17 @@ pytest -k "test_validate_url"
 - [x] 断点续跑（从检查点恢复）
 - [x] 结构化 JSON 日志
 - [x] Docker 支持
+- [x] YAML 工作流定义与可视化编辑
+- [x] 模板市场（预置模板一键运行/实例化）
 - [x] 商用级稳定性加固（50+ 问题修复）
+- [x] 并行任务执行（TaskPool 并发控制）
+- [x] 插件系统（自定义 Action 注册 + 3 个示例插件）
+- [x] 安全加固（路径遍历/时序攻击/输入校验/LLM 重试）
+- [x] 键盘组合键、右键点击、iframe 切换、SPA 检测
 
 ### 计划中
 
-- [ ] YAML 工作流定义（声明式多步骤）
-- [ ] 多浏览器实例并行执行
-- [ ] 插件系统（自定义工具扩展）
+- [ ] 多用户/多租户（API Key 隔离、用量统计）
 
 ## 🤝 贡献指南
 

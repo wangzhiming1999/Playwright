@@ -1,5 +1,16 @@
 # ── 工具定义（GPT 可调用的操作） ──────────────────────────────────────────────
 
+# 标记哪些 tool 会导致页面跳转（执行后需要中断剩余 action 队列）
+TERMINATES_SEQUENCE = {
+    "navigate",      # 导航到新 URL
+    "click",         # 可能触发页面跳转
+    "right_click",   # 右键可能触发导航
+    "press_key",     # Enter 可能提交表单
+    "type_text",     # press_enter=true 时可能提交
+    "switch_tab",    # 切换标签页
+    "download_file", # 可能触发下载跳转
+}
+
 TOOLS = [
     {
         "type": "function",
@@ -124,11 +135,16 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "press_key",
-            "description": "按下键盘按键，如 Enter、Tab、Escape 等",
+            "description": "按下键盘按键，支持组合键。如 Enter、Tab、Escape、Ctrl+C、Ctrl+Shift+T 等",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "key": {"type": "string", "description": "按键名称，如 Enter、Tab、Escape、ArrowDown"},
+                    "modifiers": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": ["Control", "Shift", "Alt", "Meta"]},
+                        "description": "修饰键列表（可选），如 [\"Control\"] 表示 Ctrl+key",
+                    },
                 },
                 "required": ["key"],
             },
@@ -362,6 +378,34 @@ TOOLS = [
                     "text": {"type": "string", "description": "要查找的文字内容（模糊匹配）"},
                 },
                 "required": ["text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "right_click",
+            "description": "右键点击页面上的元素，用于触发右键菜单。优先用截图中的元素编号（index），也可以用可见文字（text）。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "index": {"type": "integer", "description": "截图中元素的编号（红色数字标签），优先使用"},
+                    "text": {"type": "string", "description": "元素的可见文字，当不确定 index 时使用"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "switch_iframe",
+            "description": "切换到页面中的 iframe 内部进行操作。index=0 表示回到主页面。用于操作嵌入的表单、支付页面、验证码等 iframe 内容。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "index": {"type": "integer", "description": "iframe 元素的编号（截图中的红色数字标签），0 表示回到主页面"},
+                },
+                "required": ["index"],
             },
         },
     },

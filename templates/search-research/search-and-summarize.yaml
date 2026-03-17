@@ -1,0 +1,54 @@
+template:
+  id: search-and-summarize
+  category: search-research
+  tags: [search, research, summary]
+  icon: search
+  difficulty: beginner
+  estimated_time: "3-5 分钟"
+
+title: 搜索并总结
+description: 在搜索引擎中搜索关键词，提取前几条结果的标题和摘要
+
+parameters:
+  - key: search_query
+    type: string
+    description: 搜索关键词
+    required: true
+  - key: search_engine_url
+    type: string
+    description: 搜索引擎 URL
+    default: "https://www.bing.com"
+    required: false
+  - key: result_count
+    type: integer
+    description: 提取结果数量
+    default: 5
+    required: false
+
+blocks:
+  - block_type: navigation
+    label: open_search
+    url: "{{ search_engine_url }}"
+
+  - block_type: task
+    label: do_search
+    task: "在搜索框中输入「{{ search_query }}」并按回车执行搜索"
+
+  - block_type: extraction
+    label: get_results
+    data_extraction_goal: "提取前{{ result_count }}条搜索结果的标题、链接和摘要"
+    data_schema:
+      type: object
+      properties:
+        results:
+          type: array
+          description: 搜索结果列表
+          items:
+            type: object
+            properties:
+              title:
+                type: string
+              url:
+                type: string
+              snippet:
+                type: string

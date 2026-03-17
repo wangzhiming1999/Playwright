@@ -1,0 +1,50 @@
+template:
+  id: task-and-webhook
+  category: integration
+  tags: [webhook, notification, automation]
+  icon: webhook
+  difficulty: intermediate
+  estimated_time: "2-5 分钟"
+
+title: 执行任务并 Webhook 通知
+description: 执行浏览器任务后，将结果以 POST 请求发送到指定 Webhook URL，便于与钉钉、飞书、Slack 等集成
+
+parameters:
+  - key: task_description
+    type: string
+    description: 要执行的浏览器任务描述
+    required: true
+  - key: webhook_url
+    type: string
+    description: 接收结果的 Webhook URL（POST JSON）
+    required: true
+  - key: webhook_headers
+    type: json
+    description: 可选请求头（如 Authorization）
+    default: null
+    required: false
+
+blocks:
+  - block_type: task
+    label: run_task
+    task: "{{ task_description }}"
+
+  - block_type: code
+    label: build_payload
+    code: |
+      import json
+      task_result = ctx.get_output("run_task")
+      payload = {
+        "success": True,
+        "task": "{{ task_description }}",
+        "result": task_result,
+      }
+      _result_ = json.dumps(payload, ensure_ascii=False)
+
+  - block_type: http_request
+    label: notify_webhook
+    method: POST
+    url: "{{ webhook_url }}"
+    headers:
+      Content-Type: application/json
+    body: "{{ build_payload_output }}"

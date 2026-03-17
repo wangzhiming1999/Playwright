@@ -44,3 +44,19 @@ export function editGenerated(source: string, sourceId: string, field: string, v
 export function cleanup(keepLast = 20) {
   return api.post<{ deleted_tasks: number }>('/cleanup', { keep_last: keepLast });
 }
+
+export function retryTask(taskId: string) {
+  return api.post<{ task_id: string; retry_of: string }>(`/tasks/${taskId}/retry`);
+}
+
+export function getPool() {
+  return api.get<{ max_workers: number; running: number; queued: number; completed: number; failed: number }>('/pool');
+}
+
+export function resizePool(maxWorkers: number) {
+  return api.put<{ old_max_workers: number; new_max_workers: number }>('/pool', { max_workers: maxWorkers });
+}
+
+export function batchDeleteTasks(taskIds: string[]) {
+  return api.post<{ deleted: number; deleted_ids: string[] }>('/tasks/batch-delete', { task_ids: taskIds });
+}

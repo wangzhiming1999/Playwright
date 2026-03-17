@@ -1,0 +1,30 @@
+template:
+  id: session-keep-alive
+  category: login-session
+  tags: [session, keep-alive, heartbeat]
+  icon: heartbeat
+  difficulty: beginner
+  estimated_time: "1-2 分钟"
+
+title: 会话保活
+description: 访问需要登录的页面以刷新会话，防止登录过期；适合与定时任务配合
+
+parameters:
+  - key: keep_alive_url
+    type: string
+    description: 用于保活的页面 URL（需已登录状态下可访问）
+    required: true
+  - key: success_hint
+    type: string
+    description: 页面加载成功时的特征（用于验证仍处于登录状态）
+    default: "能看到用户信息或主导航"
+    required: false
+
+blocks:
+  - block_type: navigation
+    label: visit_page
+    url: "{{ keep_alive_url }}"
+
+  - block_type: task
+    label: verify_session
+    task: "确认当前页面{{ success_hint }}，若已退出登录则说明会话已过期"

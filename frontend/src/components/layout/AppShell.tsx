@@ -24,6 +24,9 @@ export function AppShell() {
           <Link to="/workflows" className={location.pathname.startsWith('/workflows') ? 'active' : ''}>
             工作流
           </Link>
+          <Link to="/templates" className={location.pathname.startsWith('/templates') ? 'active' : ''}>
+            模板市场
+          </Link>
           <Link to="/settings" className={location.pathname === '/settings' ? 'active' : ''}>
             设置
           </Link>

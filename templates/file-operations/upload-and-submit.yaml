@@ -1,0 +1,38 @@
+template:
+  id: upload-and-submit
+  category: file-operations
+  tags: [upload, file, submit, form]
+  icon: upload
+  difficulty: intermediate
+  estimated_time: "3-6 分钟"
+
+title: 上传文件并提交
+description: 在已打开的页面或指定页面上找到上传区域，选择文件并提交表单
+
+parameters:
+  - key: page_url
+    type: string
+    description: 包含上传功能的页面 URL
+    required: true
+  - key: file_path
+    type: string
+    description: 要上传的本地文件路径
+    required: true
+  - key: submit_instruction
+    type: string
+    description: 上传后如何提交（如「点击提交按钮」「点击确认上传」）
+    default: "点击提交或确认按钮完成上传"
+    required: false
+
+blocks:
+  - block_type: navigation
+    label: open_upload_page
+    url: "{{ page_url }}"
+
+  - block_type: file_upload
+    label: upload_file
+    file_path: "{{ file_path }}"
+
+  - block_type: task
+    label: submit_form
+    task: "{{ submit_instruction }}"

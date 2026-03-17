@@ -1,0 +1,90 @@
+template:
+  id: compare-prices
+  category: search-research
+  tags: [price, comparison, e-commerce, research]
+  icon: bar-chart
+  difficulty: intermediate
+  estimated_time: "5-10 分钟"
+
+title: 多商品比价
+description: 依次打开多个商品链接，提取价格等信息并汇总比较，输出最低价及来源
+
+parameters:
+  - key: product_urls
+    type: string
+    description: 商品页面 URL 列表（JSON 数组字符串或逗号分隔）
+    required: true
+  - key: product_names
+    type: string
+    description: 可选商品名称列表（与 URL 一一对应，便于识别）
+    default: ""
+    required: false
+
+blocks:
+  - block_type: code
+    label: parse_urls
+    code: |
+      import json
+      raw = "{{ product_urls }}".strip()
+      if raw.startswith("["):
+        urls = json.loads(raw)
+      else:
+        urls = [u.strip() for u in raw.split(",") if u.strip()]
+      names_raw = "{{ product_names }}".strip()
+      names = json.loads(names_raw) if names_raw and names_raw.startswith("[") else (names_raw.split(",") if names_raw else [])
+      names = [n.strip() for n in names] if names else [f"商品{i+1}" for i in range(len(urls))]
+      while len(names) < len(urls):
+        names.append(f"商品{len(names)+1}")
+      _result_ = {"urls": urls, "names": names[:len(urls)]}
+
+  - block_type: for_loop
+    label: loop_products
+    loop_over: "{{ parse_urls_output.urls }}"
+    blocks:
+      - block_type: navigation
+        label: open_product
+        url: "{{ current_value }}"
+
+      - block_type: extraction
+        label: get_price
+        data_extraction_goal: "提取当前商品页面的价格（主售价）"
+        data_schema:
+          type: object
+          properties:
+            price:
+              type: string
+            currency:
+              type: string
+
+  - block_type: code
+    label: compare
+    code: |
+      import json
+      loop_results = ctx.get_output("loop_products") or []
+      meta = ctx.get_output("parse_urls") or {}
+      urls = meta.get("urls", [])
+      names = meta.get("names", [])
+      rows = []
+      for i, it in enumerate(loop_results):
+        out = it.get("get_price") or {}
+        price_str = out.get("price", "0")
+        try:
+          p = float("".join(c for c in str(price_str) if c.isdigit() or c == ".") or "0")
+        except Exception:
+          p = 0
+        rows.append({
+          "name": names[i] if i < len(names) else f"商品{i+1}",
+          "url": urls[i] if i < len(urls) else "",
+          "price": price_str,
+          "price_number": p,
+        })
+      if not rows:
+        _result_ = {"message": "无有效价格数据", "items": []}
+      else:
+        best = min(rows, key=lambda x: x["price_number"])
+        _result_ = {
+          "items": rows,
+          "lowest_price": best["price"],
+          "lowest_from": best["name"],
+          "lowest_url": best["url"],
+        }

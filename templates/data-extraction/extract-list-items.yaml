@@ -1,0 +1,51 @@
+template:
+  id: extract-list-items
+  category: data-extraction
+  tags: [list, items, scraping, structured]
+  icon: list
+  difficulty: beginner
+  estimated_time: "2-5 分钟"
+
+title: 列表项提取
+description: 从列表页（如商品列表、新闻列表、目录）提取每一项的标题、链接及可选字段
+
+parameters:
+  - key: list_url
+    type: string
+    description: 列表页 URL
+    required: true
+  - key: item_description
+    type: string
+    description: 列表项描述（帮助定位，如「新闻标题卡片」「商品条目」）
+    default: "列表中的每一项"
+    required: false
+  - key: max_items
+    type: integer
+    description: 最多提取条数
+    default: 20
+    required: false
+
+blocks:
+  - block_type: navigation
+    label: open_list
+    url: "{{ list_url }}"
+
+  - block_type: extraction
+    label: extract_items
+    data_extraction_goal: "找到{{ item_description }}，提取前 {{ max_items }} 条，每条包含标题、链接及可见的关键信息"
+    data_schema:
+      type: object
+      properties:
+        items:
+          type: array
+          description: 列表项数组
+          items:
+            type: object
+            properties:
+              title:
+                type: string
+              url:
+                type: string
+              summary:
+                type: string
+                description: 可选摘要或副标题
