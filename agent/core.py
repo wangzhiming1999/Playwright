@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 
 from playwright.async_api import Page
-from page_annotator import get_element_coords
+from page_annotator import get_element_coords, get_last_elements
 
 from .page_utils import _safe_print, _wait_for_page_ready
 from .llm_helpers import robust_json_loads
@@ -50,6 +50,19 @@ class BrowserAgent:
         _safe_print(msg)
         if self._log_fn:
             await self._log_fn(msg)
+
+    def _validate_index(self, index: int) -> str | None:
+        """校验 index 是否在有效范围内，返回错误消息或 None。"""
+        elements = get_last_elements()
+        if not elements:
+            return None  # 没有元素列表时不校验
+        max_idx = max(el.get("index", 0) for el in elements)
+        if index < 0 or index > max_idx:
+            return (
+                f"操作失败: index={index} 超出有效范围 0~{max_idx}。"
+                "请查看截图中的蓝色编号，使用有效的 index 重试。"
+            )
+        return None
 
     async def _click_and_wait(self, x: int, y: int, check_navigation: bool = True) -> str:
         """
@@ -294,6 +307,14 @@ class BrowserAgent:
                             await self._log(f"  ⚠ 导航失败 (尝试 {nav_attempt+1}/{max_nav_retries}): {e}，1秒后重试...")
                             await asyncio.sleep(1)
                         else:
+                            # 降级：只等待 commit（不等 domcontentloaded），适用于超慢页面
+                            try:
+                                await page.goto(url, wait_until="commit", timeout=15000)
+                                self._active_requests.clear()
+                                await asyncio.sleep(1)
+                                return f"已打开 {url}（页面可能仍在加载）"
+                            except Exception:
+                                pass
                             return f"操作失败: 导航到 {url} 失败（已重试{max_nav_retries}次）— {e}"
 
             elif tool_name == "click":
@@ -302,12 +323,41 @@ class BrowserAgent:
 
                 # 优先用回退链定位（skyvern-id → CSS → XPath → 缓存坐标）
                 if index is not None:
+                    idx_err = self._validate_index(index)
+                    if idx_err:
+                        return idx_err
                     try:
                         el_info = await get_element_coords(page, index)
                         if el_info:
                             x, y = el_info["x"], el_info["y"]
                             method = el_info.get("method", "skyvern-id")
                             await self._log(f"  [点击] #{index} → ({x}, {y}) tag={el_info.get('tag','')} method={method}")
+
+                            # 遮挡检测：检查目标坐标处的顶层元素是否是目标元素
+                            is_covered = await self._safe_evaluate(
+                                f"""() => {{
+                                    const el = document.querySelector('[data-skyvern-id="{index}"]');
+                                    if (!el) return false;
+                                    const r = el.getBoundingClientRect();
+                                    const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+                                    const top = document.elementFromPoint(cx, cy);
+                                    return top !== el && !el.contains(top) && !(top && top.contains(el));
+                                }}""",
+                                default=False,
+                            )
+                            if is_covered:
+                                await self._log(f"  [点击] #{index} 被遮挡，尝试滚动到可见")
+                                await self._safe_evaluate(
+                                    f"""() => {{
+                                        const el = document.querySelector('[data-skyvern-id="{index}"]');
+                                        if (el) el.scrollIntoView({{block: 'center', behavior: 'instant'}});
+                                    }}"""
+                                )
+                                await asyncio.sleep(0.3)
+                                el_info = await get_element_coords(page, index)
+                                if el_info:
+                                    x, y = el_info["x"], el_info["y"]
+
                             await self._click_and_wait(x, y)
                             return "点击成功"
                         else:
@@ -363,6 +413,9 @@ class BrowserAgent:
 
                 # 优先路径：用回退链定位（skyvern-id → CSS → XPath → 缓存坐标）
                 if annotation_index is not None:
+                    idx_err = self._validate_index(annotation_index)
+                    if idx_err:
+                        return idx_err
                     try:
                         el_info = await get_element_coords(page, annotation_index)
                         if el_info:
@@ -637,6 +690,9 @@ class BrowserAgent:
                 text = args.get("text")
 
                 if index is not None:
+                    idx_err = self._validate_index(index)
+                    if idx_err:
+                        return idx_err
                     try:
                         el_info = await get_element_coords(page, index)
                         if el_info:
@@ -675,6 +731,9 @@ class BrowserAgent:
                 text = args.get("text")
 
                 if index is not None:
+                    idx_err = self._validate_index(index)
+                    if idx_err:
+                        return idx_err
                     try:
                         el_info = await get_element_coords(page, index)
                         if el_info:
@@ -747,6 +806,9 @@ class BrowserAgent:
 
                 if index is None:
                     return "操作失败: 需要提供 index 参数"
+                idx_err = self._validate_index(index)
+                if idx_err:
+                    return idx_err
 
                 try:
                     el_info = await get_element_coords(page, index)

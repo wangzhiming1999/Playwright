@@ -34,7 +34,7 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "index": {"type": "integer", "description": "截图中元素的编号（红色数字标签），优先使用"},
+                    "index": {"type": "integer", "description": "截图中元素的编号（蓝色数字标签），优先使用"},
                     "text": {"type": "string", "description": "元素的可见文字，当不确定 index 时使用"},
                 },
             },
@@ -48,27 +48,13 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "index": {"type": "integer", "description": "截图中输入框的编号（红色数字标签），优先使用，比 description 更准确"},
+                    "index": {"type": "integer", "description": "截图中输入框的编号（蓝色数字标签），优先使用，比 description 更准确"},
                     "description": {"type": "string", "description": "输入框的描述，如'邮箱输入框'、'密码框'、'搜索框'，当不确定 index 时使用"},
                     "text": {"type": "string", "description": "要输入的内容"},
                     "press_enter": {"type": "boolean", "description": "输入后是否按 Enter"},
                     "is_password": {"type": "boolean", "description": "是否为密码，设为 true 时日志中不显示内容"},
                 },
                 "required": ["text"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_credentials",
-            "description": "从环境变量获取某站点的登录账号和密码，用于登录流程。站点 key 示例：felo_ai 对应 FELO_AI_EMAIL、FELO_AI_PASSWORD",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "site_key": {"type": "string", "description": "站点标识，如 felo_ai、github，对应环境变量 FELO_AI_EMAIL/FELO_AI_PASSWORD、GITHUB_EMAIL/GITHUB_PASSWORD"},
-                },
-                "required": ["site_key"],
             },
         },
     },
@@ -192,7 +178,7 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "index": {"type": "integer", "description": "截图中元素的编号（红色数字标签），优先使用"},
+                    "index": {"type": "integer", "description": "截图中元素的编号（蓝色数字标签），优先使用"},
                     "text": {"type": "string", "description": "元素的可见文字，当不确定 index 时使用"},
                 },
             },
@@ -206,7 +192,7 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "index": {"type": "integer", "description": "截图中 select 元素的编号（红色数字标签）"},
+                    "index": {"type": "integer", "description": "截图中 select 元素的编号（蓝色数字标签）"},
                     "value": {"type": "string", "description": "选项的 value 属性值或可见文字"},
                 },
                 "required": ["index", "value"],
@@ -389,7 +375,7 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "index": {"type": "integer", "description": "截图中元素的编号（红色数字标签），优先使用"},
+                    "index": {"type": "integer", "description": "截图中元素的编号（蓝色数字标签），优先使用"},
                     "text": {"type": "string", "description": "元素的可见文字，当不确定 index 时使用"},
                 },
             },
@@ -403,9 +389,23 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "index": {"type": "integer", "description": "iframe 元素的编号（截图中的红色数字标签），0 表示回到主页面"},
+                    "index": {"type": "integer", "description": "iframe 元素的编号（截图中的蓝色数字标签），0 表示回到主页面"},
                 },
                 "required": ["index"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_credentials",
+            "description": "从环境变量获取某站点的登录账号和密码，用于登录流程。站点 key 示例：felo_ai 对应 FELO_AI_EMAIL、FELO_AI_PASSWORD",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "site_key": {"type": "string", "description": "站点标识，如 felo_ai、github，对应环境变量 FELO_AI_EMAIL/FELO_AI_PASSWORD、GITHUB_EMAIL/GITHUB_PASSWORD"},
+                },
+                "required": ["site_key"],
             },
         },
     },

@@ -63,6 +63,10 @@ _ANNOTATE_JS = """() => {
         if (tag === 'input' && el.type === 'hidden') return false;
         if (['script', 'style', 'noscript', 'meta', 'head'].includes(tag)) return false;
 
+        // 排除 aria-hidden 和 disabled 元素
+        if (el.getAttribute('aria-hidden') === 'true') return false;
+        if (el.disabled || el.getAttribute('aria-disabled') === 'true') return false;
+
         // 1. 原生交互标签
         if (INTERACTIVE_TAGS.has(tag)) return true;
 
@@ -141,6 +145,37 @@ _ANNOTATE_JS = """() => {
     }
     walk(document.body);
 
+    // ── 大页面优化：>500 元素时只保留视口 ± 200px ──
+    if (interactables.length > 500) {
+        const vpTop = -200;
+        const vpBottom = window.innerHeight + 200;
+        const viewport_els = interactables.filter(el => {
+            const r = el.getBoundingClientRect();
+            return r.top >= vpTop && r.top <= vpBottom;
+        });
+        if (viewport_els.length >= 20) {
+            interactables.length = 0;
+            interactables.push(...viewport_els);
+        }
+    }
+
+    // ── 父子去重：<a> 内的 <img> 只标注外层 <a> ──
+    const deduped = [];
+    for (let i = 0; i < interactables.length; i++) {
+        const el = interactables[i];
+        let dominated = false;
+        const parent = el.parentElement;
+        if (parent && seen.has(parent)) {
+            const pTag = parent.tagName.toLowerCase();
+            if (['a', 'button'].includes(pTag)) {
+                dominated = true;
+            }
+        }
+        if (!dominated) deduped.push(el);
+    }
+    interactables.length = 0;
+    interactables.push(...deduped);
+
     // 按 DOM 顺序排序（从上到下、从左到右）
     interactables.sort((a, b) => {
         const ra = a.getBoundingClientRect();
@@ -152,7 +187,55 @@ _ANNOTATE_JS = """() => {
     // ── 标注 + 构建元素信息 ──
 
     const elements = [];
-    const labelRects = [];  // 已放置的标签矩形，用于避让
+
+    // 网格分区避让（替代 O(n²) 暴力碰撞检测）
+    const GRID_SIZE = 50;
+    const labelGrid = {};
+
+    function gridKey(x, y) { return Math.floor(x/GRID_SIZE) + ',' + Math.floor(y/GRID_SIZE); }
+
+    function addToGrid(rect) {
+        for (let gx = Math.floor(rect.left/GRID_SIZE); gx <= Math.floor(rect.right/GRID_SIZE); gx++) {
+            for (let gy = Math.floor(rect.top/GRID_SIZE); gy <= Math.floor(rect.bottom/GRID_SIZE); gy++) {
+                const k = gx + ',' + gy;
+                if (!labelGrid[k]) labelGrid[k] = [];
+                labelGrid[k].push(rect);
+            }
+        }
+    }
+
+    function checkOverlap(newRect) {
+        for (let gx = Math.floor(newRect.left/GRID_SIZE); gx <= Math.floor(newRect.right/GRID_SIZE); gx++) {
+            for (let gy = Math.floor(newRect.top/GRID_SIZE); gy <= Math.floor(newRect.bottom/GRID_SIZE); gy++) {
+                const k = gx + ',' + gy;
+                for (const existing of (labelGrid[k] || [])) {
+                    if (!(newRect.right < existing.left || newRect.left > existing.right ||
+                          newRect.bottom < existing.top || newRect.top > existing.bottom)) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    // 元素类型 → 颜色映射
+    const TYPE_COLORS = {
+        'input':    'rgba(76, 175, 80, 0.7)',   // 绿色 — 输入框
+        'textarea': 'rgba(76, 175, 80, 0.7)',
+        'button':   'rgba(33, 150, 243, 0.7)',  // 蓝色 — 按钮
+        'a':        'rgba(156, 39, 176, 0.7)',  // 紫色 — 链接
+        'select':   'rgba(255, 152, 0, 0.7)',   // 橙色 — 下拉框
+        'img':      'rgba(233, 30, 99, 0.7)',   // 粉色 — 图片/媒体
+        'video':    'rgba(233, 30, 99, 0.7)',
+        'canvas':   'rgba(233, 30, 99, 0.7)',
+    };
+
+    // 类型缩写
+    const TYPE_ABBR = {
+        'input': 'I', 'textarea': 'T', 'button': 'B', 'a': 'L',
+        'select': 'S', 'img': 'P', 'video': 'V', 'details': 'D',
+    };
 
     // 构建 CSS selector（用于回退定位）
     function buildSelector(el) {
@@ -199,9 +282,8 @@ _ANNOTATE_JS = """() => {
         return '//' + parts.join('/');
     }
 
-    // 标签避让：找到不重叠的位置
+    // 标签避让：找到不重叠的位置（使用网格分区）
     function findLabelPosition(rect, labelW, labelH) {
-        // 候选位置：右上角、左上角、右下角、左下角、正上方居中
         const candidates = [
             { x: Math.min(rect.right - labelW, window.innerWidth - labelW - 2), y: Math.max(rect.top - labelH - 2, 2) },
             { x: Math.max(rect.left, 2), y: Math.max(rect.top - labelH - 2, 2) },
@@ -212,59 +294,57 @@ _ANNOTATE_JS = """() => {
 
         for (const pos of candidates) {
             const newRect = { left: pos.x, top: pos.y, right: pos.x + labelW, bottom: pos.y + labelH };
-            let overlaps = false;
-            for (const existing of labelRects) {
-                if (!(newRect.right < existing.left || newRect.left > existing.right ||
-                      newRect.bottom < existing.top || newRect.top > existing.bottom)) {
-                    overlaps = true;
-                    break;
-                }
-            }
-            if (!overlaps) {
-                labelRects.push(newRect);
+            if (!checkOverlap(newRect)) {
+                addToGrid(newRect);
                 return pos;
             }
         }
 
         // 所有候选都重叠，用第一个（右上角）
         const fallback = candidates[0];
-        labelRects.push({ left: fallback.x, top: fallback.y, right: fallback.x + labelW, bottom: fallback.y + labelH });
+        const fRect = { left: fallback.x, top: fallback.y, right: fallback.x + labelW, bottom: fallback.y + labelH };
+        addToGrid(fRect);
         return fallback;
     }
 
     interactables.forEach((el, index) => {
         const rect = el.getBoundingClientRect();
+        const tag = el.tagName.toLowerCase();
 
         // 打上稳定 ID
         el.setAttribute('data-skyvern-id', String(index));
 
-        // 蓝色边框（参考 Skyvern 风格）
+        // 按元素类型着色
+        const borderColor = TYPE_COLORS[tag] || 'rgba(30, 100, 255, 0.7)';
+        const bgColor = borderColor.replace('0.7)', '0.85)');
+
         const box = document.createElement('div');
         box.className = 'skyvern-label';
         box.style.cssText = `
             position: fixed;
             left: ${rect.left}px; top: ${rect.top}px;
             width: ${rect.width}px; height: ${rect.height}px;
-            border: 2px solid rgba(30, 100, 255, 0.7);
+            border: 2px solid ${borderColor};
             pointer-events: none;
             z-index: 2147483646;
             box-sizing: border-box;
             border-radius: 2px;
         `;
 
-        // 编号标签（带避让）
-        const labelText = String(index);
+        // 编号标签：类型缩写 + 编号（如 I3, B5, L12）
+        const abbr = TYPE_ABBR[tag] || '';
+        const labelText = abbr ? abbr + index : String(index);
         const labelW = Math.max(18, labelText.length * 8 + 8);
         const labelH = 18;
         const pos = findLabelPosition(rect, labelW, labelH);
 
         const label = document.createElement('div');
         label.className = 'skyvern-label';
-        label.textContent = index;
+        label.textContent = labelText;
         label.style.cssText = `
             position: fixed;
             left: ${pos.x}px; top: ${pos.y}px;
-            background: rgba(30, 100, 255, 0.85);
+            background: ${bgColor};
             color: white;
             padding: 1px 4px;
             font-size: 11px;
@@ -283,9 +363,8 @@ _ANNOTATE_JS = """() => {
         document.body.appendChild(label);
 
         // 构建元素信息
-        const tag = el.tagName.toLowerCase();
 
-        // 装饰性元素标记：SVG icon < 24x24、空文本的 span/div、纯装饰图片
+        // 装饰性元素标记
         let is_decorative = false;
         if (tag === 'svg' || (tag === 'img' && rect.width < 24 && rect.height < 24)) {
             is_decorative = true;
@@ -293,17 +372,40 @@ _ANNOTATE_JS = """() => {
             is_decorative = true;
         }
 
+        // 文本截取优化：按元素类型调整长度
+        const rawText = (el.textContent || el.value || '').trim();
+        let textLimit = 50;
+        if (tag === 'input' || tag === 'textarea') textLimit = 100;
+        else if (tag === 'button' || tag === 'a') textLimit = 30;
+        const text = rawText.substring(0, textLimit);
+
+        // label 关联：查找 input/textarea/select 的关联 label
+        let assocLabel = '';
+        if (['input', 'textarea', 'select'].includes(tag)) {
+            if (el.id) {
+                try {
+                    const lbl = document.querySelector('label[for="' + CSS.escape(el.id) + '"]');
+                    if (lbl) assocLabel = lbl.textContent.trim().substring(0, 30);
+                } catch(e) {}
+            }
+            if (!assocLabel) {
+                const parentLabel = el.closest('label');
+                if (parentLabel) assocLabel = parentLabel.textContent.trim().substring(0, 30);
+            }
+        }
+
         const info = {
             index: index,
             tag: tag,
             type: el.type || '',
-            text: (el.textContent || el.value || '').trim().substring(0, 50),
+            text: text,
             placeholder: el.placeholder || el.getAttribute('data-placeholder') || '',
             name: el.name || '',
             id: el.id || '',
             href: (tag === 'a' ? el.href : '') || '',
             aria_label: el.getAttribute('aria-label') || '',
             role: el.getAttribute('role') || '',
+            label: assocLabel,
             x: Math.round(rect.left + rect.width / 2),
             y: Math.round(rect.top + rect.height / 2),
             w: Math.round(rect.width),
@@ -405,6 +507,11 @@ _LOCATE_BY_XPATH_JS = """(xpath) => {
 _last_elements: list[dict] = []
 
 
+def get_last_elements() -> list[dict]:
+    """返回上一次标注的元素列表（供 index 校验使用）。"""
+    return _last_elements
+
+
 # ── 公开 API ─────────────────────────────────────────────────────────────────
 
 async def annotate_page(page):
@@ -423,7 +530,14 @@ async def annotate_page(page):
 
     await asyncio.sleep(0.3)
 
-    screenshot = await page.screenshot(type="jpeg", quality=60)
+    try:
+        screenshot = await page.screenshot(type="jpeg", quality=60, timeout=10000)
+    except Exception:
+        # 超时降级：禁用动画、不等待字体
+        screenshot = await page.screenshot(
+            type="jpeg", quality=50, timeout=10000,
+            animations="disabled",
+        )
     img_b64 = base64.b64encode(screenshot).decode()
 
     # 移除视觉标注，但保留 data-skyvern-id（execute 还要用）

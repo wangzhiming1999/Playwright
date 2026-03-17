@@ -136,6 +136,20 @@ async def _wait_for_page_ready(page, log_fn=None, timeout_ms: int = 15000, check
         pass
 
     # 3+4. 同时监测网络和内容，双条件满足才返回
+    # 注入 MutationObserver 辅助检测 DOM 变化率
+    try:
+        await page.evaluate("""() => {
+            if (window.__mutationCount !== undefined) return;
+            window.__mutationCount = 0;
+            const observer = new MutationObserver(mutations => {
+                window.__mutationCount += mutations.length;
+            });
+            observer.observe(document.body, { childList: true, subtree: true, characterData: true });
+            setTimeout(() => observer.disconnect(), 10000);
+        }""")
+    except Exception:
+        pass
+
     try:
         prev_len = await page.evaluate("() => document.body?.innerText?.length || 0")
     except Exception:
@@ -159,9 +173,24 @@ async def _wait_for_page_ready(page, log_fn=None, timeout_ms: int = 15000, check
             network_idle_count = 0
             has_seen_activity = True
 
-        # 检查内容
+        # 检查内容（复合指纹：文本长度 + DOM 子元素数 + loading 指示器 + mutation 变化率）
         try:
-            curr_len = await page.evaluate("() => document.body?.innerText?.length || 0")
+            fingerprint = await page.evaluate("""() => {
+                const body = document.body;
+                if (!body) return { textLen: 0, childCount: 0, hasSpinner: false, mutations: 0 };
+                const textLen = (body.innerText || '').length;
+                const childCount = body.querySelectorAll('*').length;
+                const hasSpinner = !!(
+                    document.querySelector('.loading, .spinner, [class*="skeleton"], [class*="loading"]') ||
+                    document.querySelector('[aria-busy="true"]')
+                );
+                const mutations = window.__mutationCount || 0;
+                window.__mutationCount = 0;
+                return { textLen, childCount, hasSpinner, mutations };
+            }""")
+            curr_len = fingerprint.get("textLen", 0) + fingerprint.get("childCount", 0)
+            has_spinner = fingerprint.get("hasSpinner", False)
+            mutation_rate = fingerprint.get("mutations", 0)
         except Exception:
             # 页面正在导航，重置一切
             curr_len = prev_len
@@ -171,7 +200,11 @@ async def _wait_for_page_ready(page, log_fn=None, timeout_ms: int = 15000, check
             continue
 
         delta = abs(curr_len - prev_len)
-        if delta < 10:
+        # 有 spinner 或高 mutation 率时强制不算稳定
+        if has_spinner or mutation_rate > 5:
+            content_stable_count = 0
+            has_seen_activity = True
+        elif delta < 10:
             content_stable_count += 1
         else:
             content_stable_count = 0

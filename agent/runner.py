@@ -24,6 +24,7 @@ from .loop_detector import ActionLoopDetector
 from .plan_manager import PlanManager
 from .watchdog import Watchdog, EventType
 from .action_registry import load_custom_actions, get_custom_tools
+from .cost_tracker import CostTracker
 
 from utils import llm_chat
 from page_annotator import annotate_page
@@ -331,11 +332,11 @@ async def run_agent(
         messages = [
             {
                 "role": "system",
-                "content": _SYSTEM_PROMPT_STATIC + _cred_hint,
+                "content": _SYSTEM_PROMPT_STATIC,  # 纯静态，利用 prompt caching
             },
             {
                 "role": "user",
-                "content": f"任务：{task_for_gpt}",
+                "content": f"任务：{task_for_gpt}" + (_cred_hint if _cred_hint else ""),
             },
         ]
 
@@ -354,6 +355,7 @@ async def run_agent(
         last_tool_pressed_enter = False
         _last_content_hash = None  # 用于截图复用：检测 DOM 是否变化
         _pending_nudges: list[str] = []  # 缓存 nudge 消息，下一轮截图时注入（避免打断 tool_result 顺序）
+        cost_tracker = CostTracker()  # 成本追踪
 
         # ── 智能错误恢复 + 熔断器 + 循环检测 ──────────────────────────────────
         failure_tracker = FailureTracker()
@@ -454,7 +456,7 @@ async def run_agent(
                 except Exception as e:
                     await _log(f"  ⚠ 页面标注失败: {e}，使用普通截图")
                     try:
-                        raw = await agent.page.screenshot(type="jpeg", quality=60)
+                        raw = await agent.page.screenshot(type="jpeg", quality=60, timeout=10000)
                         img_b64 = base64.b64encode(raw).decode()
                         elements = []
                     except Exception as e2:
@@ -463,6 +465,10 @@ async def run_agent(
                 _last_content_hash = _cur_hash
 
             elements_summary = trim_elements(elements)
+
+            # 计算有效 index 范围，注入到 prompt 防止 LLM 幻觉
+            max_index = max((el.get("index", 0) for el in elements), default=-1) if elements else -1
+            index_hint = f"⚠️ 有效 index 范围: 0~{max_index}，不要使用超出此范围的 index。\n" if max_index >= 0 else ""
 
             # 保存标注截图，方便调试，并实时推送给前端
             debug_path = screenshots_dir / f"step_{step+1:02d}_annotated.jpg"
@@ -489,9 +495,10 @@ async def run_agent(
                     {
                         "type": "text",
                         "text": (
-                            f"第{step+1}步，当前页面截图（红框+编号标注了所有可交互元素）：\n"
+                            f"第{step+1}步，当前页面截图（蓝框+编号标注了所有可交互元素）：\n"
                             f"{nudge_text}"
                             f"{plan_manager.format_hint()}"
+                            f"{index_hint}"
                             f"元素列表: {elements_summary}\n"
                             "根据截图判断当前状态，调用工具推进任务（可一次返回多个工具调用）。"
                             "操作时用元素的 index 编号，不要猜 selector 或坐标。"
@@ -531,6 +538,11 @@ async def run_agent(
                         max_tokens=2000,  # 增大以支持多 action 返回
                     )
                     llm_breaker.record_success()
+                    # 记录 token 消耗
+                    if response and hasattr(response, 'usage') and response.usage:
+                        from utils import _resolve_model as _rm
+                        _actual_model, _ = _rm(None)
+                        cost_tracker.record(model=_actual_model, usage=response.usage, purpose="main_loop")
                     break  # 成功
                 except Exception as e:
                     _llm_last_error = e
@@ -844,8 +856,20 @@ async def run_agent(
                 if task_reason == "未知":
                     task_reason = "任务已完成（截图已保存）"
 
+        # 输出成本统计
+        cost_summary = cost_tracker.summary()
+        if cost_summary["total_calls"] > 0:
+            await _log(
+                f"\n💰 [成本统计] 调用 {cost_summary['total_calls']} 次, "
+                f"输入 {cost_summary['total_input_tokens']} tokens, "
+                f"输出 {cost_summary['total_output_tokens']} tokens, "
+                f"缓存命中 {cost_summary['cache_hit_rate']*100:.0f}%, "
+                f"成本 ${cost_summary['total_cost_usd']}"
+            )
+
         return {
             "success": task_success,
             "reason": task_reason,
             "steps": steps_executed,
+            "cost": cost_summary,
         }

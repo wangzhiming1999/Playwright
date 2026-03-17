@@ -146,12 +146,23 @@ class _Function:
 
 class _WrappedResponse:
     """Unified response wrapper — both backends produce this."""
-    def __init__(self, choices):
+    def __init__(self, choices, usage=None):
         self.choices = choices
+        self.usage = usage or {}
 
     @classmethod
     def from_openai(cls, resp):
         """Wrap native OpenAI response."""
+        usage = {}
+        if hasattr(resp, 'usage') and resp.usage:
+            cached = 0
+            if hasattr(resp.usage, 'prompt_tokens_details') and resp.usage.prompt_tokens_details:
+                cached = getattr(resp.usage.prompt_tokens_details, 'cached_tokens', 0) or 0
+            usage = {
+                "input_tokens": resp.usage.prompt_tokens or 0,
+                "output_tokens": resp.usage.completion_tokens or 0,
+                "cached_tokens": cached,
+            }
         choices = []
         for c in resp.choices:
             m = c.message
@@ -166,11 +177,21 @@ class _WrappedResponse:
                 content=m.content,
                 tool_calls=tool_calls,
             )))
-        return cls(choices)
+        return cls(choices, usage=usage)
 
     @classmethod
     def from_anthropic(cls, resp):
         """Wrap native Anthropic response."""
+        usage = {}
+        if hasattr(resp, 'usage') and resp.usage:
+            input_tokens = getattr(resp.usage, 'input_tokens', 0) or 0
+            output_tokens = getattr(resp.usage, 'output_tokens', 0) or 0
+            cached = getattr(resp.usage, 'cache_read_input_tokens', 0) or 0
+            usage = {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cached_tokens": cached,
+            }
         content_text = ""
         tool_calls = []
         for block in resp.content:
@@ -187,7 +208,7 @@ class _WrappedResponse:
             content=content_text or None,
             tool_calls=tool_calls if tool_calls else None,
         )
-        return cls([_Choice(msg)])
+        return cls([_Choice(msg)], usage=usage)
 
 
 # ── Anthropic format converters ──────────────────────────────────────────────
