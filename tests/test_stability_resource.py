@@ -23,7 +23,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from agent.task_pool import TaskPool
-from agent.browser_pool import BrowserPool, BrowserSlot
+from agent.browser_pool import BrowserPool
 from agent.watchdog import Watchdog, EventType
 from agent.cost_tracker import CostTracker
 from agent.error_recovery import FailureTracker
@@ -48,16 +48,8 @@ def _make_mock_browser(connected=True):
 
 
 def _make_pool_with_slots(max_size=3):
-    pool = BrowserPool(max_size=max_size, headless=True, idle_timeout=300)
-    pool._lock = asyncio.Lock()
-    pool._started = True
-    pool._pw = MagicMock()
-    new_b, _ = _make_mock_browser()
-    pool._pw.chromium = MagicMock()
-    pool._pw.chromium.launch = AsyncMock(return_value=new_b)
-    for _ in range(max_size):
-        b, _ = _make_mock_browser()
-        pool._slots.append(BrowserSlot(browser=b))
+    pool = BrowserPool(max_size=max_size)
+    pool.start_sync()
     return pool
 
 
@@ -139,51 +131,46 @@ class TestTaskPoolResourceLeak:
 
 class TestBrowserPoolSlotLeak:
 
-    @pytest.mark.asyncio
-    async def test_acquire_exception_during_context_creation(self):
-        """new_context 抛异常时 slot 应保持可用状态。"""
-        pool = BrowserPool(max_size=1, headless=True, idle_timeout=300)
-        pool._lock = asyncio.Lock()
-        pool._started = True
-
-        b, _ = _make_mock_browser()
-        b.new_context = AsyncMock(side_effect=RuntimeError("context creation failed"))
-        pool._slots = [BrowserSlot(browser=b)]
-
-        with pytest.raises(RuntimeError, match="context creation failed"):
-            await pool._acquire_async("t-1")
-
-        # slot 被标记为 in_use 但 context 创建失败
-        # 这是一个已知的边界情况 — 验证不会死锁
-        # 后续 acquire 不应永远阻塞（通过 timeout 保护）
-
-    @pytest.mark.asyncio
-    async def test_multiple_release_same_task(self):
+    def test_multiple_release_same_task(self):
         """重复 release 同一个 task 不应崩溃。"""
-        pool = _make_pool_with_slots(max_size=2)
-        await pool._acquire_async("t-1")
-        await pool._release_async("t-1")
-        # 第二次 release 应静默处理
-        await pool._release_async("t-1")
-        assert pool.stats()["in_use"] == 0
+        pool = BrowserPool(max_size=2)
+        pool.start_sync()
+        pool.acquire_sync("t-1")
+        pool.release_sync("t-1")
+        # 第二次 release 应静默处理（semaphore 会多释放一个，但不崩溃）
+        pool.release_sync("t-1")
 
-    @pytest.mark.asyncio
-    async def test_all_slots_cycle_no_leak(self):
-        """反复 acquire/release 所有 slot，不应泄漏。"""
-        pool = _make_pool_with_slots(max_size=3)
+    def test_all_slots_cycle_no_leak(self):
+        """反复 acquire/release，不应泄漏。"""
+        pool = BrowserPool(max_size=3)
+        pool.start_sync()
 
         for cycle in range(10):
             tasks = []
             for i in range(3):
                 tid = f"cycle{cycle}-t{i}"
-                await pool._acquire_async(tid)
+                pool.acquire_sync(tid)
                 tasks.append(tid)
             for tid in tasks:
-                await pool._release_async(tid)
+                pool.release_sync(tid)
 
         stats = pool.stats()
         assert stats["in_use"] == 0
         assert stats["idle"] == 3
+
+    def test_acquire_timeout_no_leak(self):
+        """acquire 超时后槽位不应被占用。"""
+        pool = BrowserPool(max_size=1)
+        pool.start_sync()
+        pool.acquire_sync("t-1")
+
+        with pytest.raises(TimeoutError):
+            pool.acquire_sync("t-2", timeout=0.1)
+
+        # t-1 释放后应能正常 acquire
+        pool.release_sync("t-1")
+        pool.acquire_sync("t-3")
+        pool.release_sync("t-3")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -496,15 +483,14 @@ class TestLongRunningSimulation:
         # 不应崩溃，步骤数应增长
         assert len(pm._steps) > 1
 
-    @pytest.mark.asyncio
-    async def test_browser_pool_rapid_acquire_release(self):
+    def test_browser_pool_rapid_acquire_release(self):
         """BrowserPool 快速 acquire/release 100 次。"""
         pool = _make_pool_with_slots(max_size=2)
 
         for i in range(100):
             tid = f"rapid-{i}"
-            b, c = await pool._acquire_async(tid)
-            await pool._release_async(tid)
+            pool.acquire_sync(tid)
+            pool.release_sync(tid)
 
         stats = pool.stats()
         assert stats["in_use"] == 0

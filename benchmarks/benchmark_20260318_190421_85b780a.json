@@ -1,0 +1,141 @@
+{
+  "timestamp": "2026-03-18T19:04:21.806894",
+  "git_commit": "85b780a",
+  "total": 9,
+  "passed": 0,
+  "failed": 9,
+  "success_rate": 0.0,
+  "avg_duration_seconds": 0.5,
+  "avg_steps": 0.0,
+  "total_cost_usd": 0.0,
+  "by_category": {
+    "navigation": {
+      "total": 3,
+      "passed": 0
+    },
+    "login": {
+      "total": 1,
+      "passed": 0
+    },
+    "form": {
+      "total": 3,
+      "passed": 0
+    },
+    "extract": {
+      "total": 1,
+      "passed": 0
+    },
+    "multi_step": {
+      "total": 1,
+      "passed": 0
+    }
+  },
+  "by_difficulty": {
+    "basic": {
+      "total": 9,
+      "passed": 0
+    }
+  },
+  "results": [
+    {
+      "scenario_name": "simple_navigation",
+      "success": false,
+      "steps": 0,
+      "duration_seconds": 0.6,
+      "token_usage": {},
+      "error": "E2ERunner.run_scenario.<locals>._log_collector() takes 1 positional argument but 2 were given",
+      "category": "navigation",
+      "difficulty": "basic",
+      "logs": []
+    },
+    {
+      "scenario_name": "login_flow",
+      "success": false,
+      "steps": 0,
+      "duration_seconds": 0.5,
+      "token_usage": {},
+      "error": "E2ERunner.run_scenario.<locals>._log_collector() takes 1 positional argument but 2 were given",
+      "category": "login",
+      "difficulty": "basic",
+      "logs": []
+    },
+    {
+      "scenario_name": "form_fill",
+      "success": false,
+      "steps": 0,
+      "duration_seconds": 0.5,
+      "token_usage": {},
+      "error": "E2ERunner.run_scenario.<locals>._log_collector() takes 1 positional argument but 2 were given",
+      "category": "form",
+      "difficulty": "basic",
+      "logs": []
+    },
+    {
+      "scenario_name": "table_extract",
+      "success": false,
+      "steps": 0,
+      "duration_seconds": 0.5,
+      "token_usage": {},
+      "error": "E2ERunner.run_scenario.<locals>._log_collector() takes 1 positional argument but 2 were given",
+      "category": "extract",
+      "difficulty": "basic",
+      "logs": []
+    },
+    {
+      "scenario_name": "multi_step",
+      "success": false,
+      "steps": 0,
+      "duration_seconds": 0.5,
+      "token_usage": {},
+      "error": "E2ERunner.run_scenario.<locals>._log_collector() takes 1 positional argument but 2 were given",
+      "category": "multi_step",
+      "difficulty": "basic",
+      "logs": []
+    },
+    {
+      "scenario_name": "dropdown_select",
+      "success": false,
+      "steps": 0,
+      "duration_seconds": 0.5,
+      "token_usage": {},
+      "error": "E2ERunner.run_scenario.<locals>._log_collector() takes 1 positional argument but 2 were given",
+      "category": "form",
+      "difficulty": "basic",
+      "logs": []
+    },
+    {
+      "scenario_name": "file_download",
+      "success": false,
+      "steps": 0,
+      "duration_seconds": 0.5,
+      "token_usage": {},
+      "error": "E2ERunner.run_scenario.<locals>._log_collector() takes 1 positional argument but 2 were given",
+      "category": "navigation",
+      "difficulty": "basic",
+      "logs": []
+    },
+    {
+      "scenario_name": "scroll_long_page",
+      "success": false,
+      "steps": 0,
+      "duration_seconds": 0.5,
+      "token_usage": {},
+      "error": "E2ERunner.run_scenario.<locals>._log_collector() takes 1 positional argument but 2 were given",
+      "category": "navigation",
+      "difficulty": "basic",
+      "logs": []
+    },
+    {
+      "scenario_name": "checkbox_toggle",
+      "success": false,
+      "steps": 0,
+      "duration_seconds": 0.5,
+      "token_usage": {},
+      "error": "E2ERunner.run_scenario.<locals>._log_collector() takes 1 positional argument but 2 were given",
+      "category": "form",
+      "difficulty": "basic",
+      "logs": []
+    }
+  ],
+  "regressions": []
+}

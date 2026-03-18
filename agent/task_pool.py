@@ -122,15 +122,11 @@ class TaskPool:
             for _ in range(diff):
                 self._semaphore.release()
         else:
-            # 减小：通过获取 semaphore 来减少可用槽位
-            # 注意：这是 best-effort，不会阻塞
+            # 减小：best-effort 非阻塞消耗空闲槽位
             async def _shrink():
                 for _ in range(-diff):
                     try:
-                        # 非阻塞尝试获取
-                        acquired = self._semaphore._value > 0
-                        if acquired:
-                            await asyncio.wait_for(self._semaphore.acquire(), timeout=0.01)
+                        await asyncio.wait_for(self._semaphore.acquire(), timeout=0.01)
                     except (asyncio.TimeoutError, Exception):
                         break
             asyncio.ensure_future(_shrink())

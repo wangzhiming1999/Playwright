@@ -68,7 +68,7 @@ class E2ERunner:
         # 日志收集器
         collected_logs: list[str] = []
 
-        async def _log_collector(msg: str):
+        async def _log_collector(task_id: str, msg: str):
             collected_logs.append(msg)
 
         start = time.monotonic()

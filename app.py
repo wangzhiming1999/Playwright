@@ -282,18 +282,11 @@ def _run_agent_in_thread(
     asyncio.set_event_loop(loop)
 
     async def thread_safe_log(tid: str, msg: str):
-        try:
-            fut = asyncio.run_coroutine_threadsafe(_log_callback(tid, msg), main_loop)
-            fut.result(timeout=_CALLBACK_TIMEOUT)
-        except Exception as e:
-            print(f"[warn] log callback error: {e}", file=sys.stderr)
+        # fire-and-forget：不阻塞 agent 事件循环
+        asyncio.run_coroutine_threadsafe(_log_callback(tid, msg), main_loop)
 
     async def thread_safe_screenshot(tid: str, filename: str):
-        try:
-            fut = asyncio.run_coroutine_threadsafe(_screenshot_callback(tid, filename), main_loop)
-            fut.result(timeout=_CALLBACK_TIMEOUT)
-        except Exception as e:
-            print(f"[warn] screenshot callback error: {e}", file=sys.stderr)
+        asyncio.run_coroutine_threadsafe(_screenshot_callback(tid, filename), main_loop)
 
     async def ask_user_callback(tid: str, question: str, reason: str) -> str:
         ev = threading.Event()
@@ -327,45 +320,30 @@ def _run_agent_in_thread(
         t = TASKS.get(task_id, {})
         browser_mode = t.get("browser_mode", "builtin")
 
-        # 浏览器池：builtin 模式且池可用时，获取槽位（信号量模式）
+        # 浏览器池：builtin 模式且池可用时，走 pool 模式（复用预热 browser，跳过冷启动）
         _use_pool = (
             _browser_pool is not None
             and _browser_pool.started
             and browser_mode == "builtin"
         )
+        _effective_browser_mode = "pool" if _use_pool else browser_mode
 
-        if _use_pool:
-            try:
-                _browser_pool.acquire_sync(task_id)
-                print(f"[BrowserPool] Acquired slot for task {task_id}")
-            except Exception as e:
-                print(f"[BrowserPool] Acquire failed: {e}, falling back to standalone", file=sys.stderr)
-                _use_pool = False
-
-        try:
-            agent_result = loop.run_until_complete(
-                run_agent(
-                    task=task,
-                    headless=HEADLESS,
-                    task_id=task_id,
-                    log_callback=thread_safe_log,
-                    cookies_path=f"data/cookies/cookies_{task_id}.json",
-                    screenshots_dir=f"screenshots/{task_id}",
-                    ask_user_callback=ask_user_callback,
-                    screenshot_callback=thread_safe_screenshot,
-                    browser_mode=browser_mode,
-                    cdp_url=t.get("cdp_url", "http://localhost:9222"),
-                    chrome_profile=t.get("chrome_profile", "Default"),
-                )
+        agent_result = loop.run_until_complete(
+            run_agent(
+                task=task,
+                headless=HEADLESS,
+                task_id=task_id,
+                log_callback=thread_safe_log,
+                cookies_path=f"data/cookies/cookies_{task_id}.json",
+                screenshots_dir=f"screenshots/{task_id}",
+                ask_user_callback=ask_user_callback,
+                screenshot_callback=thread_safe_screenshot,
+                browser_mode=_effective_browser_mode,
+                cdp_url=t.get("cdp_url", "http://localhost:9222"),
+                chrome_profile=t.get("chrome_profile", "Default"),
+                pool=_browser_pool if _use_pool else None,
             )
-        finally:
-            # 归还槽位到池
-            if _use_pool:
-                try:
-                    _browser_pool.release_sync(task_id)
-                    print(f"[BrowserPool] Released slot for task {task_id}")
-                except Exception as e:
-                    print(f"[BrowserPool] Release failed: {e}", file=sys.stderr)
+        )
 
         # agent_result: {"success": bool, "reason": str, "steps": int, "cost": dict}
         task_succeeded = agent_result.get("success", False) if isinstance(agent_result, dict) else True

@@ -192,9 +192,10 @@ async def run_agent(
     screenshots_dir: str = "screenshots",
     ask_user_callback=None,      # async (task_id, question, reason) -> str
     screenshot_callback=None,    # async (task_id, filename) -> None
-    browser_mode: str = "builtin",  # "builtin" | "user_chrome" | "cdp"
+    browser_mode: str = "builtin",  # "builtin" | "user_chrome" | "cdp" | "pool"
     cdp_url: str = "http://localhost:9222",  # browser_mode="cdp" 时使用
     chrome_profile: str = None,  # browser_mode="user_chrome" 时指定 profile 名，默认 "Default"
+    pool=None,                   # browser_mode="pool" 时传入 BrowserPool 实例
     site_understanding: bool = True,  # 首步自动分析站点结构
     max_steps: int = 35,         # 最大执行步数
 ) -> dict:
@@ -213,11 +214,38 @@ async def run_agent(
         if log_callback and task_id:
             await log_callback(task_id, msg)
 
-    # 每个 agent 线程自己启动 Playwright（BrowserPool 只做并发槽位控制，不共享对象）
+    # pool 模式：从预热池获取 browser，直接 new_context() 跳过 launch()
+    _pool_browser = None
+    _pool_browser_healthy = True
+    if browser_mode == "pool" and pool is not None:
+        try:
+            _pool_browser = pool.acquire_sync(task_id or "unknown", timeout=60)
+        except TimeoutError as e:
+            await _early_log(f"  ⚠ [Pool] 获取槽位超时，降级为 builtin: {e}")
+            browser_mode = "builtin"
+        except Exception as e:
+            await _early_log(f"  ⚠ [Pool] 获取槽位失败，降级为 builtin: {e}")
+            browser_mode = "builtin"
+    elif browser_mode == "pool":
+        # pool 参数未传，降级
+        browser_mode = "builtin"
+
     _pw_cm = async_playwright()
     pw = await _pw_cm.start()
     browser = None
     context = None
+
+    if browser_mode == "pool" and _pool_browser is not None:
+        # 复用预热的 browser，直接创建新 context（跳过 launch，节省 ~400ms）
+        _fingerprint = get_stealth_fingerprint()
+        try:
+            context = await _pool_browser.new_context(**_fingerprint)
+            await apply_stealth(context)
+            await _early_log("  [Pool] 复用预热浏览器，跳过冷启动")
+        except Exception as e:
+            await _early_log(f"  ⚠ [Pool] 创建 context 失败，降级为 builtin: {e}")
+            _pool_browser_healthy = False
+            browser_mode = "builtin"
 
     if browser_mode == "cdp":
         await _early_log(f"  [CDP] 连接 {cdp_url} ...")
@@ -1125,13 +1153,20 @@ async def run_agent(
             except Exception as e:
                 await _log(f"⚠ 保存 cookies 失败: {e}")
 
-        # 关闭浏览器：池模式不关闭（由池管理），其他模式按原逻辑
+        # 关闭浏览器：池模式关闭 page+context（browser 由池管理），其他模式按原逻辑
         if browser_mode == "pool":
-            # 池模式：只关闭 page，不关闭 browser/context（由 BrowserPool.release 处理）
+            # 关闭 page 和 context，但保留 browser（由 BrowserPool 管理）
             try:
                 await page.close()
             except Exception:
                 pass
+            try:
+                await context.close()
+            except Exception:
+                pass
+            # 释放槽位，通知池 browser 是否健康
+            if pool is not None and task_id:
+                pool.release_sync(task_id, browser_healthy=_pool_browser_healthy)
         elif browser_mode == "cdp":
             await _log("  [CDP] 保持浏览器运行，不关闭")
         elif browser_mode == "user_chrome":

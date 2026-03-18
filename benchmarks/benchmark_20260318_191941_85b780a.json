@@ -1,0 +1,287 @@
+{
+  "timestamp": "2026-03-18T19:19:41.714194",
+  "git_commit": "85b780a",
+  "total": 9,
+  "passed": 0,
+  "failed": 9,
+  "success_rate": 0.0,
+  "avg_duration_seconds": 97.6,
+  "avg_steps": 0.0,
+  "total_cost_usd": 0.0,
+  "by_category": {
+    "navigation": {
+      "total": 3,
+      "passed": 0
+    },
+    "login": {
+      "total": 1,
+      "passed": 0
+    },
+    "form": {
+      "total": 3,
+      "passed": 0
+    },
+    "extract": {
+      "total": 1,
+      "passed": 0
+    },
+    "multi_step": {
+      "total": 1,
+      "passed": 0
+    }
+  },
+  "by_difficulty": {
+    "basic": {
+      "total": 9,
+      "passed": 0
+    }
+  },
+  "results": [
+    {
+      "scenario_name": "simple_navigation",
+      "success": false,
+      "steps": 0,
+      "duration_seconds": 60.0,
+      "token_usage": {},
+      "error": "超时 (60s)",
+      "category": "navigation",
+      "difficulty": "basic",
+      "logs": [
+        "  [Watchdog] 事件监听器已启动",
+        "\n🚀 开始执行任务: 打开 https://example.com 并截图\n",
+        "  [记忆] 已注入 4 条相关经验",
+        "  [自定义 Action] 已加载 3 个自定义工具",
+        "  [任务分解] 正在拆解任务步骤...",
+        "  [任务分解] 分解失败，使用自由模式执行",
+        "__PROGRESS__:1/5",
+        "  [弹窗] AI fallback 失败: openai call failed after 3 attempts: The api_key client option must be set either by passing api_key to the client or by setting the OPENAI_API_KEY environment variable",
+        "  [截图模式] step_01_annotated.jpg",
+        "  ⚠ LLM API 调用失败 (重试 1/2): openai call failed after 3 attempts: The api_key client option must be set either by passing api_key to the client or by setting the OPENAI_API_KEY environment variable，1.0s 后重试...",
+        "  ⚠ LLM API 调用失败 (重试 2/2): openai call failed after 3 attempts: The api_key client option must be set either by passing api_key to the client or by setting the OPENAI_API_KEY environment variable，3.0s 后重试..."
+      ]
+    },
+    {
+      "scenario_name": "login_flow",
+      "success": false,
+      "steps": 0,
+      "duration_seconds": 122.3,
+      "token_usage": {},
+      "error": "超时 (120s)",
+      "category": "login",
+      "difficulty": "basic",
+      "logs": [
+        "  [Watchdog] 事件监听器已启动",
+        "\n🚀 开始执行任务: 打开 https://the-internet.herokuapp.com/login 用账号 tomsmith 密码 SuperSecretPassword! 登录，截图登录成功页面\n",
+        "  [记忆] 已注入 4 条相关经验",
+        "  [任务分解] 正在拆解任务步骤...",
+        "  [任务分解] 分解失败，使用自由模式执行",
+        "__PROGRESS__:1/10",
+        "  [弹窗] AI fallback 失败: openai call failed after 3 attempts: The api_key client option must be set either by passing api_key to the client or by setting the OPENAI_API_KEY environment variable",
+        "  [截图模式] step_01_annotated.jpg",
+        "  ⚠ LLM API 调用失败 (重试 1/2): openai call failed after 3 attempts: The api_key client option must be set either by passing api_key to the client or by setting the OPENAI_API_KEY environment variable，1.0s 后重试...",
+        "  ⚠ LLM API 调用失败 (重试 2/2): openai call failed after 3 attempts: The api_key client option must be set either by passing api_key to the client or by setting the OPENAI_API_KEY environment variable，3.0s 后重试...",
+        "  ❌ LLM API 调用失败 (已重试2次): openai call failed after 3 attempts: The api_key client option must be set either by passing api_key to the client or by setting the OPENAI_API_KEY environment variable",
+        "__PROGRESS__:2/10",
+        "  [DOM模式] 第1步（累计节省 ~1100 tokens）",
+        "  [模型路由] mini（DOM模式，简单操作）",
+        "  ⚠ LLM API 调用失败 (重试 1/2): openai call failed after 3 attempts: The api_key client option must be set either by passing api_key to the client or by setting the OPENAI_API_KEY environment variable，1.0s 后重试...",
+        "  ⚠ LLM API 调用失败 (重试 2/2): openai call failed after 3 attempts: The api_key client option must be set either by passing api_key to the client or by setting the OPENAI_API_KEY environment variable，3.0s 后重试...",
+        "  ❌ LLM API 调用失败 (已重试2次): openai call failed after 3 attempts: The api_key client option must be set either by passing api_key to the client or by setting the OPENAI_API_KEY environment variable"
+      ]
+    },
+    {
+      "scenario_name": "form_fill",
+      "success": false,
+      "steps": 0,
+      "duration_seconds": 122.4,
+      "token_usage": {},
+      "error": "超时 (120s)",
+      "category": "form",
+      "difficulty": "basic",
+      "logs": [
+        "  [Watchdog] 事件监听器已启动",
+        "\n🚀 开始执行任务: 打开 https://httpbin.org/forms/post 填写所有表单字段（Customer=Test User, Size=Medium, Topping=Cheese, Comments=E2E test）并提交，截图提交结果\n",
+        "  [记忆] 已注入 4 条相关经验",
+        "  [任务分解] 正在拆解任务步骤...",
+        "  [任务分解] 分解失败，使用自由模式执行",
+        "__PROGRESS__:1/15",
+        "  [弹窗] AI fallback 失败: openai call failed after 3 attempts: The api_key client option must be set either by passing api_key to the client or by setting the OPENAI_API_KEY environment variable",
+        "  [截图模式] step_01_annotated.jpg",
+        "  ⚠ LLM API 调用失败 (重试 1/2): openai call failed after 3 attempts: The api_key client option must be set either by passing api_key to the client or by setting the OPENAI_API_KEY environment variable，1.0s 后重试...",
+        "  ⚠ LLM API 调用失败 (重试 2/2): openai call failed after 3 attempts: The api_key client option must be set either by passing api_key to the client or by setting the OPENAI_API_KEY environment variable，3.0s 后重试...",
+        "  ❌ LLM API 调用失败 (已重试2次): openai call failed after 3 attempts: The api_key client option must be set either by passing api_key to the client or by setting the OPENAI_API_KEY environment variable",
+        "__PROGRESS__:2/15",
+        "  [DOM模式] 第1步（累计节省 ~1100 tokens）",
+        "  [模型路由] mini（DOM模式，简单操作）",
+        "  ⚠ LLM API 调用失败 (重试 1/2): openai call failed after 3 attempts: The api_key client option must be set either by passing api_key to the client or by setting the OPENAI_API_KEY environment variable，1.0s 后重试...",
+        "  ⚠ LLM API 调用失败 (重试 2/2): openai call failed after 3 attempts: The api_key client option must be set either by passing api_key to the client or by setting the OPENAI_API_KEY environment variable，3.0s 后重试...",
+        "  ❌ LLM API 调用失败 (已重试2次): openai call failed after 3 attempts: The api_key client option must be set either by passing api_key to the client or by setting the OPENAI_API_KEY environment variable"
+      ]
+    },
+    {
+      "scenario_name": "table_extract",
+      "success": false,
+      "steps": 0,
+      "duration_seconds": 90.4,
+      "token_usage": {},
+      "error": "超时 (90s)",
+      "category": "extract",
+      "difficulty": "basic",
+      "logs": [
+        "  [Watchdog] 事件监听器已启动",
+        "\n🚀 开始执行任务: 打开 https://the-internet.herokuapp.com/tables 截图页面上的表格数据\n",
+        "  [记忆] 已注入 4 条相关经验",
+        "  [任务分解] 正在拆解任务步骤...",
+        "  [任务分解] 分解失败，使用自由模式执行",
+        "__PROGRESS__:1/8",
+        "  [弹窗] AI fallback 失败: openai call failed after 3 attempts: The api_key client option must be set either by passing api_key to the client or by setting the OPENAI_API_KEY environment variable",
+        "  [截图模式] step_01_annotated.jpg",
+        "  ⚠ LLM API 调用失败 (重试 1/2): openai call failed after 3 attempts: The api_key client option must be set either by passing api_key to the client or by setting the OPENAI_API_KEY environment variable，1.0s 后重试...",
+        "  ⚠ LLM API 调用失败 (重试 2/2): openai call failed after 3 attempts: The api_key client option must be set either by passing api_key to the client or by setting the OPENAI_API_KEY environment variable，3.0s 后重试...",
+        "  ❌ LLM API 调用失败 (已重试2次): openai call failed after 3 attempts: The api_key client option must be set either by passing api_key to the client or by setting the OPENAI_API_KEY environment variable",
+        "__PROGRESS__:2/8",
+        "  [DOM模式] 第1步（累计节省 ~1100 tokens）",
+        "  [模型路由] mini（DOM模式，简单操作）",
+        "  ⚠ LLM API 调用失败 (重试 1/2): openai call failed after 3 attempts: The api_key client option must be set either by passing api_key to the client or by setting the OPENAI_API_KEY environment variable，1.0s 后重试..."
+      ]
+    },
+    {
+      "scenario_name": "multi_step",
+      "success": false,
+      "steps": 0,
+      "duration_seconds": 90.3,
+      "token_usage": {},
+      "error": "超时 (90s)",
+      "category": "multi_step",
+      "difficulty": "basic",
+      "logs": [
+        "  [Watchdog] 事件监听器已启动",
+        "\n🚀 开始执行任务: 打开 https://the-internet.herokuapp.com/add_remove_elements/ 点击 Add Element 按钮 3 次，然后截图\n",
+        "  [记忆] 已注入 4 条相关经验",
+        "  [任务分解] 正在拆解任务步骤...",
+        "  [任务分解] 分解失败，使用自由模式执行",
+        "__PROGRESS__:1/10",
+        "  [弹窗] AI fallback 失败: openai call failed after 3 attempts: The api_key client option must be set either by passing api_key to the client or by setting the OPENAI_API_KEY environment variable",
+        "  [截图模式] step_01_annotated.jpg",
+        "  ⚠ LLM API 调用失败 (重试 1/2): openai call failed after 3 attempts: The api_key client option must be set either by passing api_key to the client or by setting the OPENAI_API_KEY environment variable，1.0s 后重试...",
+        "  ⚠ LLM API 调用失败 (重试 2/2): openai call failed after 3 attempts: The api_key client option must be set either by passing api_key to the client or by setting the OPENAI_API_KEY environment variable，3.0s 后重试...",
+        "  ❌ LLM API 调用失败 (已重试2次): openai call failed after 3 attempts: The api_key client option must be set either by passing api_key to the client or by setting the OPENAI_API_KEY environment variable",
+        "__PROGRESS__:2/10",
+        "  [DOM模式] 第1步（累计节省 ~1100 tokens）",
+        "  [模型路由] mini（DOM模式，简单操作）",
+        "  ⚠ LLM API 调用失败 (重试 1/2): openai call failed after 3 attempts: The api_key client option must be set either by passing api_key to the client or by setting the OPENAI_API_KEY environment variable，1.0s 后重试..."
+      ]
+    },
+    {
+      "scenario_name": "dropdown_select",
+      "success": false,
+      "steps": 0,
+      "duration_seconds": 90.4,
+      "token_usage": {},
+      "error": "超时 (90s)",
+      "category": "form",
+      "difficulty": "basic",
+      "logs": [
+        "  [Watchdog] 事件监听器已启动",
+        "\n🚀 开始执行任务: 打开 https://the-internet.herokuapp.com/dropdown 选择 Option 2，截图确认选择结果\n",
+        "  [记忆] 已注入 4 条相关经验",
+        "  [任务分解] 正在拆解任务步骤...",
+        "  [任务分解] 分解失败，使用自由模式执行",
+        "__PROGRESS__:1/8",
+        "  [弹窗] AI fallback 失败: openai call failed after 3 attempts: The api_key client option must be set either by passing api_key to the client or by setting the OPENAI_API_KEY environment variable",
+        "  [截图模式] step_01_annotated.jpg",
+        "  ⚠ LLM API 调用失败 (重试 1/2): openai call failed after 3 attempts: The api_key client option must be set either by passing api_key to the client or by setting the OPENAI_API_KEY environment variable，1.0s 后重试...",
+        "  ⚠ LLM API 调用失败 (重试 2/2): openai call failed after 3 attempts: The api_key client option must be set either by passing api_key to the client or by setting the OPENAI_API_KEY environment variable，3.0s 后重试...",
+        "  ❌ LLM API 调用失败 (已重试2次): openai call failed after 3 attempts: The api_key client option must be set either by passing api_key to the client or by setting the OPENAI_API_KEY environment variable",
+        "__PROGRESS__:2/8",
+        "  [DOM模式] 第1步（累计节省 ~1100 tokens）",
+        "  [模型路由] mini（DOM模式，简单操作）",
+        "  ⚠ LLM API 调用失败 (重试 1/2): openai call failed after 3 attempts: The api_key client option must be set either by passing api_key to the client or by setting the OPENAI_API_KEY environment variable，1.0s 后重试..."
+      ]
+    },
+    {
+      "scenario_name": "file_download",
+      "success": false,
+      "steps": 0,
+      "duration_seconds": 122.4,
+      "token_usage": {},
+      "error": "超时 (120s)",
+      "category": "navigation",
+      "difficulty": "basic",
+      "logs": [
+        "  [Watchdog] 事件监听器已启动",
+        "\n🚀 开始执行任务: 打开 https://the-internet.herokuapp.com/download 下载页面上的第一个文件\n",
+        "  [记忆] 已注入 4 条相关经验",
+        "  [任务分解] 正在拆解任务步骤...",
+        "  [任务分解] 分解失败，使用自由模式执行",
+        "__PROGRESS__:1/10",
+        "  [弹窗] AI fallback 失败: openai call failed after 3 attempts: The api_key client option must be set either by passing api_key to the client or by setting the OPENAI_API_KEY environment variable",
+        "  [截图模式] step_01_annotated.jpg",
+        "  ⚠ LLM API 调用失败 (重试 1/2): openai call failed after 3 attempts: The api_key client option must be set either by passing api_key to the client or by setting the OPENAI_API_KEY environment variable，1.0s 后重试...",
+        "  ⚠ LLM API 调用失败 (重试 2/2): openai call failed after 3 attempts: The api_key client option must be set either by passing api_key to the client or by setting the OPENAI_API_KEY environment variable，3.0s 后重试...",
+        "  ❌ LLM API 调用失败 (已重试2次): openai call failed after 3 attempts: The api_key client option must be set either by passing api_key to the client or by setting the OPENAI_API_KEY environment variable",
+        "__PROGRESS__:2/10",
+        "  [DOM模式] 第1步（累计节省 ~1100 tokens）",
+        "  [模型路由] mini（DOM模式，简单操作）",
+        "  ⚠ LLM API 调用失败 (重试 1/2): openai call failed after 3 attempts: The api_key client option must be set either by passing api_key to the client or by setting the OPENAI_API_KEY environment variable，1.0s 后重试...",
+        "  ⚠ LLM API 调用失败 (重试 2/2): openai call failed after 3 attempts: The api_key client option must be set either by passing api_key to the client or by setting the OPENAI_API_KEY environment variable，3.0s 后重试...",
+        "  ❌ LLM API 调用失败 (已重试2次): openai call failed after 3 attempts: The api_key client option must be set either by passing api_key to the client or by setting the OPENAI_API_KEY environment variable"
+      ]
+    },
+    {
+      "scenario_name": "scroll_long_page",
+      "success": false,
+      "steps": 0,
+      "duration_seconds": 90.3,
+      "token_usage": {},
+      "error": "超时 (90s)",
+      "category": "navigation",
+      "difficulty": "basic",
+      "logs": [
+        "  [Watchdog] 事件监听器已启动",
+        "\n🚀 开始执行任务: 打开 https://the-internet.herokuapp.com/large 向下滚动 3 次并截图页面底部\n",
+        "  [记忆] 已注入 4 条相关经验",
+        "  [任务分解] 正在拆解任务步骤...",
+        "  [任务分解] 分解失败，使用自由模式执行",
+        "__PROGRESS__:1/10",
+        "  [弹窗] AI fallback 失败: openai call failed after 3 attempts: The api_key client option must be set either by passing api_key to the client or by setting the OPENAI_API_KEY environment variable",
+        "  [截图模式] step_01_annotated.jpg",
+        "  ⚠ LLM API 调用失败 (重试 1/2): openai call failed after 3 attempts: The api_key client option must be set either by passing api_key to the client or by setting the OPENAI_API_KEY environment variable，1.0s 后重试...",
+        "  ⚠ LLM API 调用失败 (重试 2/2): openai call failed after 3 attempts: The api_key client option must be set either by passing api_key to the client or by setting the OPENAI_API_KEY environment variable，3.0s 后重试...",
+        "  ❌ LLM API 调用失败 (已重试2次): openai call failed after 3 attempts: The api_key client option must be set either by passing api_key to the client or by setting the OPENAI_API_KEY environment variable",
+        "__PROGRESS__:2/10",
+        "  [DOM模式] 第1步（累计节省 ~1100 tokens）",
+        "  [模型路由] mini（DOM模式，简单操作）",
+        "  ⚠ LLM API 调用失败 (重试 1/2): openai call failed after 3 attempts: The api_key client option must be set either by passing api_key to the client or by setting the OPENAI_API_KEY environment variable，1.0s 后重试..."
+      ]
+    },
+    {
+      "scenario_name": "checkbox_toggle",
+      "success": false,
+      "steps": 0,
+      "duration_seconds": 90.3,
+      "token_usage": {},
+      "error": "超时 (90s)",
+      "category": "form",
+      "difficulty": "basic",
+      "logs": [
+        "  [Watchdog] 事件监听器已启动",
+        "\n🚀 开始执行任务: 打开 https://the-internet.herokuapp.com/checkboxes 勾选第一个复选框，取消勾选第二个复选框，截图结果\n",
+        "  [记忆] 已注入 4 条相关经验",
+        "  [任务分解] 正在拆解任务步骤...",
+        "  [任务分解] 分解失败，使用自由模式执行",
+        "__PROGRESS__:1/10",
+        "  [弹窗] AI fallback 失败: openai call failed after 3 attempts: The api_key client option must be set either by passing api_key to the client or by setting the OPENAI_API_KEY environment variable",
+        "  [截图模式] step_01_annotated.jpg",
+        "  ⚠ LLM API 调用失败 (重试 1/2): openai call failed after 3 attempts: The api_key client option must be set either by passing api_key to the client or by setting the OPENAI_API_KEY environment variable，1.0s 后重试...",
+        "  ⚠ LLM API 调用失败 (重试 2/2): openai call failed after 3 attempts: The api_key client option must be set either by passing api_key to the client or by setting the OPENAI_API_KEY environment variable，3.0s 后重试...",
+        "  ❌ LLM API 调用失败 (已重试2次): openai call failed after 3 attempts: The api_key client option must be set either by passing api_key to the client or by setting the OPENAI_API_KEY environment variable",
+        "__PROGRESS__:2/10",
+        "  [DOM模式] 第1步（累计节省 ~1100 tokens）",
+        "  [模型路由] mini（DOM模式，简单操作）",
+        "  ⚠ LLM API 调用失败 (重试 1/2): openai call failed after 3 attempts: The api_key client option must be set either by passing api_key to the client or by setting the OPENAI_API_KEY environment variable，1.0s 后重试..."
+      ]
+    }
+  ],
+  "regressions": []
+}
