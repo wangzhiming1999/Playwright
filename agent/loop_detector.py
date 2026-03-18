@@ -26,18 +26,18 @@ class ActionLoopDetector:
         self._action_hashes: list[str] = []       # 滑动窗口内的 action hash
         self._action_history: list[dict] = []      # 完整 action 记录（用于日志）
         self._page_fingerprints: list[str] = []    # 页面指纹历史
-        self._nudge_thresholds = [5, 8, 12]        # 递进提醒阈值
+        self._nudge_thresholds = [4, 6, 9]        # 递进提醒阈值（更早干预）
         self._last_nudge_count = 0                 # 上次提醒时的重复次数
 
-    def _hash_action(self, tool_name: str, tool_args: dict) -> str:
-        """将 action 转为 hash，用于去重比较。"""
-        # 忽略一些不影响语义的字段（如 timeout 的微小差异）
-        key = f"{tool_name}:{sorted(tool_args.items())}"
+    def _hash_action(self, tool_name: str, tool_args: dict, result: str = "") -> str:
+        """将 action + result 前缀转为 hash，用于去重比较。"""
+        result_prefix = result[:50] if result else ""
+        key = f"{tool_name}:{sorted(tool_args.items())}:{result_prefix}"
         return hashlib.md5(key.encode()).hexdigest()[:12]
 
-    def record_action(self, tool_name: str, tool_args: dict):
-        """记录一次 action。"""
-        h = self._hash_action(tool_name, tool_args)
+    def record_action(self, tool_name: str, tool_args: dict, result: str = ""):
+        """记录一次 action（含执行结果前缀）。"""
+        h = self._hash_action(tool_name, tool_args, result)
         self._action_hashes.append(h)
         self._action_history.append({"tool": tool_name, "args": tool_args})
 

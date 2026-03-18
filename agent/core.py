@@ -96,6 +96,7 @@ class BrowserAgent:
         在当前焦点元素输入文字（假设已经聚焦）。
         清空现有内容，输入新内容，可选按 Enter。
         如果按 Enter 触发导航，自动等待页面就绪。
+        输入后验证是否成功写入（密码框跳过验证）。
         """
         # 清空现有内容
         await self.page.keyboard.press("Control+a")
@@ -103,6 +104,27 @@ class BrowserAgent:
 
         # 输入新内容
         await self.page.keyboard.type(text, delay=50)
+
+        # 输入验证（密码框无法读取值，跳过）
+        if not is_password and not press_enter:
+            try:
+                actual_value = await self._safe_evaluate(
+                    "() => document.activeElement?.value || ''",
+                    timeout_ms=2000, default=""
+                )
+                if actual_value and text not in actual_value and actual_value not in text:
+                    await self._log(f"  ⚠ 输入验证失败: 期望含 '{text[:20]}', 实际 '{actual_value[:20]}'，尝试 fill")
+                    # 重试：用 fill 方法（直接设置 value）
+                    try:
+                        focused = await self.page.evaluate_handle("() => document.activeElement")
+                        el = focused.as_element()
+                        if el:
+                            await el.fill(text)
+                            return f"已输入(fill): {text}"
+                    except Exception:
+                        pass  # fill 也失败，继续原始流程
+            except Exception:
+                pass
 
         # 可选：按 Enter 提交
         if press_enter:
@@ -432,27 +454,88 @@ class BrowserAgent:
                             method = el_info.get("method", "skyvern-id")
                             await self._log(f"  [点击] #{index} → ({x}, {y}) tag={el_info.get('tag','')} method={method}")
 
-                            # 遮挡检测：检查目标坐标处的顶层元素是否是目标元素
+                            # 遮挡检测：3级递进恢复策略
                             is_covered = await self._safe_evaluate(
                                 f"""() => {{
                                     const el = document.querySelector('[data-skyvern-id="{index}"]');
-                                    if (!el) return false;
+                                    if (!el) return {{covered: false, sticky: false}};
                                     const r = el.getBoundingClientRect();
                                     const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
                                     const top = document.elementFromPoint(cx, cy);
-                                    return top !== el && !el.contains(top) && !(top && top.contains(el));
+                                    const isCovered = top !== el && !el.contains(top) && !(top && top.contains(el));
+                                    if (!isCovered) return {{covered: false, sticky: false}};
+                                    let isSticky = false;
+                                    try {{
+                                        const s = window.getComputedStyle(top);
+                                        isSticky = s.position === 'fixed' || s.position === 'sticky';
+                                    }} catch(e) {{}}
+                                    return {{covered: true, sticky: isSticky}};
                                 }}""",
-                                default=False,
+                                default={"covered": False, "sticky": False},
                             )
-                            if is_covered:
-                                await self._log(f"  [点击] #{index} 被遮挡，尝试滚动到可见")
+                            _cover_info = is_covered if isinstance(is_covered, dict) else {"covered": is_covered, "sticky": False}
+                            if _cover_info.get("covered"):
+                                # 第1级：scrollIntoView(center)
+                                _scroll_block = "'nearest'" if _cover_info.get("sticky") else "'center'"
+                                await self._log(f"  [点击] #{index} 被遮挡{'(sticky)' if _cover_info.get('sticky') else ''}，尝试滚动")
                                 await self._safe_evaluate(
                                     f"""() => {{
                                         const el = document.querySelector('[data-skyvern-id="{index}"]');
-                                        if (el) el.scrollIntoView({{block: 'center', behavior: 'instant'}});
+                                        if (el) el.scrollIntoView({{block: {_scroll_block}, behavior: 'instant'}});
                                     }}"""
                                 )
                                 await asyncio.sleep(0.3)
+
+                                # 检查是否仍被遮挡
+                                _still_covered = await self._safe_evaluate(
+                                    f"""() => {{
+                                        const el = document.querySelector('[data-skyvern-id="{index}"]');
+                                        if (!el) return true;
+                                        const r = el.getBoundingClientRect();
+                                        const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+                                        const top = document.elementFromPoint(cx, cy);
+                                        return top !== el && !el.contains(top) && !(top && top.contains(el));
+                                    }}""",
+                                    default=False,
+                                )
+                                if _still_covered:
+                                    # 第2级：偏移滚动（避开 sticky header/footer）
+                                    await self._log(f"  [点击] #{index} 仍被遮挡，尝试偏移滚动")
+                                    await self._safe_evaluate(
+                                        f"""() => {{
+                                            const el = document.querySelector('[data-skyvern-id="{index}"]');
+                                            if (el) {{
+                                                el.scrollIntoView({{block: 'nearest', behavior: 'instant'}});
+                                                window.scrollBy(0, -100);
+                                            }}
+                                        }}"""
+                                    )
+                                    await asyncio.sleep(0.3)
+
+                                    # 再次检查
+                                    _still_covered2 = await self._safe_evaluate(
+                                        f"""() => {{
+                                            const el = document.querySelector('[data-skyvern-id="{index}"]');
+                                            if (!el) return true;
+                                            const r = el.getBoundingClientRect();
+                                            const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+                                            const top = document.elementFromPoint(cx, cy);
+                                            return top !== el && !el.contains(top) && !(top && top.contains(el));
+                                        }}""",
+                                        default=False,
+                                    )
+                                    if _still_covered2:
+                                        # 第3级：force click（JS 直接触发 click 事件）
+                                        await self._log(f"  [点击] #{index} 仍被遮挡，使用 force click")
+                                        await self._safe_evaluate(
+                                            f"""() => {{
+                                                const el = document.querySelector('[data-skyvern-id="{index}"]');
+                                                if (el) el.click();
+                                            }}"""
+                                        )
+                                        form_err = await self._detect_form_errors()
+                                        return f"点击成功(force)。{form_err}" if form_err else "点击成功(force)"
+
                                 el_info = await get_element_coords(page, index)
                                 if el_info:
                                     x, y = el_info["x"], el_info["y"]
@@ -707,6 +790,19 @@ class BrowserAgent:
                     seconds = args.get("seconds", 2)
                     await _wait_for_page_ready(page, log_fn=self._log, timeout_ms=seconds * 1000, check_network=True, active_requests=self._active_requests)
                     return "等待完成"
+
+            elif tool_name == "wait_for_text":
+                text_to_find = args.get("text", "")
+                timeout_secs = args.get("timeout", 15)
+                if not text_to_find:
+                    return "操作失败: text 参数不能为空"
+                try:
+                    await page.get_by_text(text_to_find, exact=False).first.wait_for(
+                        state="visible", timeout=timeout_secs * 1000
+                    )
+                    return f"Text '{text_to_find}' appeared on page"
+                except Exception:
+                    return f"Timeout: text '{text_to_find}' did not appear within {timeout_secs}s"
 
             elif tool_name == "screenshot":
                 filename = args.get("filename", "screenshot.png")

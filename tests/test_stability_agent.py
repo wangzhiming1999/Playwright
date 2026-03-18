@@ -61,7 +61,7 @@ class TestFailureTrackerStress:
         assert tracker._total_consecutive == 50
 
     def test_success_resets_all_counters(self):
-        """成功后所有计数器归零。"""
+        """成功后计数器减半（渐进衰减），连续失败归零。"""
         tracker = FailureTracker()
         for _ in range(5):
             tracker.record_failure("click", "未找到")
@@ -70,14 +70,15 @@ class TestFailureTrackerStress:
 
         tracker.record_success()
         assert tracker._total_consecutive == 0
-        for ft in FailureType:
-            assert tracker._counts[ft] == 0
+        # 渐进衰减：5 // 2 = 2, 3 // 2 = 1
+        assert tracker._counts[FailureType.ELEMENT_NOT_FOUND] == 2
+        assert tracker._counts[FailureType.PAGE_NOT_LOADED] == 1
 
     def test_abort_triggers_on_single_type_threshold(self):
         """单一类型达到阈值应触发 abort。"""
         tracker = FailureTracker()
-        # NETWORK_ERROR 阈值是 3
-        for _ in range(3):
+        # NETWORK_ERROR 阈值是 5
+        for _ in range(5):
             tracker.record_failure("api", "connection refused")
         should, reason = tracker.should_abort()
         assert should is True

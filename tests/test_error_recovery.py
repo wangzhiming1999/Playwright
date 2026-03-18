@@ -69,8 +69,8 @@ class TestFailureTracker:
 
     def test_should_abort_single_type_threshold(self):
         ft = FailureTracker()
-        # network_error threshold is 3
-        for _ in range(3):
+        # network_error threshold is 5
+        for _ in range(5):
             ft.record_failure("navigate", "Connection refused")
         abort, reason = ft.should_abort()
         assert abort is True
@@ -107,8 +107,8 @@ class TestFailureTracker:
 
     def test_element_not_found_high_threshold(self):
         ft = FailureTracker()
-        # element_not_found threshold is 8
-        for _ in range(7):
+        # element_not_found threshold is 10
+        for _ in range(9):
             ft.record_failure("click", "元素未找到")
         abort, _ = ft.should_abort()
         assert abort is False

@@ -12,6 +12,7 @@ import os
 import re
 import shutil
 import sqlite3
+import socket
 import sys
 import threading
 import time
@@ -49,6 +50,7 @@ from workflow import (
     WorkflowEngine, WorkflowCreateRequest, WorkflowRunRequest,
 )
 from template_loader import scan_templates, TEMPLATE_CATEGORIES
+from urllib.parse import urlparse
 
 # ── Configuration constants ───────────────────────────────────────────────────
 
@@ -139,7 +141,25 @@ _task_pool = TaskPool(max_workers=_MAX_CONCURRENT_TASKS)
 # 浏览器实例池：池化复用���览器实例，避免每次冷启动
 _browser_pool: BrowserPool | None = None
 if _USE_BROWSER_POOL:
-    _proxy = "http://127.0.0.1:7897" if os.environ.get("USE_PROXY") else None
+    def _proxy_reachable(proxy_url: str) -> bool:
+        try:
+            p = urlparse(proxy_url)
+            host = p.hostname
+            port = p.port
+            if not host or not port:
+                return False
+            with socket.create_connection((host, port), timeout=0.5):
+                return True
+        except Exception:
+            return False
+
+    _proxy = None
+    if os.environ.get("USE_PROXY"):
+        _proxy_candidate = os.getenv("PROXY_SERVER", "http://127.0.0.1:7897")
+        if _proxy_reachable(_proxy_candidate):
+            _proxy = _proxy_candidate
+        else:
+            print(f"[BrowserPool] ⚠ 代理不可用，已禁用: {_proxy_candidate}", file=sys.stderr)
     _browser_pool = BrowserPool(
         max_size=_BROWSER_POOL_SIZE,
         idle_timeout=_BROWSER_POOL_IDLE_TIMEOUT,
@@ -154,12 +174,33 @@ TASKS: dict[str, dict] = load_all_tasks()
 
 EXPLORE_TASKS: dict[str, dict] = load_all_explore_tasks()
 
+def _created_at_key(t: dict) -> float:
+    """用于排序的 created_at 归一化（兼容历史数据的 str/float 混用）。"""
+    v = t.get("created_at", 0)
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, str):
+        try:
+            return float(v)
+        except Exception:
+            return 0.0
+    return 0.0
+
 
 def _startup_cleanup():
     for store in (TASKS, EXPLORE_TASKS):
+        # 重置残留的 running/pending 任务（上次异常退出遗留）
+        _save_fn = save_task if store is TASKS else save_explore_task
+        for t in store.values():
+            if t["status"] in ("running", "pending", "waiting_input"):
+                t["status"] = "failed"
+                t["logs"] = t.get("logs", [])
+                t["logs"].append("服务重启，任务被中断")
+                _save_fn(t)
+
         done = sorted(
             [t for t in store.values() if t["status"] in ("done", "failed")],
-            key=lambda t: t.get("created_at", ""),
+            key=_created_at_key,
         )
         for t in (done[:-MAX_TASKS_KEEP] if len(done) > MAX_TASKS_KEEP else []):
             store.pop(t["id"], None)
@@ -286,9 +327,7 @@ def _run_agent_in_thread(
         t = TASKS.get(task_id, {})
         browser_mode = t.get("browser_mode", "builtin")
 
-        # 浏览器池：builtin 模式且池可用时，从池中借用浏览器
-        pool_browser = None
-        pool_context = None
+        # 浏览器池：builtin 模式且池可用时，获取槽位（信号量模式）
         _use_pool = (
             _browser_pool is not None
             and _browser_pool.started
@@ -297,12 +336,10 @@ def _run_agent_in_thread(
 
         if _use_pool:
             try:
-                pool_browser, pool_context = _browser_pool.acquire_sync(task_id)
-                print(f"[BrowserPool] Acquired browser for task {task_id}")
+                _browser_pool.acquire_sync(task_id)
+                print(f"[BrowserPool] Acquired slot for task {task_id}")
             except Exception as e:
                 print(f"[BrowserPool] Acquire failed: {e}, falling back to standalone", file=sys.stderr)
-                pool_browser = None
-                pool_context = None
                 _use_pool = False
 
         try:
@@ -319,16 +356,14 @@ def _run_agent_in_thread(
                     browser_mode=browser_mode,
                     cdp_url=t.get("cdp_url", "http://localhost:9222"),
                     chrome_profile=t.get("chrome_profile", "Default"),
-                    pool_browser=pool_browser,
-                    pool_context=pool_context,
                 )
             )
         finally:
-            # 归还浏览器到池
+            # 归还槽位到池
             if _use_pool:
                 try:
                     _browser_pool.release_sync(task_id)
-                    print(f"[BrowserPool] Released browser for task {task_id}")
+                    print(f"[BrowserPool] Released slot for task {task_id}")
                 except Exception as e:
                     print(f"[BrowserPool] Release failed: {e}", file=sys.stderr)
 
@@ -610,7 +645,7 @@ def list_tasks(
     offset = max(0, offset)
     all_tasks = list(TASKS.values())
     # 按 created_at 倒序
-    all_tasks.sort(key=lambda t: t.get("created_at", 0), reverse=True)
+    all_tasks.sort(key=_created_at_key, reverse=True)
     if status:
         all_tasks = [t for t in all_tasks if t.get("status") == status]
     if q:
@@ -738,6 +773,26 @@ def get_task(task_id: str, _: None = Depends(_verify_api_key)):
     if task_id not in TASKS:
         raise HTTPException(status_code=404, detail="task not found")
     return TASKS[task_id]
+
+
+@app.get("/tasks/{task_id}/trace")
+def get_task_trace(task_id: str, _: None = Depends(_verify_api_key)):
+    """获取任务的决策链路追踪数据。"""
+    if task_id not in TASKS:
+        raise HTTPException(status_code=404, detail="task not found")
+    task = TASKS[task_id]
+    # 优先从内存中的 result 获取 trace
+    result = task.get("result", {})
+    if isinstance(result, dict) and "trace" in result:
+        return result["trace"]
+    # 尝试从文件加载
+    trace_path = Path("screenshots") / task_id / "trace.json"
+    if trace_path.exists():
+        try:
+            return json.loads(trace_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    raise HTTPException(status_code=404, detail="trace not found for this task")
 
 
 @app.post("/tasks/{task_id}/retry")
@@ -1253,11 +1308,11 @@ async def cleanup_old_tasks(keep_last: int = 20, _: None = Depends(_verify_api_k
     """
     done_tasks = sorted(
         [t for t in TASKS.values() if t["status"] in ("done", "failed")],
-        key=lambda t: t.get("created_at", ""),
+        key=_created_at_key,
     )
     done_explores = sorted(
         [t for t in EXPLORE_TASKS.values() if t["status"] in ("done", "failed")],
-        key=lambda t: t.get("created_at", ""),
+        key=_created_at_key,
     )
 
     deleted_tasks = []
@@ -1654,7 +1709,8 @@ async def start_recording(req: RecordingStartRequest, background_tasks: Backgrou
     recording_id = uuid.uuid4().hex[:12]
 
     async def _launch():
-        pw = await async_playwright().__aenter__()
+        pw_cm = async_playwright()
+        pw = await pw_cm.start()
         browser = None
         try:
             if req.browser_mode == "cdp":
@@ -1675,7 +1731,7 @@ async def start_recording(req: RecordingStartRequest, background_tasks: Backgrou
 
             session = {
                 "recorder": recorder, "page": page, "browser": browser,
-                "context": context, "pw": pw, "title": req.title,
+                "context": context, "pw": pw, "pw_cm": pw_cm, "title": req.title,
                 "start_url": req.start_url, "broadcast_task": None,
                 "started_at": time.time(), "timeout": req.timeout,
             }
@@ -1712,7 +1768,7 @@ async def start_recording(req: RecordingStartRequest, background_tasks: Backgrou
                 except Exception:
                     pass
             try:
-                await pw.__aexit__(None, None, None)
+                await pw_cm.__aexit__(None, None, None)
             except Exception:
                 pass
             _RECORDING_SESSIONS.pop(recording_id, None)
@@ -1751,10 +1807,12 @@ async def _auto_stop_recording(recording_id: str):
             await session["browser"].close()
         except Exception:
             pass
-        try:
-            await session["pw"].__aexit__(None, None, None)
-        except Exception:
-            pass
+        pw_cm = session.get("pw_cm")
+        if pw_cm:
+            try:
+                await pw_cm.__aexit__(None, None, None)
+            except Exception:
+                pass
 
 
 @app.post("/recordings/{recording_id}/stop")
@@ -1777,10 +1835,12 @@ async def stop_recording(recording_id: str, _=Depends(_verify_api_key)):
             await session["browser"].close()
         except Exception:
             pass
-        try:
-            await session["pw"].__aexit__(None, None, None)
-        except Exception:
-            pass
+        pw_cm = session.get("pw_cm")
+        if pw_cm:
+            try:
+                await pw_cm.__aexit__(None, None, None)
+            except Exception:
+                pass
 
     # 自动检测参数
     from agent.recording_converter import RecordingConverter

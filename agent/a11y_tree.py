@@ -11,7 +11,8 @@ Accessibility Tree 提取：轻量级页面结构表示。
 """
 
 # JS: 提取 Accessibility Tree 的精简表示
-_A11Y_TREE_JS = """() => {
+# MAX_LINES 由 Python 侧通过参数传入
+_A11Y_TREE_JS_TEMPLATE = """(maxLines) => {
     const INTERACTIVE_TAGS = new Set([
         'input', 'textarea', 'select', 'button', 'a', 'details', 'summary'
     ]);
@@ -23,7 +24,7 @@ _A11Y_TREE_JS = """() => {
     ]);
 
     const lines = [];
-    const MAX_LINES = 150;
+    const MAX_LINES = maxLines || 150;
     let lineCount = 0;
 
     // 获取页面基本信息
@@ -32,10 +33,12 @@ _A11Y_TREE_JS = """() => {
     lines.push('---');
     lineCount += 3;
 
+    const vMid = window.innerHeight / 2;
+
     function isVisible(el) {
         const rect = el.getBoundingClientRect();
         if (rect.width < 4 || rect.height < 4) return false;
-        if (rect.bottom < -100 || rect.top > window.innerHeight + 100) return false;
+        if (rect.bottom < -300 || rect.top > window.innerHeight + 300) return false;
         if (rect.right < 0 || rect.left > window.innerWidth) return false;
         const style = window.getComputedStyle(el);
         if (style.display === 'none' || style.visibility === 'hidden') return false;
@@ -51,7 +54,16 @@ _A11Y_TREE_JS = """() => {
                 text += child.textContent.trim() + ' ';
             }
         }
-        return text.trim().substring(0, 60);
+        return text.trim().substring(0, 80);
+    }
+
+    function getPositionMark(el) {
+        try {
+            const rect = el.getBoundingClientRect();
+            if (rect.top < vMid * 0.4) return ' ↑';
+            if (rect.top > vMid * 1.6) return ' ↓';
+        } catch(e) {}
+        return '';
     }
 
     function isInteractive(el) {
@@ -115,9 +127,10 @@ _A11Y_TREE_JS = """() => {
 
             // 值/文本
             const text = getNodeText(el) || el.value || el.placeholder || el.getAttribute('aria-label') || '';
-            if (text) desc += ' ' + text.substring(0, 50);
+            if (text) desc += ' ' + text.substring(0, 60);
             if (el.disabled) desc += ' [disabled]';
             if (tag === 'input' && el.checked) desc += ' [checked]';
+            desc += getPositionMark(el);
 
             lines.push(desc);
             lineCount++;
@@ -155,6 +168,10 @@ _A11Y_TREE_JS = """() => {
 }"""
 
 
+# 保持向后兼容的旧变量名
+_A11Y_TREE_JS = _A11Y_TREE_JS_TEMPLATE
+
+
 # JS: 提取页面摘要信息（用于判断是否需要截图）
 _PAGE_SUMMARY_JS = """() => {
     const title = document.title || '';
@@ -185,13 +202,14 @@ _PAGE_SUMMARY_JS = """() => {
 }"""
 
 
-async def extract_a11y_tree(page) -> str:
+async def extract_a11y_tree(page, max_lines: int = 150) -> str:
     """
     提取页面的 Accessibility Tree 文本表示。
     返回纯文本字符串，约 500-1500 tokens。
+    max_lines: 动态行数上限（简单页面 100 / 默认 150 / 复杂页面 250）
     """
     try:
-        tree = await page.evaluate(_A11Y_TREE_JS)
+        tree = await page.evaluate(_A11Y_TREE_JS_TEMPLATE, max_lines)
         return tree or "Page: (empty)\nURL: about:blank"
     except Exception as e:
         return f"Page: (error extracting a11y tree: {e})\nURL: {page.url}"
@@ -249,3 +267,36 @@ def should_use_screenshot(
         return True
 
     return False
+
+
+# JS: 提取页面布局摘要（nav/header/footer/main 的位置分布）
+_LAYOUT_SUMMARY_JS = """() => {
+    const vh = window.innerHeight;
+    const regions = { top: [], middle: [], bottom: [] };
+    const selectors = 'nav, header, footer, main, [role="banner"], [role="navigation"], [role="main"], [role="contentinfo"]';
+    document.querySelectorAll(selectors).forEach(el => {
+        const r = el.getBoundingClientRect();
+        if (r.width < 10 || r.height < 10) return;
+        const tag = el.tagName.toLowerCase();
+        const label = el.getAttribute('aria-label') || '';
+        const region = r.top < vh * 0.2 ? 'top' : r.top > vh * 0.7 ? 'bottom' : 'middle';
+        regions[region].push(tag + (label ? '(' + label.substring(0, 30) + ')' : ''));
+    });
+    const parts = [];
+    if (regions.top.length) parts.push('top=[' + regions.top.join(',') + ']');
+    if (regions.middle.length) parts.push('mid=[' + regions.middle.join(',') + ']');
+    if (regions.bottom.length) parts.push('bot=[' + regions.bottom.join(',') + ']');
+    return parts.length ? 'Layout: ' + parts.join(' ') : '';
+}"""
+
+
+async def get_layout_summary(page) -> str:
+    """
+    提取页面布局摘要：nav/header/footer/main 的位置分布。
+    返回约 50 tokens 的布局描述，用于 DOM 模式下帮助 LLM 理解页面结构。
+    """
+    try:
+        result = await page.evaluate(_LAYOUT_SUMMARY_JS)
+        return result or ""
+    except Exception:
+        return ""

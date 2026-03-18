@@ -261,7 +261,9 @@ def _decompose_task(task: str) -> list[dict]:
         )
         if not resp.choices:
             return []
-        raw = resp.choices[0].message.content
+        raw = resp.choices[0].message.content or ""
+        if not raw.strip():
+            return []
         data = json.loads(raw)
         steps = data if isinstance(data, list) else data.get("steps", [])
         return steps if isinstance(steps, list) else []

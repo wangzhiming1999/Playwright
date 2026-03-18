@@ -203,6 +203,13 @@ class _WrappedResponse:
                     name=block.name,
                     arguments=json.dumps(block.input, ensure_ascii=False),
                 ))
+        # Strip markdown code fences that Claude sometimes wraps JSON in
+        if content_text:
+            stripped = content_text.strip()
+            if stripped.startswith("```"):
+                stripped = _re.sub(r"^```[a-zA-Z]*\n?", "", stripped)
+                stripped = _re.sub(r"\n?```$", "", stripped.rstrip())
+                content_text = stripped.strip()
         msg = _Message(
             role=resp.role,
             content=content_text or None,

@@ -145,7 +145,10 @@ class MemoryManager:
                 )
                 if not resp.choices:
                     return []
-                data = json.loads(resp.choices[0].message.content)
+                raw = resp.choices[0].message.content or ""
+                if not raw.strip():
+                    return []
+                data = json.loads(raw)
                 break
             except json.JSONDecodeError:
                 if attempt == 0:

@@ -5,6 +5,7 @@
 ## ✨ 核心特性
 
 - **视觉驱动操作** - LLM 直接"看"网页截图，通过视觉理解定位元素
+- **DOM 优先（a11y tree）** - 非关键步骤用页面结构文本替代截图，显著降低 token 与延迟
 - **多 LLM 后端** - 支持 OpenAI (GPT-4o)、Anthropic (Claude)、litellm（Gemini / Ollama / Azure 等 100+ 模型）
 - **智能任务分解** - 自动将复杂任务拆解为可执行步骤
 - **失败自愈** - 操作失败时 AI 自动分析原因并调整策略重试
@@ -17,6 +18,7 @@
 - **Webhook 回调** - 任务完成/失败时自动通知外部系统
 - **断点续跑** - 从检查点恢复中断的任务
 - **Cookie 持久化** - 自动保存登录状态，跨会话复用
+- **浏览器池（BrowserPool）** - builtin 模式下复用浏览器进程，避免每个任务冷启动
 - **网站探索** - 自动爬取网站并生成营销内容（截图策展 + 文案生成）
 - **Docker 支持** - 开箱即用的容器化部署
 
@@ -126,6 +128,9 @@ skyvern/
 │   ├── __init__.py         # 包导出
 │   ├── core.py             # BrowserAgent 类（截图、点击、输入、工具执行）
 │   ├── runner.py           # run_agent() 主函数（LLM 决策循环）
+│   ├── browser_pool.py     # 浏览器池（复用 browser 进程，任务隔离用 context）
+│   ├── a11y_tree.py        # DOM 模式：提取 Accessibility Tree + 截图按需策略
+│   ├── trace.py            # 决策链路追踪（每步输入/工具/结果/验证/成本）
 │   ├── tools.py            # 工具定义（LLM 可调用的 20+ 操作）
 │   ├── llm_helpers.py      # 任务分解、步骤验证、上下文压缩
 │   ├── page_utils.py       # 页面就绪等待、安全打印
@@ -185,6 +190,11 @@ skyvern/
 | `CORS_ORIGINS` | CORS 允许的源（逗号分隔） | `http://localhost:8000` |
 | `MAX_QUEUE_SIZE` | 最大并发任务数 | `20` |
 | `MAX_TASKS_KEEP` | 保留的历史任务数 | `50` |
+| `MAX_CONCURRENT_TASKS` | TaskPool 最大并发（影响同时运行的任务数） | `3` |
+| `AGENT_WORKERS` | 后端线程池 worker 数（Playwright 在独立线程运行） | `4` |
+| `USE_BROWSER_POOL` | 是否启用浏览器池（仅 builtin 模式生效） | `true` |
+| `BROWSER_POOL_SIZE` | 浏览器池大小（预启动的 browser 进程数） | `MAX_CONCURRENT_TASKS` |
+| `BROWSER_POOL_IDLE_TIMEOUT` | 空闲多久后回收并重建浏览器（秒） | `300` |
 
 ### 浏览器模式
 
@@ -193,6 +203,26 @@ skyvern/
 | `builtin` | ✅ 可用 | 内置 Chromium，开箱即用 |
 | `user_chrome` | 🚧 开发中 | 使用用户 Chrome 配置文件，保留登录态 |
 | `cdp` | 🚧 开发中 | CDP 远程调试，连接已打开的 Chrome |
+
+### 浏览器池（BrowserPool）
+
+默认开启（`USE_BROWSER_POOL=true`）：当 `browser_mode=builtin` 且池已启动时，后端会从池中 **借用一个常驻的 browser 进程**，并为每个任务创建独立 `BrowserContext` 来隔离 cookie/storage；任务结束后只关闭 context 并归还槽位，避免每次冷启动 Chromium。
+
+常见建议：
+- **并发任务较多**：增大 `BROWSER_POOL_SIZE`（一般设置为 `MAX_CONCURRENT_TASKS` 或略大）
+- **内存占用敏感**：降低 `BROWSER_POOL_SIZE` 或缩短 `BROWSER_POOL_IDLE_TIMEOUT`
+- **`cdp` / `user_chrome`**：不走池（它们本身就是复用外部/持久化浏览器）
+
+### DOM 模式（Accessibility Tree）
+
+为降低 token 与延迟，主循环会优先发送 **页面结构文本（a11y tree）**，仅在需要视觉信息时才回退到截图模式：
+- 首步、导航/切换 tab/iframe 后
+- 检测到验证码/弹窗
+- 连续多步 DOM 模式后（防止长期缺失视觉信息）
+- 执行 `find_element` / `save_element` / `solve_captcha` / `drag_drop` 等视觉相关工具后
+- 页面图片较多需要视觉定位时
+
+如果你希望强制拿截图，可在任务里显式要求（或让 Agent 调用 `screenshot` 工具）。
 
 ### 网站凭证配置
 
@@ -223,6 +253,29 @@ pytest tests/test_app.py -v
 pytest -k "test_validate_url"
 ```
 
+### 评测基准（Benchmark）
+
+基准会跑一组 E2E 场景并生成报告（含：成功率、平均耗时、平均步数、成本、回归对比）。报告会写入 `benchmarks/`，并用 `benchmarks/latest.json` 作为最新基线。
+
+```bash
+# 运行全部场景（默认保存基线，并与 latest 对比）
+python -m tests.e2e.benchmark
+
+# 只跑某一类/难度
+python -m tests.e2e.benchmark --category search
+python -m tests.e2e.benchmark --difficulty basic
+
+# 只跑带 tag 的场景
+python -m tests.e2e.benchmark --tags real_site
+
+# 不做基线对比 / 不保存基线
+python -m tests.e2e.benchmark --no-compare
+python -m tests.e2e.benchmark --no-save
+
+# 列出历史基线
+python -m tests.e2e.benchmark --list-baselines
+```
+
 ## 📊 API 端点
 
 ### 任务管理
@@ -246,6 +299,15 @@ pytest -k "test_validate_url"
 - `POST /tasks/{task_id}/cancel` - 取消运行中的任务
 
 - `DELETE /tasks/{task_id}` - 删除指定任务
+
+### 浏览器池
+
+- `GET /browser-pool` - 查询浏览器池状态（总数/在用/空闲/slot 详情）
+- `PUT /browser-pool` - 调整池大小
+  ```json
+  {"max_size": 4}
+  ```
+- `POST /browser-pool/warmup` - 手动预热/健康检查（重建掉线的 browser）
 
 ### 网站探索
 

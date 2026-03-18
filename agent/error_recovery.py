@@ -16,13 +16,13 @@ class FailureType(Enum):
     UNKNOWN = "unknown"
 
 
-# 每种失败类型的最大容忍次数
+# 每种失败类型的最大容忍次数（+2 补偿渐进衰减）
 _MAX_FAILURES = {
-    FailureType.ELEMENT_NOT_FOUND: 8,   # 元素找不到可以多试几次（滚动、刷新）
-    FailureType.PAGE_NOT_LOADED: 4,     # 页面加载失败
-    FailureType.LLM_INVALID: 5,        # LLM 返回无效
-    FailureType.NETWORK_ERROR: 3,       # 网络错误容忍度低
-    FailureType.UNKNOWN: 5,
+    FailureType.ELEMENT_NOT_FOUND: 10,  # 元素找不到可以多试几次（滚动、刷新）
+    FailureType.PAGE_NOT_LOADED: 6,     # 页面加载失败
+    FailureType.LLM_INVALID: 7,        # LLM 返回无效
+    FailureType.NETWORK_ERROR: 5,       # 网络错误容忍度低
+    FailureType.UNKNOWN: 7,
 }
 
 # 每种失败类型的恢复建议（注入到 GPT 的 tool result 中）
@@ -86,9 +86,9 @@ class FailureTracker:
         return ft, self._counts[ft], hint
 
     def record_success(self):
-        """成功操作重置所有计数器。"""
+        """成功操作：计数器减半（而非清零），避免过于乐观。连续失败计数仍清零。"""
         for ft in FailureType:
-            self._counts[ft] = 0
+            self._counts[ft] = self._counts[ft] // 2
         self._total_consecutive = 0
 
     def should_abort(self) -> tuple[bool, str]:

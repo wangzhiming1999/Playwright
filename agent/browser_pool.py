@@ -1,67 +1,43 @@
 """
-浏览器实例池：池化复用 Playwright 浏览器实例，避免每个任务冷启动。
+浏览器并发控制池（信号量模式）
 
-设计：
-- 池运行在自己的专用线程中（ProactorEventLoop），解决 Playwright 跨线程问题
-- 预创建 N 个浏览器实例，任务从池中借用，用完归还
-- 每个任务用独立 BrowserContext 隔离（cookies/storage 互不干扰）
-- 归还时关闭 context，浏览器进程保持运行
-- 空闲超时自动回收（默认 5 分钟）
-- 健康检查：借出前检测浏览器是否存活，崩溃的自动替换
-- 只有 builtin 模式走池，cdp/user_chrome 不走池
+设计原则：
+- Playwright 对象（Browser/Context/Page）绑定到创建它的事件循环，不能跨线程传递
+- 本模块只做"槽位占用"控制，限制同时运行的浏览器数量
+- 每个 agent 线程自己启动 Playwright、创建浏览器和 context
+- acquire_sync 阻塞直到有空闲槽位，release_sync 释放槽位
 """
 
-import asyncio
-import sys
 import threading
 import time
 import logging
-from dataclasses import dataclass, field
 from typing import Optional
-
-from playwright.async_api import async_playwright, Playwright, Browser, BrowserContext
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class BrowserSlot:
-    """浏览器池中的一个槽位。"""
-    browser: Browser
-    in_use: bool = False
-    created_at: float = field(default_factory=time.time)
-    last_used_at: float = field(default_factory=time.time)
-    task_id: Optional[str] = None
-    context: Optional[BrowserContext] = None
-
-
 class BrowserPool:
     """
-    浏览器实例池，运行在专用线程中。
+    浏览器并发控制池（信号量模式）。
 
-    池内部有自己的事件循环和 Playwright 实例，
-    通过 acquire_sync/release_sync 提供线程安全的同步接口。
+    不共享任何 Playwright 对象，只限制同时运行的任务数。
+    acquire_sync/release_sync 是线程安全的同步接口。
     """
 
     def __init__(
         self,
         max_size: int = 3,
-        idle_timeout: float = 300.0,
+        idle_timeout: float = 300.0,  # 保留参数，兼容旧调用，不再使用
         headless: bool = False,
         proxy: Optional[str] = None,
     ):
         self._max_size = max_size
-        self._idle_timeout = idle_timeout
         self._headless = headless
         self._proxy = proxy
-        self._pw: Optional[Playwright] = None
-        self._slots: list[BrowserSlot] = []
-        self._lock = asyncio.Lock()
+        self._semaphore = threading.Semaphore(max_size)
+        self._lock = threading.Lock()
+        self._active: dict[str, float] = {}  # task_id -> acquired_at
         self._started = False
-        self._cleanup_task: Optional[asyncio.Task] = None
-        # 专用线程和事件循环
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._thread: Optional[threading.Thread] = None
 
     @property
     def max_size(self) -> int:
@@ -72,236 +48,88 @@ class BrowserPool:
         return self._started
 
     def start_sync(self):
-        """同步启动：创建专用线程，启动 Playwright 和浏览器池。"""
-        if self._started:
-            return
-        ready = threading.Event()
-        error_holder = [None]
-
-        def _run():
-            if sys.platform == "win32":
-                asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-            self._loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self._loop)
-            try:
-                self._loop.run_until_complete(self._start_async())
-                ready.set()
-                self._loop.run_forever()
-            except Exception as e:
-                error_holder[0] = e
-                ready.set()
-            finally:
-                self._loop.close()
-
-        self._thread = threading.Thread(target=_run, name="browser-pool", daemon=True)
-        self._thread.start()
-        ready.wait(timeout=60)
-        if error_holder[0]:
-            raise error_holder[0]
-
-    async def _start_async(self):
-        """在池线程的事件循环中启动 Playwright 和浏览器。"""
-        self._pw = await async_playwright().start()
-        for _ in range(self._max_size):
-            browser = await self._launch_browser()
-            self._slots.append(BrowserSlot(browser=browser))
+        """启动池（信号量模式下只是标记 started）。"""
         self._started = True
-        self._cleanup_task = asyncio.ensure_future(self._idle_cleanup_loop())
-        logger.info(f"BrowserPool started: {self._max_size} browsers, headless={self._headless}")
+        logger.info(f"BrowserPool (semaphore mode) started: max_size={self._max_size}")
 
-    async def _launch_browser(self) -> Browser:
-        """启动一个新的浏览器实例。"""
-        launch_args = {"headless": self._headless}
-        if self._proxy:
-            launch_args["proxy"] = {"server": self._proxy}
-        return await self._pw.chromium.launch(**launch_args)
-
-    # ── 异步核心方法（在池线程的事件循环中执行） ──────────────────────────
-
-    async def _acquire_async(self, task_id: str) -> tuple[Browser, BrowserContext]:
-        """从池中借用一个浏览器实例，创建独立的 BrowserContext。"""
-        while True:
-            async with self._lock:
-                for slot in self._slots:
-                    if not slot.in_use:
-                        # 健康检查
-                        if not slot.browser.is_connected():
-                            logger.warning("Browser in slot is dead, replacing...")
-                            try:
-                                await slot.browser.close()
-                            except Exception:
-                                pass
-                            slot.browser = await self._launch_browser()
-                            slot.created_at = time.time()
-
-                        slot.in_use = True
-                        slot.task_id = task_id
-                        slot.last_used_at = time.time()
-                        context = await slot.browser.new_context(
-                            viewport={"width": 1920, "height": 1080},
-                            locale="zh-CN",
-                        )
-                        slot.context = context
-                        logger.info(f"Acquired browser for task {task_id}")
-                        return slot.browser, context
-            await asyncio.sleep(0.5)
-
-    async def _release_async(self, task_id: str):
-        """归还浏览器实例：关闭 context，保留浏览器进程。"""
-        async with self._lock:
-            for slot in self._slots:
-                if slot.task_id == task_id and slot.in_use:
-                    if slot.context:
-                        try:
-                            await slot.context.close()
-                        except Exception as e:
-                            logger.warning(f"Failed to close context for task {task_id}: {e}")
-                        slot.context = None
-                    slot.in_use = False
-                    slot.task_id = None
-                    slot.last_used_at = time.time()
-                    logger.info(f"Released browser for task {task_id}")
-                    return
-        logger.warning(f"No slot found for task {task_id} during release")
-
-    # ── 同步接口（从任意线程调用） ──────────────────────────────────────
-
-    def acquire_sync(self, task_id: str, timeout: float = 60) -> tuple[Browser, BrowserContext]:
-        """线程安全的同步 acquire。从任意线程调用，阻塞直到获取到浏览器。"""
-        fut = asyncio.run_coroutine_threadsafe(self._acquire_async(task_id), self._loop)
-        return fut.result(timeout=timeout)
+    def acquire_sync(self, task_id: str, timeout: float = 60) -> bool:
+        """
+        阻塞直到获取到一个槽位。
+        返回 True 表示成功获取，调用方可以自行启动浏览器。
+        超时抛出 TimeoutError。
+        """
+        acquired = self._semaphore.acquire(timeout=timeout)
+        if not acquired:
+            raise TimeoutError(f"BrowserPool: timeout waiting for slot (task={task_id})")
+        with self._lock:
+            self._active[task_id] = time.time()
+        logger.info(f"BrowserPool: slot acquired for task {task_id} ({len(self._active)}/{self._max_size} in use)")
+        return True
 
     def release_sync(self, task_id: str, timeout: float = 30):
-        """线程安全的同步 release。从任意线程调用。"""
-        fut = asyncio.run_coroutine_threadsafe(self._release_async(task_id), self._loop)
-        fut.result(timeout=timeout)
-
-    # ── 管理方法 ──────────────────────────────────────────────────────────
+        """释放槽位。"""
+        with self._lock:
+            self._active.pop(task_id, None)
+        self._semaphore.release()
+        logger.info(f"BrowserPool: slot released for task {task_id} ({len(self._active)}/{self._max_size} in use)")
 
     def shutdown_sync(self, timeout: float = 30):
-        """同步关闭：停止所有浏览器和 Playwright，终止专用线程。"""
-        if not self._started or not self._loop:
-            return
-        fut = asyncio.run_coroutine_threadsafe(self._shutdown_async(), self._loop)
-        try:
-            fut.result(timeout=timeout)
-        except Exception as e:
-            logger.warning(f"Shutdown error: {e}")
-        self._loop.call_soon_threadsafe(self._loop.stop)
-        if self._thread:
-            self._thread.join(timeout=10)
-
-    async def _shutdown_async(self):
-        """在池线程中执行关闭。"""
-        if self._cleanup_task:
-            self._cleanup_task.cancel()
-            try:
-                await self._cleanup_task
-            except asyncio.CancelledError:
-                pass
-        for slot in self._slots:
-            try:
-                if slot.context:
-                    await slot.context.close()
-                await slot.browser.close()
-            except Exception as e:
-                logger.warning(f"Error closing browser: {e}")
-        self._slots.clear()
-        if self._pw:
-            await self._pw.stop()
-            self._pw = None
+        """关闭池。"""
         self._started = False
         logger.info("BrowserPool shutdown complete")
 
     def resize_sync(self, new_size: int, timeout: float = 30):
-        """同步调整池大小。"""
-        fut = asyncio.run_coroutine_threadsafe(self._resize_async(new_size), self._loop)
-        fut.result(timeout=timeout)
-
-    async def _resize_async(self, new_size: int):
-        """在池线程中执行 resize。"""
+        """调整最大并发数（重建信号量）。"""
         if new_size < 1:
             new_size = 1
-        async with self._lock:
-            old_size = self._max_size
-            self._max_size = new_size
-            if new_size > old_size:
-                for _ in range(new_size - old_size):
-                    browser = await self._launch_browser()
-                    self._slots.append(BrowserSlot(browser=browser))
-            elif new_size < old_size:
-                to_remove = old_size - new_size
-                removed = 0
-                for i in range(len(self._slots) - 1, -1, -1):
-                    if removed >= to_remove:
-                        break
-                    if not self._slots[i].in_use:
-                        slot = self._slots.pop(i)
-                        try:
-                            await slot.browser.close()
-                        except Exception:
-                            pass
-                        removed += 1
+        old_size = self._max_size
+        # 计算当前已占用的槽位数
+        with self._lock:
+            in_use = len(self._active)
+        # 重建信号量：新容量 = new_size，当前已用 = in_use
+        self._semaphore = threading.Semaphore(max(0, new_size - in_use))
+        self._max_size = new_size
         logger.info(f"BrowserPool resized: {old_size} → {new_size}")
 
     def warmup_sync(self, timeout: float = 60):
-        """同步预热。"""
-        fut = asyncio.run_coroutine_threadsafe(self._warmup_async(), self._loop)
-        fut.result(timeout=timeout)
-
-    async def _warmup_async(self):
-        """在池线程中执行预热。"""
-        async with self._lock:
-            for slot in self._slots:
-                if not slot.browser.is_connected():
-                    try:
-                        await slot.browser.close()
-                    except Exception:
-                        pass
-                    slot.browser = await self._launch_browser()
-                    slot.created_at = time.time()
-
-    async def _idle_cleanup_loop(self):
-        """定期检查空闲超时的浏览器，关闭并替换。"""
-        while True:
-            await asyncio.sleep(60)
-            now = time.time()
-            async with self._lock:
-                for slot in self._slots:
-                    if (
-                        not slot.in_use
-                        and (now - slot.last_used_at) > self._idle_timeout
-                        and slot.browser.is_connected()
-                    ):
-                        logger.info(f"Closing idle browser (idle {now - slot.last_used_at:.0f}s)")
-                        try:
-                            await slot.browser.close()
-                        except Exception:
-                            pass
-                        slot.browser = await self._launch_browser()
-                        slot.created_at = time.time()
-                        slot.last_used_at = time.time()
+        """预热（信号量模式下无需预热）。"""
+        pass
 
     def stats(self) -> dict:
-        """返回池状态（线程安全，只读快照）。"""
+        """返回池状态快照。"""
+        with self._lock:
+            active_copy = dict(self._active)
         now = time.time()
         slots_info = []
-        for i, slot in enumerate(self._slots):
-            slots_info.append({
-                "index": i,
-                "in_use": slot.in_use,
-                "task_id": slot.task_id,
-                "connected": slot.browser.is_connected() if slot.browser else False,
-                "created_at": slot.created_at,
-                "last_used_at": slot.last_used_at,
-                "idle_seconds": round(now - slot.last_used_at, 1) if not slot.in_use else 0,
-            })
+        for i in range(self._max_size):
+            task_ids = list(active_copy.keys())
+            if i < len(task_ids):
+                tid = task_ids[i]
+                slots_info.append({
+                    "index": i,
+                    "in_use": True,
+                    "task_id": tid,
+                    "connected": True,
+                    "created_at": active_copy[tid],
+                    "last_used_at": active_copy[tid],
+                    "idle_seconds": 0,
+                })
+            else:
+                slots_info.append({
+                    "index": i,
+                    "in_use": False,
+                    "task_id": None,
+                    "connected": False,
+                    "created_at": now,
+                    "last_used_at": now,
+                    "idle_seconds": 0,
+                })
         return {
             "max_size": self._max_size,
-            "total": len(self._slots),
-            "in_use": sum(1 for s in self._slots if s.in_use),
-            "idle": sum(1 for s in self._slots if not s.in_use),
+            "total": self._max_size,
+            "in_use": len(active_copy),
+            "idle": self._max_size - len(active_copy),
             "headless": self._headless,
-            "idle_timeout": self._idle_timeout,
+            "idle_timeout": 0,
             "slots": slots_info,
         }

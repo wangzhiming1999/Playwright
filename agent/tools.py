@@ -92,6 +92,21 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "wait_for_text",
+            "description": "Wait for specific text to appear on the page. More reliable than wait(selector=...) because it doesn't require knowing CSS selectors. Useful after form submission, navigation, or AJAX loading.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "The text to wait for (case-insensitive partial match)"},
+                    "timeout": {"type": "integer", "description": "Max wait seconds, default 15"},
+                },
+                "required": ["text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "screenshot",
             "description": "截图并保存，任务完成时调用",
             "parameters": {
