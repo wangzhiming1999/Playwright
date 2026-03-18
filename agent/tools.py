@@ -157,6 +157,45 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "set_date",
+            "description": (
+                "在日期输入框中设置日期。支持 input[type='date'] 和常见日期选择器组件。"
+                "优先直接设置 value 并触发 change 事件，失败则清空输入框后键盘输入。"
+                "日期格式：YYYY-MM-DD（如 2024-03-15）。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "index": {"type": "integer", "description": "截图中日期输入框的编号（蓝色数字标签）"},
+                    "date": {"type": "string", "description": "日期字符串，格式 YYYY-MM-DD，如 2024-03-15"},
+                },
+                "required": ["index", "date"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "analyze_current_page",
+            "description": (
+                "分析当前页面的站点结构和特征。返回站点类别、名称、关键功能、导航入口等信息。"
+                "适用于：到达新的子站点、遇到复杂页面需要理解整体结构时。"
+                "不要频繁调用，每个新站点调用一次即可。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "context": {
+                        "type": "string",
+                        "description": "可选的上下文说明，如'这是一个电商网站的后台管理页面'",
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "done",
             "description": "任务已完成，退出循环",
             "parameters": {

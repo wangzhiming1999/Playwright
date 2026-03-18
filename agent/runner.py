@@ -135,6 +135,34 @@ def _normalize_url(url: str) -> str:
         return url
 
 
+def _format_site_understanding(analysis: dict) -> str:
+    """Format site analysis result as a prompt hint for LLM."""
+    if not analysis or analysis.get("site_category") == "unknown":
+        return ""
+
+    parts = ["## 站点理解（自动分析结果）"]
+    parts.append(f"- 站点: {analysis.get('site_name', '未知')} ({analysis.get('site_category', '未知')})")
+
+    if analysis.get("needs_login"):
+        parts.append("- 需要登录才能使用核心功能")
+
+    features = analysis.get("key_features_visible", [])
+    if features:
+        parts.append(f"- 可见功能: {', '.join(features[:5])}")
+
+    strategy = analysis.get("exploration_strategy", "")
+    if strategy:
+        parts.append(f"- 建议策略: {strategy}")
+
+    entry_points = analysis.get("entry_points", [])
+    if entry_points:
+        top_entries = sorted(entry_points, key=lambda x: -x.get("priority", 0))[:3]
+        entries_str = ", ".join(f"{e.get('label', '')}({e.get('path', '')})" for e in top_entries)
+        parts.append(f"- 关键入口: {entries_str}")
+
+    return "\n".join(parts)
+
+
 async def run_agent(
     task: str,
     headless: bool = False,
@@ -149,6 +177,8 @@ async def run_agent(
     chrome_profile: str = None,  # browser_mode="user_chrome" 时指定 profile 名，默认 "Default"
     pool_browser=None,           # 从 BrowserPool 注入的浏览器实例
     pool_context=None,           # 从 BrowserPool 注入的 BrowserContext
+    site_understanding: bool = True,  # 首步自动分析站点结构
+    max_steps: int = 35,         # 最大执行步数
 ) -> dict:
     """
     运行 agent 执行任务。
@@ -379,7 +409,13 @@ async def run_agent(
         if custom_count > 0:
             await _log(f"  [自定义 Action] 已加载 {custom_count} 个自定义工具")
 
-        max_steps = 35
+        # 环境变量覆盖 max_steps
+        _env_max_steps = os.environ.get("AGENT_MAX_STEPS")
+        if _env_max_steps:
+            try:
+                max_steps = max(10, min(int(_env_max_steps), 200))
+            except (ValueError, TypeError):
+                pass
         fail_count = 0
         last_tool_name = None
         last_tool_pressed_enter = False
@@ -452,23 +488,27 @@ async def run_agent(
                 await _log(f"__PROGRESS__:{plan_manager.completed_count}/{plan_manager.total_steps}")
             else:
                 await _log(f"__PROGRESS__:{step+1}/{max_steps}")
-            # 步数预警：80% 时提醒 GPT 加速收尾（缓存到 nudge，避免打断 tool_result）
-            if step == int(max_steps * 0.8):
-                await _log(f"  ⚠ [预警] 已执行 {step+1}/{max_steps} 步，即将达到上限")
-                _pending_nudges.append("⚠️ 注意：你已使用了大部分步数，请尽快完成任务。如果核心目标已达成，请截图并调用 done。")
+            # 步数预警：剩余 5 步时提醒 GPT 加速收尾
+            _remaining = max_steps - step - 1
+            if _remaining == 5:
+                await _log(f"  ⚠ [预警] 已执行 {step+1}/{max_steps} 步，仅剩 {_remaining} 步")
+                _pending_nudges.append(f"⚠️ 注意：仅剩 {_remaining} 步可用，请尽快完成任务。如果核心目标已达成，请截图并调用 done。")
 
-            # 只在第一步和 navigate 后检查弹窗，避免干扰正常操作
+            # 只在第一步用完整 dismiss_overlay（含 AI fallback），后续步骤用轻量 quick_dismiss
             if step == 0:
                 await agent.dismiss_overlay()
                 # 首步主动检测 CAPTCHA
                 await watchdog.check_captcha()
+            else:
+                # 每步轻量弹窗检测（<100ms，不调 AI）
+                await agent.quick_dismiss()
 
             # 截图前确保页面就绪（统一使用 _wait_for_page_ready）
             await _wait_for_page_ready(agent.page, log_fn=_log, timeout_ms=10000, check_network=True, active_requests=active_requests)
 
             # ── DOM 优先 + 按需截图策略 ──────────────────────────────────
             # 获取页面摘要，判断是否需要截图
-            page_summary = await get_page_summary(agent.page)
+            page_summary = await get_page_summary(agent.get_active_page())
             use_screenshot = should_use_screenshot(
                 step=step,
                 last_tool=last_tool_name,
@@ -478,7 +518,7 @@ async def run_agent(
 
             # DOM 变化检测
             try:
-                _cur_hash = await agent.page.evaluate("() => document.body.innerText.length + '|' + document.body.children.length")
+                _cur_hash = await agent.get_active_page().evaluate("() => document.body.innerText.length + '|' + document.body.children.length")
             except Exception:
                 _cur_hash = None
 
@@ -494,7 +534,7 @@ async def run_agent(
                 await _log(f"  [截图复用] DOM 未变化，跳过重新截图")
             else:
                 try:
-                    img_b64, elements = await annotate_page(agent.page)
+                    img_b64, elements = await annotate_page(agent.get_active_page())
                 except Exception as e:
                     await _log(f"  ⚠ 页面标注失败: {e}，使用普通截图")
                     use_screenshot = True  # 标注失败时强制截图
@@ -506,6 +546,33 @@ async def run_agent(
                         await _log(f"  ❌ 截图也失败: {e2}，终止任务")
                         break
                 _last_content_hash = _cur_hash
+
+            # ── 站点理解：首步自动分析 ──────────────────────────────────
+            _site_understanding_enabled = site_understanding and os.environ.get("SITE_UNDERSTANDING", "1") != "0"
+            if step == 0 and _site_understanding_enabled and not getattr(agent, '_site_analysis', None):
+                try:
+                    _page_url = agent.page.url
+                    if _page_url and _page_url != "about:blank":
+                        await _log("  [站点理解] 正在分析目标站点...")
+                        _page_html = await agent._safe_evaluate(
+                            "() => document.documentElement.outerHTML",
+                            timeout_ms=10000,
+                            default=""
+                        )
+                        if _page_html:
+                            from site_understanding import analyze_site as _analyze_site
+                            _site_analysis = _analyze_site(
+                                url=_page_url,
+                                html=_page_html,
+                                screenshot_b64=img_b64 if use_screenshot else None,
+                            )
+                            agent._site_analysis = _site_analysis
+                            _site_hint = _format_site_understanding(_site_analysis)
+                            if _site_hint:
+                                messages[0]["content"] += f"\n\n{_site_hint}"
+                                await _log(f"  [站点理解] {_site_analysis.get('site_name', '?')} ({_site_analysis.get('site_category', '?')})")
+                except Exception as e:
+                    await _log(f"  ⚠ [站点理解] 分析失败: {e}")
 
             elements_summary = trim_elements(elements)
 
@@ -559,7 +626,7 @@ async def run_agent(
                 _consecutive_dom_steps += 1
                 _dom_tokens_saved += 1100  # 每次省掉一张截图的 token
 
-                a11y_tree = await extract_a11y_tree(agent.page)
+                a11y_tree = await extract_a11y_tree(agent.get_active_page())
                 await _log(f"  [DOM模式] 第{_consecutive_dom_steps}步（累计节省 ~{_dom_tokens_saved} tokens）")
 
                 messages.append({
@@ -577,16 +644,16 @@ async def run_agent(
                 })
 
             # ── Token 级上下文压缩 ──────────────────────────────────────
-            # 硬上限：消息数 > 50 时强制截断（防止压缩失败时无限增长）
-            if len(messages) > 50:
+            # 硬上限：消息数 > 80 时强制截断（防止压缩失败时无限增长）
+            if len(messages) > 80:
                 await _log(f"  ⚠ [上下文] 消息数 {len(messages)} 超过硬上限，强制截断")
-                messages = [messages[0]] + messages[-15:]
+                messages = [messages[0]] + messages[-20:]
 
             # Token 级压缩：估算总 token 数，超过预算时智能压缩
             current_tokens = estimate_messages_tokens(messages)
             if current_tokens > 65000:  # 65k 触发压缩（20% 安全边际给 128k 上下文窗口）
                 await _log(f"  [上下文] 当前 {current_tokens} tokens，触发压缩...")
-                messages = _compress_messages(messages, max_tokens=65000, keep_recent=15)
+                messages = _compress_messages(messages, max_tokens=65000, keep_recent=20)
 
             # ── 智能模型路由 ──────────────────────────────────────────
             _last_failed = (
@@ -858,6 +925,20 @@ async def run_agent(
                         skipped_count = len(msg.tool_calls) - tc_idx - 1
                         change_type = "URL 变化" if url_changed else "DOM 内容变化"
                         await _log(f"  [multi_act] {change_type} ({url_before} → {url_after})，跳过剩余 {skipped_count} 个 action")
+
+                        # OAuth/SSO 跨域跳转感知
+                        if url_changed:
+                            try:
+                                domain_before = urlparse(url_before).netloc
+                                domain_after = urlparse(url_after).netloc
+                                if domain_before and domain_after and domain_before != domain_after:
+                                    _pending_nudges.append(
+                                        f"⚠️ 页面已跳转到第三方域名 ({domain_after})，"
+                                        "这可能是 OAuth/SSO 登录流程。请在此页面完成登录操作，完成后会自动跳回原站。"
+                                    )
+                            except Exception:
+                                pass
+
                         for remaining_tc in msg.tool_calls[tc_idx+1:]:
                             messages.append({"role": "tool", "tool_call_id": remaining_tc.id, "content": f"skipped: 页面已变化（{change_type}），后续操作取消"})
                         break

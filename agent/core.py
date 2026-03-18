@@ -22,6 +22,12 @@ class BrowserAgent:
         self._screenshot_callback = screenshot_callback
         self._task_id = task_id
         self._active_requests: set = set()  # 由外部主循环注入，供 wait 工具使用
+        self._nav_baseline_ms: float | None = None  # 首次导航耗时基准（ms），用于自适应超时
+        self._active_frame = None  # switch_iframe 设置的当前 frame
+
+    def get_active_page(self):
+        """返回当前活跃的页面或 iframe frame，供标注和截图使用。"""
+        return self._active_frame if self._active_frame else self.page
 
     async def screenshot_base64(self, quality: int = 92, full_page: bool = False) -> str:
         """截当前页面，返回 base64 字符串供 GPT 分析"""
@@ -128,9 +134,13 @@ class BrowserAgent:
             "[class*='modal'] button[class*='close' i]",
             "[class*='overlay'] button[class*='close' i]",
             "[class*='dialog'] button[class*='close' i]",
+            "[role='dialog'] button[class*='close' i]",
+            "[role='alertdialog'] button[class*='close' i]",
+            "[class*='popup'] button[class*='close' i]",
             "[class*='cookie'] button",
             "[id*='cookie'] button",
             "[class*='banner'] button",
+            "[class*='toast'] button[class*='close' i]",
             "[data-testid*='close' i]",
             "[data-dismiss]",
         ]
@@ -180,6 +190,85 @@ class BrowserAgent:
                     await self._log(f"  [弹窗] AI 关闭失败: {e}")
         except Exception as e:
             await self._log(f"  [弹窗] AI fallback 失败: {e}")
+
+    async def quick_dismiss(self) -> bool:
+        """轻量弹窗检测+关闭：只做 JS 检测 + selector 匹配，不调 AI。耗时 <100ms。
+        返回 True 表示关闭了弹窗。"""
+        try:
+            has_overlay = await self._safe_evaluate("""() => {
+                const d = document.querySelector('[role="dialog"]:not([aria-hidden="true"])');
+                const a = document.querySelector('[role="alertdialog"]:not([aria-hidden="true"])');
+                const m = document.querySelector('[class*="modal"]:not([style*="display: none"])');
+                const p = document.querySelector('[class*="popup"]:not([style*="display: none"])');
+                const el = d || a || m || p;
+                if (!el) return false;
+                const r = el.getBoundingClientRect();
+                return r.width > 0 && r.height > 0;
+            }""", timeout_ms=500, default=False)
+            if not has_overlay:
+                return False
+        except Exception:
+            return False
+
+        quick_selectors = [
+            "[role='dialog'] button[aria-label*='close' i]",
+            "[role='alertdialog'] button[aria-label*='close' i]",
+            "[class*='modal'] button[aria-label*='close' i]",
+            "[class*='popup'] button[class*='close' i]",
+            "[class*='modal'] button[class*='close' i]",
+            "[class*='toast'] button[class*='close' i]",
+            "[data-dismiss]",
+        ]
+        for sel in quick_selectors:
+            try:
+                el = self.page.locator(sel).first
+                if await el.is_visible(timeout=200):
+                    await el.click(timeout=500)
+                    await self._log("  [弹窗] quick_dismiss 关闭成功")
+                    return True
+            except Exception:
+                pass
+        return False
+
+    async def _detect_form_errors(self) -> str:
+        """检测页面上的表单验证错误，返回错误描述或空字符串。"""
+        try:
+            errors = await self._safe_evaluate("""() => {
+                const results = [];
+                // aria-invalid 标记
+                document.querySelectorAll('[aria-invalid="true"]').forEach(el => {
+                    const label = el.getAttribute('aria-label') || el.name || el.id || el.type || '';
+                    const msg = el.getAttribute('aria-errormessage');
+                    const msgEl = msg ? document.getElementById(msg) : null;
+                    const errText = msgEl ? msgEl.textContent.trim() : '';
+                    results.push({ field: label, error: errText });
+                });
+                // 常见错误 class
+                document.querySelectorAll('.error-message, .field-error, .invalid-feedback, [class*="error-msg"], [role="alert"]').forEach(el => {
+                    const text = el.textContent.trim();
+                    if (text && text.length < 200) {
+                        results.push({ field: '', error: text });
+                    }
+                });
+                return results.slice(0, 5);
+            }""", timeout_ms=2000, default=[])
+            if not errors:
+                return ""
+            parts = []
+            for e in errors:
+                field = e.get("field", "")
+                err = e.get("error", "")
+                if field and err:
+                    parts.append(f"{err}({field})")
+                elif err:
+                    parts.append(err)
+                elif field:
+                    parts.append(f"{field}: 验证失败")
+            if parts:
+                return "⚠️ 检测到表单错误: " + ", ".join(parts)
+            return ""
+        except Exception:
+            return ""
 
     async def _ai_validate(self, prompt: str) -> bool:
         """视觉验证：截图 + GPT 判断页面状态"""
@@ -296,11 +385,21 @@ class BrowserAgent:
                 if not url:
                     return "操作失败: url 参数不能为空"
                 max_nav_retries = 3
+                # 自适应超时：首次 30s，后续根据基准动态调整（上限 60s）
+                nav_timeout = 30000
+                if self._nav_baseline_ms is not None:
+                    nav_timeout = min(60000, max(30000, int(self._nav_baseline_ms * 2)))
                 for nav_attempt in range(max_nav_retries):
                     try:
-                        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                        _t0 = asyncio.get_event_loop().time()
+                        await page.goto(url, wait_until="domcontentloaded", timeout=nav_timeout)
+                        _elapsed_ms = (asyncio.get_event_loop().time() - _t0) * 1000
                         self._active_requests.clear()  # 清除旧页面的残留请求
                         await _wait_for_page_ready(page, log_fn=self._log, timeout_ms=15000, check_network=True, active_requests=self._active_requests)
+                        # 记录首次导航耗时作为基准
+                        if self._nav_baseline_ms is None:
+                            self._nav_baseline_ms = _elapsed_ms
+                            await self._log(f"  [导航基准] {_elapsed_ms:.0f}ms")
                         return f"已打开 {url}"
                     except Exception as e:
                         if nav_attempt < max_nav_retries - 1:
@@ -359,7 +458,8 @@ class BrowserAgent:
                                     x, y = el_info["x"], el_info["y"]
 
                             await self._click_and_wait(x, y)
-                            return "点击成功"
+                            form_err = await self._detect_form_errors()
+                            return f"点击成功。{form_err}" if form_err else "点击成功"
                         else:
                             await self._log(f"  #{index} 回退链全部失败，fallback 到文字")
                             if not text:
@@ -381,7 +481,8 @@ class BrowserAgent:
                         else:
                             await el.click(force=True, timeout=10000)
                             await _wait_for_page_ready(page, log_fn=self._log, timeout_ms=15000, check_network=True, active_requests=self._active_requests)
-                        return "点击成功"
+                        form_err = await self._detect_form_errors()
+                        return f"点击成功。{form_err}" if form_err else "点击成功"
                     except Exception as e:
                         await self._log(f"  文字点击失败 ({e})，尝试 AI 视觉...")
                         return await self._ai_act(f"点击 {text}")
@@ -544,15 +645,46 @@ class BrowserAgent:
 
                 direction = 1 if direction_str == "down" else -1
                 try:
-                    # 记录滚动前位置，检测是否到底/到顶
+                    # 记录滚动前状态
                     scroll_before = await self._safe_evaluate("() => window.scrollY", default=0)
+                    content_before = await self._safe_evaluate(
+                        "() => ({ len: (document.body.innerText || '').length, children: document.body.querySelectorAll('*').length })",
+                        default={"len": 0, "children": 0}
+                    )
                     await page.evaluate("(px) => window.scrollBy(0, px)", direction * amount)
                     await asyncio.sleep(0.3)
                     scroll_after = await self._safe_evaluate("() => window.scrollY", default=0)
 
                     if scroll_before == scroll_after:
+                        # 到达边界，但检查是否有新内容在加载
                         boundary = "底部" if direction_str == "down" else "顶部"
-                        return f"已到达页面{boundary}，无法继续滚动"
+                        for _ in range(6):  # 最多再等 3s (6 × 0.5s)
+                            await asyncio.sleep(0.5)
+                            content_after = await self._safe_evaluate(
+                                "() => ({ len: (document.body.innerText || '').length, children: document.body.querySelectorAll('*').length })",
+                                default={"len": 0, "children": 0}
+                            )
+                            has_spinner = await self._safe_evaluate(
+                                "() => !!(document.querySelector('.loading, .spinner, [class*=\"skeleton\"], [aria-busy=\"true\"]'))",
+                                default=False
+                            )
+                            if content_after.get("len", 0) != content_before.get("len", 0) or \
+                               content_after.get("children", 0) != content_before.get("children", 0):
+                                content_before = content_after
+                                continue  # 内容还在变化，继续等
+                            if has_spinner:
+                                continue  # 有 loading 指示器，继续等
+                            break  # 内容稳定且无 spinner
+                        else:
+                            return f"已到达页面{boundary}，但内容仍在加载中，建议稍后再检查"
+                        # 再次检查是否有新内容
+                        content_final = await self._safe_evaluate(
+                            "() => (document.body.innerText || '').length",
+                            default=0
+                        )
+                        if content_final > content_before.get("len", 0):
+                            return f"已到达页面{boundary}，新内容已加载完成"
+                        return f"已到达页面{boundary}，无更多内容"
                     return f"已向{direction_str}滚动 {amount}px"
                 except Exception as e:
                     return f"操作失败: 滚动失败 — {e}"
@@ -852,31 +984,40 @@ class BrowserAgent:
                     method = el_info.get("method", "skyvern-id")
                     await self._log(f"  [选择] #{index} method={method}")
 
+                    selected = False
+
                     # 尝试用 Playwright 的 select_option（优先用 css_selector 回退）
                     selector = f'[data-skyvern-id="{index}"]'
                     try:
                         await page.select_option(selector, value=value, timeout=5000)
-                        return f"已选择 '{value}'"
+                        selected = True
                     except Exception:
                         pass
 
                     # fallback: 用 label 匹配
-                    try:
-                        await page.select_option(selector, label=value, timeout=5000)
-                        return f"已选择 '{value}'"
-                    except Exception:
-                        pass
+                    if not selected:
+                        try:
+                            await page.select_option(selector, label=value, timeout=5000)
+                            selected = True
+                        except Exception:
+                            pass
 
                     # fallback: 点击 select 后点击选项文字
-                    x, y = el_info["x"], el_info["y"]
-                    await self._click_and_wait(x, y, check_navigation=False)
-                    await asyncio.sleep(0.3)
-                    try:
-                        option_el = page.get_by_text(value, exact=False).first
-                        await option_el.click(timeout=5000)
-                        return f"已选择 '{value}'"
-                    except Exception as e:
-                        return f"操作失败: 选择 '{value}' 失败 — {e}"
+                    if not selected:
+                        x, y = el_info["x"], el_info["y"]
+                        await self._click_and_wait(x, y, check_navigation=False)
+                        await asyncio.sleep(0.3)
+                        try:
+                            option_el = page.get_by_text(value, exact=False).first
+                            await option_el.click(timeout=5000)
+                            selected = True
+                        except Exception as e:
+                            return f"操作失败: 选择 '{value}' 失败 — {e}"
+
+                    if selected:
+                        # 等待 DOM 稳定（级联选择场景：选择后其他下拉框选项会动态更新）
+                        await _wait_for_page_ready(page, log_fn=self._log, timeout_ms=3000, check_network=False)
+                        return f"已选择 '{value}'（页面可能有联动更新，请观察后再操作下一个选择框）"
 
                 except Exception as e:
                     return f"操作失败: select_option 失败 — {e}"
@@ -1384,6 +1525,116 @@ class BrowserAgent:
 
                 except Exception as e:
                     return f"操作失败: scroll_to_text 失败 — {e}"
+
+            # ── 日期选择器工具 ──────────────────────────────────────────
+            elif tool_name == "set_date":
+                index = args.get("index")
+                date_str = args.get("date", "")
+                if index is None:
+                    return "操作失败: 需要提供 index 参数"
+                if not date_str:
+                    return "操作失败: 需要提供 date 参数��格式 YYYY-MM-DD）"
+                idx_err = self._validate_index(index)
+                if idx_err:
+                    return idx_err
+
+                try:
+                    el_info = await get_element_coords(page, index)
+                    if not el_info:
+                        return f"操作失败: index={index} 定位失败"
+
+                    selector = f'[data-skyvern-id="{index}"]'
+
+                    # 方法1: 直接设置 value + 触发事件（适用于 input[type="date"] 和大部分组件）
+                    try:
+                        set_ok = await page.evaluate(f"""(sel) => {{
+                            const el = document.querySelector(sel);
+                            if (!el) return false;
+                            // 尝试用 native input setter 绕过 React/Vue 的受控组件
+                            const nativeSetter = Object.getOwnPropertyDescriptor(
+                                window.HTMLInputElement.prototype, 'value'
+                            )?.set;
+                            if (nativeSetter) {{
+                                nativeSetter.call(el, '{date_str}');
+                            }} else {{
+                                el.value = '{date_str}';
+                            }}
+                            el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                            el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                            return true;
+                        }}""", selector)
+                        if set_ok:
+                            await asyncio.sleep(0.3)
+                            return f"已设置日期 '{date_str}'"
+                    except Exception:
+                        pass
+
+                    # 方法2: 点击 + 清空 + 键盘输入
+                    x, y = el_info["x"], el_info["y"]
+                    await page.mouse.click(x, y)
+                    await asyncio.sleep(0.2)
+                    await page.keyboard.press("Control+a")
+                    await page.keyboard.press("Backspace")
+                    await page.keyboard.type(date_str, delay=50)
+                    await page.keyboard.press("Escape")  # 关闭可能弹出的日期选择器面板
+                    await asyncio.sleep(0.3)
+                    return f"已输入日期 '{date_str}'"
+
+                except Exception as e:
+                    return f"操作失败: set_date 失败 — {e}"
+
+            # ── 站点理解工具 ──────────────────────────────────────────
+            elif tool_name == "analyze_current_page":
+                context_hint = args.get("context", "")
+                try:
+                    # 检查缓存
+                    cached = getattr(self, '_site_analysis', None)
+                    if cached and cached.get("analyzed_url") == page.url:
+                        result = cached
+                    else:
+                        page_html = await self._safe_evaluate(
+                            "() => document.documentElement.outerHTML",
+                            timeout_ms=10000,
+                            default=""
+                        )
+                        if not page_html:
+                            return "分析失败: 无法获取页面 HTML"
+
+                        screenshot_b64 = None
+                        try:
+                            raw = await page.screenshot(type="jpeg", quality=40)
+                            screenshot_b64 = base64.b64encode(raw).decode()
+                        except Exception:
+                            pass
+
+                        from site_understanding import analyze_site as _analyze_site
+                        result = _analyze_site(
+                            url=page.url,
+                            html=page_html,
+                            screenshot_b64=screenshot_b64,
+                            product_context=context_hint,
+                        )
+                        self._site_analysis = result  # 缓存
+
+                    # 格式化结果
+                    parts = []
+                    parts.append(f"站点: {result.get('site_name', '未知')} ({result.get('site_category', '未知')})")
+                    if result.get("needs_login"):
+                        parts.append("需要登录")
+                    features = result.get("key_features_visible", [])
+                    if features:
+                        parts.append(f"可见功能: {', '.join(features[:5])}")
+                    entry_points = result.get("entry_points", [])
+                    if entry_points:
+                        top = sorted(entry_points, key=lambda x: -x.get("priority", 0))[:5]
+                        for ep in top:
+                            parts.append(f"  入口: {ep.get('label', '')} → {ep.get('path', '')} (优先级{ep.get('priority', 0)})")
+                    strategy = result.get("exploration_strategy", "")
+                    if strategy:
+                        parts.append(f"建议策略: {strategy}")
+                    return "站点分析结果:\n" + "\n".join(parts)
+                except Exception as e:
+                    return f"分析失败: {e}"
 
             # ── 自定义 Action fallback ──────────────────────────────────
             elif is_custom_action(tool_name):
