@@ -191,6 +191,35 @@ def load_memories(domain: str = None, memory_type: str = None) -> list[dict]:
     return result
 
 
+def load_memories_paged(domain: str = None, memory_type: str = None,
+                        page: int = 1, page_size: int = 50) -> dict:
+    """分页加载记忆，返回 {items, total, page, page_size}。"""
+    where = "WHERE 1=1"
+    params = []
+    if domain:
+        where += " AND domain = ?"
+        params.append(domain)
+    if memory_type:
+        where += " AND memory_type = ?"
+        params.append(memory_type)
+
+    with _conn() as conn:
+        total = conn.execute(f"SELECT COUNT(*) FROM memories {where}", params).fetchone()[0]
+        query = f"SELECT * FROM memories {where} ORDER BY updated_at DESC LIMIT ? OFFSET ?"
+        rows = conn.execute(query, params + [page_size, (page - 1) * page_size]).fetchall()
+
+    items = []
+    for row in rows:
+        m = dict(row)
+        try:
+            m["content"] = json.loads(m["content"])
+        except (json.JSONDecodeError, TypeError):
+            pass
+        items.append(m)
+
+    return {"items": items, "total": total, "page": page, "page_size": page_size}
+
+
 def get_memory(memory_id: str) -> dict | None:
     with _conn() as conn:
         row = conn.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()

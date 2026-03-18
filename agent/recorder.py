@@ -19,6 +19,8 @@ RECORDER_JS = """
   window.__recorderActive = true;
 
   let inputTimer = null;
+  let scrollTimer = null;
+  let lastScrollY = window.scrollY;
 
   function buildSelector(el) {
     if (!el || !el.tagName) return '';
@@ -26,7 +28,6 @@ RECORDER_JS = """
     if (el.getAttribute('name')) return el.tagName.toLowerCase() + '[name="' + el.getAttribute('name') + '"]';
     if (el.getAttribute('data-testid')) return '[data-testid="' + el.getAttribute('data-testid') + '"]';
     if (el.getAttribute('aria-label')) return '[aria-label="' + el.getAttribute('aria-label') + '"]';
-    // 简单 CSS path
     const parts = [];
     let cur = el;
     for (let i = 0; i < 3 && cur && cur !== document.body; i++) {
@@ -45,103 +46,77 @@ RECORDER_JS = """
     return (el.innerText || el.textContent || el.value || el.placeholder || '').substring(0, 100).trim();
   }
 
-  // Click
-  document.addEventListener('click', (e) => {
+  function onClick(e) {
     const el = e.target;
     window.__recordAction(JSON.stringify({
-      type: 'click',
-      timestamp: Date.now(),
-      url: location.href,
-      selector: buildSelector(el),
-      text: getVisibleText(el),
-      tag: el.tagName.toLowerCase(),
+      type: 'click', timestamp: Date.now(), url: location.href,
+      selector: buildSelector(el), text: getVisibleText(el), tag: el.tagName.toLowerCase(),
     }));
-  }, true);
+  }
 
-  // Input (debounced 500ms)
-  document.addEventListener('input', (e) => {
+  function onInput(e) {
     clearTimeout(inputTimer);
     const el = e.target;
     inputTimer = setTimeout(() => {
       window.__recordAction(JSON.stringify({
-        type: 'type_text',
-        timestamp: Date.now(),
-        url: location.href,
-        selector: buildSelector(el),
-        text: el.value || '',
-        tag: el.tagName.toLowerCase(),
+        type: 'type_text', timestamp: Date.now(), url: location.href,
+        selector: buildSelector(el), text: el.value || '', tag: el.tagName.toLowerCase(),
         input_type: el.type || '',
       }));
     }, 500);
-  }, true);
+  }
 
-  // Select change
-  document.addEventListener('change', (e) => {
+  function onChange(e) {
     const el = e.target;
     if (el.tagName === 'SELECT') {
       window.__recordAction(JSON.stringify({
-        type: 'select_option',
-        timestamp: Date.now(),
-        url: location.href,
-        selector: buildSelector(el),
-        text: el.options[el.selectedIndex]?.text || el.value,
-        tag: 'select',
-        meta: { value: el.value },
+        type: 'select_option', timestamp: Date.now(), url: location.href,
+        selector: buildSelector(el), text: el.options[el.selectedIndex]?.text || el.value,
+        tag: 'select', meta: { value: el.value },
       }));
     }
-  }, true);
+  }
 
-  // Keyboard (Enter, Escape, Tab)
-  document.addEventListener('keydown', (e) => {
+  function onKeydown(e) {
     if (['Enter', 'Escape', 'Tab'].includes(e.key)) {
       window.__recordAction(JSON.stringify({
-        type: 'press_key',
-        timestamp: Date.now(),
-        url: location.href,
-        selector: buildSelector(e.target),
-        text: '',
-        tag: (e.target.tagName || '').toLowerCase(),
-        meta: { key: e.key },
+        type: 'press_key', timestamp: Date.now(), url: location.href,
+        selector: buildSelector(e.target), text: '',
+        tag: (e.target.tagName || '').toLowerCase(), meta: { key: e.key },
       }));
     }
-  }, true);
+  }
 
-  // Scroll (debounced 300ms)
-  let scrollTimer = null;
-  let lastScrollY = window.scrollY;
-  window.addEventListener('scroll', () => {
+  function onScroll() {
     clearTimeout(scrollTimer);
     scrollTimer = setTimeout(() => {
       const dir = window.scrollY > lastScrollY ? 'down' : 'up';
       const amount = Math.abs(window.scrollY - lastScrollY);
       if (amount > 100) {
         window.__recordAction(JSON.stringify({
-          type: 'scroll',
-          timestamp: Date.now(),
-          url: location.href,
-          selector: '',
-          text: '',
-          tag: '',
+          type: 'scroll', timestamp: Date.now(), url: location.href,
+          selector: '', text: '', tag: '',
           meta: { direction: dir, amount: amount },
         }));
       }
       lastScrollY = window.scrollY;
     }, 300);
-  }, true);
+  }
 
-  // Navigation (pushState / replaceState)
+  document.addEventListener('click', onClick, true);
+  document.addEventListener('input', onInput, true);
+  document.addEventListener('change', onChange, true);
+  document.addEventListener('keydown', onKeydown, true);
+  window.addEventListener('scroll', onScroll, true);
+
   const origPush = history.pushState;
   const origReplace = history.replaceState;
   history.pushState = function(...args) {
     origPush.apply(this, args);
     setTimeout(() => {
       window.__recordAction(JSON.stringify({
-        type: 'navigate',
-        timestamp: Date.now(),
-        url: location.href,
-        selector: '',
-        text: document.title,
-        tag: '',
+        type: 'navigate', timestamp: Date.now(), url: location.href,
+        selector: '', text: document.title, tag: '',
       }));
     }, 100);
   };
@@ -149,28 +124,32 @@ RECORDER_JS = """
     origReplace.apply(this, args);
     setTimeout(() => {
       window.__recordAction(JSON.stringify({
-        type: 'navigate',
-        timestamp: Date.now(),
-        url: location.href,
-        selector: '',
-        text: document.title,
-        tag: '',
+        type: 'navigate', timestamp: Date.now(), url: location.href,
+        selector: '', text: document.title, tag: '',
       }));
     }, 100);
   };
-  window.addEventListener('popstate', () => {
+
+  function onPopstate() {
     window.__recordAction(JSON.stringify({
-      type: 'navigate',
-      timestamp: Date.now(),
-      url: location.href,
-      selector: '',
-      text: document.title,
-      tag: '',
+      type: 'navigate', timestamp: Date.now(), url: location.href,
+      selector: '', text: document.title, tag: '',
     }));
-  });
+  }
+  window.addEventListener('popstate', onPopstate);
 
   window.__stopRecording = () => {
     window.__recorderActive = false;
+    document.removeEventListener('click', onClick, true);
+    document.removeEventListener('input', onInput, true);
+    document.removeEventListener('change', onChange, true);
+    document.removeEventListener('keydown', onKeydown, true);
+    window.removeEventListener('scroll', onScroll, true);
+    window.removeEventListener('popstate', onPopstate);
+    clearTimeout(inputTimer);
+    clearTimeout(scrollTimer);
+    history.pushState = origPush;
+    history.replaceState = origReplace;
   };
 })();
 """

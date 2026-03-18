@@ -194,3 +194,145 @@ class TestActionRecorder:
             }))
 
         assert len(recorder._actions) == 5
+
+
+class TestRecorderJSCleanup:
+    """Test that RECORDER_JS properly cleans up event listeners."""
+
+    def test_stop_removes_event_listeners(self):
+        from agent.recorder import RECORDER_JS
+        assert "removeEventListener('click'" in RECORDER_JS
+        assert "removeEventListener('input'" in RECORDER_JS
+        assert "removeEventListener('change'" in RECORDER_JS
+        assert "removeEventListener('keydown'" in RECORDER_JS
+        assert "removeEventListener('scroll'" in RECORDER_JS
+        assert "removeEventListener('popstate'" in RECORDER_JS
+
+    def test_stop_clears_timers(self):
+        from agent.recorder import RECORDER_JS
+        assert "clearTimeout(inputTimer)" in RECORDER_JS
+        assert "clearTimeout(scrollTimer)" in RECORDER_JS
+
+    def test_stop_restores_history(self):
+        from agent.recorder import RECORDER_JS
+        assert "history.pushState = origPush" in RECORDER_JS
+        assert "history.replaceState = origReplace" in RECORDER_JS
+
+
+class TestParameterDetectionEnhanced:
+    """Test enhanced parameter detection rules."""
+
+    def test_detect_parameters_username(self):
+        from agent.recording_converter import RecordingConverter
+        actions = [
+            {"type": "type_text", "timestamp": 1000, "url": "https://example.com",
+             "selector": "input#username", "text": "admin", "tag": "input", "input_type": "text"},
+        ]
+        converter = RecordingConverter({"actions": actions, "start_url": ""})
+        params = converter._detect_parameters()
+        assert any(p["key"] == "username" for p in params)
+
+    def test_detect_parameters_phone(self):
+        from agent.recording_converter import RecordingConverter
+        actions = [
+            {"type": "type_text", "timestamp": 1000, "url": "https://example.com",
+             "selector": "input.phone-input", "text": "13800138000", "tag": "input", "input_type": "tel"},
+        ]
+        converter = RecordingConverter({"actions": actions, "start_url": ""})
+        params = converter._detect_parameters()
+        assert any(p["key"] == "phone" for p in params)
+
+    def test_detect_parameters_search_input_type(self):
+        from agent.recording_converter import RecordingConverter
+        actions = [
+            {"type": "type_text", "timestamp": 1000, "url": "https://example.com",
+             "selector": "input#q", "text": "hello", "tag": "input", "input_type": "search"},
+        ]
+        converter = RecordingConverter({"actions": actions, "start_url": ""})
+        params = converter._detect_parameters()
+        assert any(p["key"] == "search_query" for p in params)
+
+    def test_detect_parameters_account_selector(self):
+        from agent.recording_converter import RecordingConverter
+        actions = [
+            {"type": "type_text", "timestamp": 1000, "url": "https://example.com",
+             "selector": "input[name=\"account\"]", "text": "myuser", "tag": "input", "input_type": "text"},
+        ]
+        converter = RecordingConverter({"actions": actions, "start_url": ""})
+        params = converter._detect_parameters()
+        assert any(p["key"] == "username" for p in params)
+
+
+class TestURLNormalization:
+    """Test enhanced URL normalization."""
+
+    def test_strips_tracking_params(self):
+        from agent.recording_converter import RecordingConverter
+        url = "https://example.com/page?utm_source=google&utm_medium=cpc&q=test"
+        result = RecordingConverter._normalize_url(url)
+        assert "utm_source" not in result
+        assert "q=test" in result
+
+    def test_strips_pagination(self):
+        from agent.recording_converter import RecordingConverter
+        url1 = "https://example.com/list?page=1"
+        url2 = "https://example.com/list?page=2"
+        assert RecordingConverter._normalize_url(url1) == RecordingConverter._normalize_url(url2)
+
+    def test_preserves_meaningful_params(self):
+        from agent.recording_converter import RecordingConverter
+        url = "https://example.com/search?q=python&lang=en"
+        result = RecordingConverter._normalize_url(url)
+        assert "q=python" in result
+        assert "lang=en" in result
+
+    def test_strips_hash(self):
+        from agent.recording_converter import RecordingConverter
+        url = "https://example.com/page#section1"
+        result = RecordingConverter._normalize_url(url)
+        assert "#" not in result
+
+
+class TestRecordingActionEdit:
+    """Test recording action delete/update via db."""
+
+    def test_delete_action(self):
+        actions = [
+            {"type": "click", "text": "A"},
+            {"type": "click", "text": "B"},
+            {"type": "click", "text": "C"},
+        ]
+        db_mod.save_recording({"id": "r1", "title": "T", "actions": actions, "parameters": [], "status": "completed"})
+        r = db_mod.get_recording("r1")
+        r["actions"].pop(1)  # remove B
+        db_mod.save_recording(r)
+        r2 = db_mod.get_recording("r1")
+        assert len(r2["actions"]) == 2
+        assert r2["actions"][0]["text"] == "A"
+        assert r2["actions"][1]["text"] == "C"
+
+    def test_update_action(self):
+        actions = [{"type": "type_text", "text": "old", "selector": "#input"}]
+        db_mod.save_recording({"id": "r2", "title": "T", "actions": actions, "parameters": [], "status": "completed"})
+        r = db_mod.get_recording("r2")
+        r["actions"][0]["text"] = "new"
+        db_mod.save_recording(r)
+        r2 = db_mod.get_recording("r2")
+        assert r2["actions"][0]["text"] == "new"
+
+    def test_recording_timeout_field(self):
+        """RecordingStartRequest should accept timeout field."""
+        from pydantic import ValidationError
+        # 动态导入避免 app 启动副作用
+        import importlib
+        import sys
+        # 简单验证 timeout 字段存在于 RecordingStartRequest
+        from app import RecordingStartRequest
+        req = RecordingStartRequest(timeout=300)
+        assert req.timeout == 300
+        # 验证范围
+        try:
+            RecordingStartRequest(timeout=10)  # < 60
+            assert False, "Should reject timeout < 60"
+        except ValidationError:
+            pass

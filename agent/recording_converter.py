@@ -10,7 +10,7 @@ RecordingConverter — 将录制的操作序列转换为 workflow YAML。
 
 import json
 import re
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs, urlencode
 
 import yaml
 
@@ -162,24 +162,38 @@ class RecordingConverter:
         params = []
         seen_keys = set()
 
+        # 敏感字段检测规则（优先级从高到低）
+        _FIELD_RULES = [
+            ("password", "密码", lambda a, t: a.get("input_type") == "password"),
+            ("email", "邮箱地址", lambda a, t: a.get("input_type") == "email" or "@" in t),
+            ("username", "用户名", lambda a, t: any(
+                k in (a.get("selector", "") + " " + a.get("name", "")).lower()
+                for k in ("user", "account", "login", "username")
+            )),
+            ("phone", "手机号", lambda a, t: (
+                a.get("input_type") == "tel"
+                or any(k in a.get("selector", "").lower() for k in ("phone", "mobile", "tel"))
+            )),
+            ("search_query", "搜索关键词", lambda a, t: (
+                "search" in a.get("selector", "").lower()
+                or "搜索" in t
+                or a.get("input_type") == "search"
+            )),
+        ]
+
         for a in self.actions:
             atype = a.get("type", "")
             text = a.get("text", "")
 
             if atype == "type_text" and text:
-                input_type = a.get("input_type", "")
-                if input_type == "password":
-                    key = "password"
-                    desc = "密码"
-                elif input_type == "email" or "@" in text:
-                    key = "email"
-                    desc = "邮箱地址"
-                elif a.get("tag") == "input" and ("search" in a.get("selector", "").lower() or "搜索" in text):
-                    key = "search_query"
-                    desc = "搜索关键词"
-                else:
+                key, desc = None, None
+                for rule_key, rule_desc, rule_fn in _FIELD_RULES:
+                    if rule_fn(a, text):
+                        key, desc = rule_key, rule_desc
+                        break
+                if not key:
                     key = f"input_{len(params) + 1}"
-                    desc = f"输入内容"
+                    desc = "输入内容"
 
                 if key not in seen_keys:
                     seen_keys.add(key)
@@ -202,11 +216,21 @@ class RecordingConverter:
 
         return params
 
+    _IGNORE_PARAMS = frozenset({
+        "utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term",
+        "fbclid", "gclid", "ref", "page", "p", "offset", "_t", "timestamp",
+    })
+
     @staticmethod
     def _normalize_url(url: str) -> str:
-        """规范化 URL（去 hash）用于比较。"""
+        """规范化 URL（去 hash + 过滤追踪/分页参数）用于比较。"""
         try:
             parsed = urlparse(url)
-            return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+            params = parse_qs(parsed.query)
+            filtered = {k: v for k, v in params.items()
+                        if k.lower() not in RecordingConverter._IGNORE_PARAMS}
+            clean_query = urlencode(filtered, doseq=True) if filtered else ""
+            base = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+            return f"{base}?{clean_query}" if clean_query else base
         except Exception:
             return url

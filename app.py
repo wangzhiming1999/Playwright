@@ -36,7 +36,7 @@ from explorer import run_exploration
 from content_gen import generate_all
 from db import init_db, save_task, load_all_tasks, save_explore_task, load_all_explore_tasks, DB_PATH
 from db import (
-    init_memory_db, save_memory, load_memories, get_memory, delete_memory,
+    init_memory_db, save_memory, load_memories, load_memories_paged, get_memory, delete_memory,
     delete_memories_batch, update_memory_hit, get_memory_stats,
     init_recording_db, save_recording, load_all_recordings, get_recording, delete_recording,
 )
@@ -1576,11 +1576,14 @@ async def run_template(
 
 class MemoryUpdateRequest(BaseModel):
     title: str | None = None
-    content: str | None = None  # JSON string
+    content: str | None = None  # JSON string — 无效 JSON 返回 400
 
 
 @app.get("/memories")
-async def list_memories(domain: str = None, type: str = None, _=Depends(_verify_api_key)):
+async def list_memories(domain: str = None, type: str = None,
+                        page: int = None, page_size: int = 50, _=Depends(_verify_api_key)):
+    if page is not None:
+        return load_memories_paged(domain=domain, memory_type=type, page=page, page_size=page_size)
     return load_memories(domain=domain, memory_type=type)
 
 
@@ -1608,7 +1611,7 @@ async def update_memory_endpoint(memory_id: str, req: MemoryUpdateRequest, _=Dep
         try:
             m["content"] = json.loads(req.content)
         except json.JSONDecodeError:
-            m["content"] = req.content
+            raise HTTPException(400, "content 必须是有效的 JSON 格式")
     save_memory(m)
     return {"ok": True}
 
@@ -1640,6 +1643,7 @@ class RecordingStartRequest(BaseModel):
     start_url: str = "about:blank"
     browser_mode: str = Field(default="builtin", pattern=r'^(builtin|cdp)$')
     cdp_url: str = Field(default="http://localhost:9222", max_length=500)
+    timeout: int = Field(default=1800, ge=60, le=7200)  # 默认 30 分钟，最大 2 小时
 
 
 @app.post("/recordings/start")
@@ -1651,44 +1655,68 @@ async def start_recording(req: RecordingStartRequest, background_tasks: Backgrou
 
     async def _launch():
         pw = await async_playwright().__aenter__()
-        if req.browser_mode == "cdp":
-            browser = await pw.chromium.connect_over_cdp(req.cdp_url)
-            context = browser.contexts[0] if browser.contexts else await browser.new_context(
-                viewport={"width": 1920, "height": 1080}, locale="zh-CN"
-            )
-        else:
-            browser = await pw.chromium.launch(headless=False)
-            context = await browser.new_context(viewport={"width": 1920, "height": 1080}, locale="zh-CN")
+        browser = None
+        try:
+            if req.browser_mode == "cdp":
+                browser = await pw.chromium.connect_over_cdp(req.cdp_url)
+                context = browser.contexts[0] if browser.contexts else await browser.new_context(
+                    viewport={"width": 1920, "height": 1080}, locale="zh-CN"
+                )
+            else:
+                browser = await pw.chromium.launch(headless=False)
+                context = await browser.new_context(viewport={"width": 1920, "height": 1080}, locale="zh-CN")
 
-        page = await context.new_page()
-        if req.start_url and req.start_url != "about:blank":
-            await page.goto(req.start_url, wait_until="domcontentloaded", timeout=30000)
+            page = await context.new_page()
+            if req.start_url and req.start_url != "about:blank":
+                await page.goto(req.start_url, wait_until="domcontentloaded", timeout=30000)
 
-        recorder = ActionRecorder(page)
-        await recorder.start()
+            recorder = ActionRecorder(page)
+            await recorder.start()
 
-        _RECORDING_SESSIONS[recording_id] = {
-            "recorder": recorder, "page": page, "browser": browser,
-            "context": context, "pw": pw, "title": req.title,
-            "start_url": req.start_url,
-        }
+            session = {
+                "recorder": recorder, "page": page, "browser": browser,
+                "context": context, "pw": pw, "title": req.title,
+                "start_url": req.start_url, "broadcast_task": None,
+                "started_at": time.time(), "timeout": req.timeout,
+            }
+            _RECORDING_SESSIONS[recording_id] = session
 
-        # 实时推送录制的 action
-        async def _broadcast_actions():
-            last_count = 0
-            while recording_id in _RECORDING_SESSIONS:
-                actions = recorder._actions
-                if len(actions) > last_count:
-                    for a in actions[last_count:]:
-                        await _broadcast({
-                            "type": "recording_action",
-                            "recording_id": recording_id,
-                            "action": a,
-                        })
-                    last_count = len(actions)
-                await asyncio.sleep(0.5)
+            # 实时推送录制的 action + 超时检测
+            async def _broadcast_actions():
+                last_count = 0
+                while recording_id in _RECORDING_SESSIONS:
+                    # 超时自动停止
+                    elapsed = time.time() - session["started_at"]
+                    if elapsed > session["timeout"]:
+                        try:
+                            await _auto_stop_recording(recording_id)
+                        except Exception:
+                            pass
+                        break
+                    actions = recorder._actions
+                    if len(actions) > last_count:
+                        for a in actions[last_count:]:
+                            await _broadcast({
+                                "type": "recording_action",
+                                "recording_id": recording_id,
+                                "action": a,
+                            })
+                        last_count = len(actions)
+                    await asyncio.sleep(0.5)
 
-        asyncio.create_task(_broadcast_actions())
+            session["broadcast_task"] = asyncio.create_task(_broadcast_actions())
+        except Exception:
+            if browser:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+            try:
+                await pw.__aexit__(None, None, None)
+            except Exception:
+                pass
+            _RECORDING_SESSIONS.pop(recording_id, None)
+            raise
 
     await _launch()
 
@@ -1700,24 +1728,59 @@ async def start_recording(req: RecordingStartRequest, background_tasks: Backgrou
     return {"recording_id": recording_id, "status": "recording"}
 
 
+async def _auto_stop_recording(recording_id: str):
+    """超时自动停止录制（内部调用）。"""
+    session = _RECORDING_SESSIONS.pop(recording_id, None)
+    if not session:
+        return
+    try:
+        actions = await session["recorder"].stop()
+        from agent.recording_converter import RecordingConverter
+        converter = RecordingConverter({"actions": actions})
+        parameters = converter._detect_parameters()
+        save_recording({
+            "id": recording_id, "title": session.get("title", ""),
+            "start_url": session.get("start_url", ""),
+            "actions": actions, "parameters": parameters, "status": "completed",
+        })
+        await _broadcast({"type": "recording_timeout", "recording_id": recording_id})
+    except Exception:
+        pass
+    finally:
+        try:
+            await session["browser"].close()
+        except Exception:
+            pass
+        try:
+            await session["pw"].__aexit__(None, None, None)
+        except Exception:
+            pass
+
+
 @app.post("/recordings/{recording_id}/stop")
 async def stop_recording(recording_id: str, _=Depends(_verify_api_key)):
     session = _RECORDING_SESSIONS.pop(recording_id, None)
     if not session:
         raise HTTPException(404, "Recording session not found or already stopped")
 
-    recorder = session["recorder"]
-    actions = await recorder.stop()
+    try:
+        # 取消广播协程
+        task = session.get("broadcast_task")
+        if task and not task.done():
+            task.cancel()
 
-    # 关闭浏览器
-    try:
-        await session["browser"].close()
-    except Exception:
-        pass
-    try:
-        await session["pw"].__aexit__(None, None, None)
-    except Exception:
-        pass
+        recorder = session["recorder"]
+        actions = await recorder.stop()
+    finally:
+        # 确保浏览器一定被关闭
+        try:
+            await session["browser"].close()
+        except Exception:
+            pass
+        try:
+            await session["pw"].__aexit__(None, None, None)
+        except Exception:
+            pass
 
     # 自动检测参数
     from agent.recording_converter import RecordingConverter
@@ -1758,6 +1821,48 @@ async def delete_recording_endpoint(recording_id: str, _=Depends(_verify_api_key
 class RecordingConvertRequest(BaseModel):
     title: str = ""
     parameters: list[dict] = Field(default_factory=list)
+
+
+class RecordingActionUpdateRequest(BaseModel):
+    text: str | None = None
+    selector: str | None = None
+    meta: dict | None = None
+
+
+@app.delete("/recordings/{recording_id}/actions/{action_index}")
+async def delete_recording_action(recording_id: str, action_index: int, _=Depends(_verify_api_key)):
+    """删除录制中的单个操作（仅 completed 状态可编辑）。"""
+    r = get_recording(recording_id)
+    if not r:
+        raise HTTPException(404, "Recording not found")
+    if r.get("status") == "recording":
+        raise HTTPException(400, "Cannot edit active recording")
+    if action_index < 0 or action_index >= len(r.get("actions", [])):
+        raise HTTPException(400, "Invalid action index")
+    r["actions"].pop(action_index)
+    save_recording(r)
+    return {"ok": True, "actions_count": len(r["actions"])}
+
+
+@app.put("/recordings/{recording_id}/actions/{action_index}")
+async def update_recording_action(recording_id: str, action_index: int, req: RecordingActionUpdateRequest, _=Depends(_verify_api_key)):
+    """���改录制中的单个操作（仅 completed 状态可编辑）。"""
+    r = get_recording(recording_id)
+    if not r:
+        raise HTTPException(404, "Recording not found")
+    if r.get("status") == "recording":
+        raise HTTPException(400, "Cannot edit active recording")
+    if action_index < 0 or action_index >= len(r.get("actions", [])):
+        raise HTTPException(400, "Invalid action index")
+    action = r["actions"][action_index]
+    if req.text is not None:
+        action["text"] = req.text
+    if req.selector is not None:
+        action["selector"] = req.selector
+    if req.meta is not None:
+        action["meta"] = req.meta
+    save_recording(r)
+    return {"ok": True}
 
 
 @app.post("/recordings/{recording_id}/convert")
