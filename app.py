@@ -1898,6 +1898,31 @@ async def convert_recording(recording_id: str, req: RecordingConvertRequest, _=D
     return {"workflow_id": wf_id, "yaml_content": yaml_content}
 
 
+@app.post("/recordings/{recording_id}/preview")
+async def preview_recording_workflow(recording_id: str, req: RecordingConvertRequest, _=Depends(_verify_api_key)):
+    """预览录制→工作流转换结果（不保存），返回清洗后的 actions 和生成的 YAML。"""
+    r = get_recording(recording_id)
+    if not r:
+        raise HTTPException(404, "Recording not found")
+
+    from agent.recording_converter import RecordingConverter
+    converter = RecordingConverter(r)
+    cleaned = converter.clean_actions()
+    yaml_content = converter.to_workflow_yaml(
+        params=req.parameters if req.parameters else None,
+        title=req.title or r.get("title", ""),
+    )
+    detected_params = converter._detect_parameters()
+
+    return {
+        "original_count": len(r.get("actions", [])),
+        "cleaned_count": len(cleaned),
+        "cleaned_actions": cleaned,
+        "detected_parameters": detected_params,
+        "yaml_preview": yaml_content,
+    }
+
+
 class RecordingReplayRequest(BaseModel):
     parameters: dict = Field(default_factory=dict)
 

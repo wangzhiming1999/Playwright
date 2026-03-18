@@ -24,41 +24,147 @@ class RecordingConverter:
         self.recording = recording
         self.actions: list[dict] = recording.get("actions", [])
 
-    def to_workflow_yaml(self, params: list[dict] = None, title: str = "") -> str:
+    # ── 动作清洗 ──────────────────────────────────────────────────
+
+    def clean_actions(self) -> list[dict]:
+        """
+        清洗录制的操作序列：
+        1. 过滤无效操作（空 click、无文本 type_text）
+        2. 合并连续输入（同一输入框的多次 type_text 只保留最后一次）
+        3. 去重连续相同 click
+        4. 合并连续同方向 scroll
+        返回清洗后的 actions 列表（不修改原始数据）。
+        """
+        if not self.actions:
+            return []
+
+        cleaned = self._filter_invalid(self.actions)
+        cleaned = self._merge_consecutive_inputs(cleaned)
+        cleaned = self._dedup_clicks(cleaned)
+        cleaned = self._merge_scrolls(cleaned)
+        return cleaned
+
+    @staticmethod
+    def _filter_invalid(actions: list[dict]) -> list[dict]:
+        """过滤无效操作。"""
+        result = []
+        for a in actions:
+            atype = a.get("type", "")
+            # 跳过无文本的 type_text
+            if atype == "type_text" and not a.get("text", "").strip():
+                continue
+            # 跳过无 selector 且无 text 的 click
+            if atype == "click" and not a.get("selector") and not a.get("text", "").strip():
+                continue
+            result.append(a)
+        return result
+
+    @staticmethod
+    def _merge_consecutive_inputs(actions: list[dict]) -> list[dict]:
+        """合并同一输入框的连续 type_text，只保留最后一次（最终值）。"""
+        if not actions:
+            return []
+        result = []
+        for a in actions:
+            if (
+                a.get("type") == "type_text"
+                and result
+                and result[-1].get("type") == "type_text"
+                and result[-1].get("selector") == a.get("selector")
+                and result[-1].get("selector")  # selector 不为空
+            ):
+                # 同一输入框，替换为最新值
+                result[-1] = a
+            else:
+                result.append(a)
+        return result
+
+    @staticmethod
+    def _dedup_clicks(actions: list[dict]) -> list[dict]:
+        """去重连续相同 click（同 selector + 同 text，500ms 内）。"""
+        if not actions:
+            return []
+        result = [actions[0]]
+        for a in actions[1:]:
+            prev = result[-1]
+            if (
+                a.get("type") == "click"
+                and prev.get("type") == "click"
+                and a.get("selector") == prev.get("selector")
+                and a.get("text") == prev.get("text")
+                and abs(a.get("timestamp", 0) - prev.get("timestamp", 0)) < 500
+            ):
+                continue  # 跳过重复 click
+            result.append(a)
+        return result
+
+    @staticmethod
+    def _merge_scrolls(actions: list[dict]) -> list[dict]:
+        """合并连续同方向 scroll 为一次。"""
+        if not actions:
+            return []
+        result = []
+        for a in actions:
+            if (
+                a.get("type") == "scroll"
+                and result
+                and result[-1].get("type") == "scroll"
+                and a.get("meta", {}).get("direction") == result[-1].get("meta", {}).get("direction")
+            ):
+                # 累加滚动量
+                prev_amount = result[-1].get("meta", {}).get("amount", 0)
+                cur_amount = a.get("meta", {}).get("amount", 0)
+                result[-1].setdefault("meta", {})["amount"] = prev_amount + cur_amount
+            else:
+                result.append(a)
+        return result
+
+    # ── 转换入口 ──────────────────────────────────────────────────
+
+    def to_workflow_yaml(self, params: list[dict] = None, title: str = "", clean: bool = True) -> str:
         """
         将操作序列转为 workflow YAML。
         params: 用户自定义参数列表（覆盖自动检测）
+        clean: 是否先清洗动作序列（默认 True）
         """
-        if not self.actions:
+        actions = self.clean_actions() if clean else self.actions
+        if not actions:
             return yaml.dump({"title": title or "空录制", "blocks": []}, allow_unicode=True)
 
-        detected_params = params if params else self._detect_parameters()
-        groups = self._group_actions_by_page()
-        blocks = []
+        # 临时替换 self.actions 用于后续方法
+        orig_actions = self.actions
+        self.actions = actions
 
-        for i, group in enumerate(groups):
-            block = self._actions_to_block(group, i, detected_params)
-            if block:
-                blocks.append(block)
+        try:
+            detected_params = params if params else self._detect_parameters()
+            groups = self._group_actions_by_page()
+            blocks = []
 
-        # 构建 workflow 定义
-        wf = {
-            "title": title or self.recording.get("title", "") or "录制工作流",
-            "description": f"从录制自动生成，共 {len(self.actions)} 步操作",
-            "parameters": [
-                {
-                    "key": p["key"],
-                    "type": p.get("type", "string"),
-                    "description": p.get("description", ""),
-                    "required": True,
-                    "default": p.get("default_value", ""),
-                }
-                for p in detected_params
-            ],
-            "blocks": blocks,
-        }
+            for i, group in enumerate(groups):
+                block = self._actions_to_block(group, i, detected_params)
+                if block:
+                    blocks.append(block)
 
-        return yaml.dump(wf, allow_unicode=True, default_flow_style=False, sort_keys=False)
+            # 构建 workflow 定义
+            wf = {
+                "title": title or self.recording.get("title", "") or "录制工作流",
+                "description": f"从录制自动生成，共 {len(self.actions)} 步操作",
+                "parameters": [
+                    {
+                        "key": p["key"],
+                        "type": p.get("type", "string"),
+                        "description": p.get("description", ""),
+                        "required": True,
+                        "default": p.get("default_value", ""),
+                    }
+                    for p in detected_params
+                ],
+                "blocks": blocks,
+            }
+
+            return yaml.dump(wf, allow_unicode=True, default_flow_style=False, sort_keys=False)
+        finally:
+            self.actions = orig_actions
 
     def _group_actions_by_page(self) -> list[list[dict]]:
         """按 URL 变化将操作分组。"""

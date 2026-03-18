@@ -28,6 +28,7 @@ from .cost_tracker import CostTracker
 from .a11y_tree import extract_a11y_tree, get_page_summary, should_use_screenshot
 from .model_router import select_model_tier
 from .memory import MemoryManager, format_memories_for_prompt, _extract_domain
+from .visual_verify import take_snapshot, verify_action, ActionVerifier, SKIP_VERIFY
 
 from utils import llm_chat
 from page_annotator import annotate_page
@@ -422,6 +423,7 @@ async def run_agent(
         _last_content_hash = None  # 用于截图复用：检测 DOM 是否变化
         _pending_nudges: list[str] = []  # 缓存 nudge 消息，下一轮截图时注入（避免打断 tool_result 顺序）
         cost_tracker = CostTracker()  # 成本追踪
+        action_verifier = ActionVerifier()  # 视觉验证器
         _consecutive_dom_steps = 0  # 连续使用 DOM 模式的步数（用于按需截图判断）
         _dom_tokens_saved = 0  # 累计节省的 token 数
 
@@ -789,8 +791,31 @@ async def run_agent(
                     wait_result = await _wait_for_page_ready(agent.page, log_fn=_log, timeout_ms=120000, check_network=True, active_requests=active_requests)
                     await _log(f"  [wait_stable] 结果: {wait_result}")
 
+                # ── 视觉验证：action 前快照 ──────────────────────────────
+                _snap_before = None
+                if tool_name not in SKIP_VERIFY:
+                    try:
+                        _snap_before = await take_snapshot(agent.get_active_page())
+                    except Exception:
+                        pass
+
                 result = await agent.execute(tool_name, tool_args)
                 await _log(f"    result: {str(result)[:200]}")
+
+                # ── 视觉验证：action 后对比 ──────────────────────────────
+                if _snap_before is not None:
+                    try:
+                        _snap_after = await take_snapshot(agent.get_active_page())
+                        _vr = verify_action(tool_name, tool_args, _snap_before, _snap_after, result)
+                        _escalation = action_verifier.record(_vr)
+                        if _vr.nudge and not _vr.changed:
+                            await _log(f"  [视觉验证] {_vr.details}")
+                            _pending_nudges.append(_vr.nudge)
+                        if _escalation:
+                            await _log(f"  [视觉验证] {_escalation}")
+                            _pending_nudges.append(_escalation)
+                    except Exception:
+                        pass
 
                 # navigate 后自动检查弹窗 + CAPTCHA
                 if tool_name == "navigate":
