@@ -90,7 +90,7 @@ export function DashboardPage() {
     let tasksWithCost = 0;
 
     for (const t of tasks) {
-      const c = (t as Record<string, unknown>).cost as Record<string, number> | undefined;
+      const c = (t as unknown as Record<string, unknown>).cost as Record<string, number> | undefined;
       if (c && c.total_calls > 0) {
         tasksWithCost++;
         totalCalls += c.total_calls || 0;

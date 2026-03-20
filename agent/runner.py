@@ -16,7 +16,7 @@ from playwright.async_api import async_playwright
 
 from .page_utils import _safe_print, _wait_for_page_ready
 from .core import BrowserAgent
-from .tools import TOOLS, TERMINATES_SEQUENCE
+from .tools import TOOLS, TERMINATES_SEQUENCE, CORE_TOOL_NAMES
 from .llm_helpers import _decompose_task, _verify_step, _compress_messages, _analyze_failure, trim_elements, estimate_messages_tokens
 from .chrome_detector import _find_chrome_user_data_dir
 from .error_recovery import FailureTracker
@@ -449,6 +449,9 @@ async def run_agent(
             )
             if _relevant_memories:
                 _memory_text = format_memories_for_prompt(_relevant_memories)
+                # 截断记忆文本，避免每步携带过多 token
+                if len(_memory_text) > 500:
+                    _memory_text = _memory_text[:500] + "...(截断)"
                 messages[1]["content"] += f"\n\n{_memory_text}"
                 await _log(f"  [记忆] 已注入 {len(_relevant_memories)} 条相关经验")
         except Exception as e:
@@ -491,6 +494,12 @@ async def run_agent(
             _inferred_task_type = "extract"
         elif any(kw in _task_lower for kw in ("下载", "download")):
             _inferred_task_type = "download"
+
+        # 简单任务裁剪工具列表（节省 ~1600 tokens/步）
+        _SIMPLE_TASK_TYPES_FOR_TRIM = {"navigate", "screenshot", "extract", "download"}
+        if _inferred_task_type in _SIMPLE_TASK_TYPES_FOR_TRIM:
+            all_tools = [t for t in all_tools if t["function"]["name"] in CORE_TOOL_NAMES]
+            await _log(f"  [工具裁剪] 简单任务，工具数: {len(all_tools)}")
 
         # ── 智能错误恢复 + 熔断器 + 循环检测 ──────────────────────────────────
         failure_tracker = FailureTracker()
@@ -706,7 +715,7 @@ async def run_agent(
                                 "操作时用元素的 index 编号，不要猜 selector 或坐标。"
                             ),
                         },
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}", "detail": "high"}},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}", "detail": "low"}},
                     ],
                 })
             else:

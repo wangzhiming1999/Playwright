@@ -254,8 +254,8 @@ def should_use_screenshot(
     if page_summary.get("has_captcha") or page_summary.get("has_dialog"):
         return True
 
-    # 4. 连续 DOM 步骤过多（每 4 步截一次图）
-    if consecutive_dom_steps >= 4:
+    # 4. 连续 DOM 步骤过多（每 6 步截一次图）
+    if consecutive_dom_steps >= 6:
         return True
 
     # 5. 视觉操作工具

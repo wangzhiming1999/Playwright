@@ -1,5 +1,11 @@
 # ── 工具定义（GPT 可调用的操作） ──────────────────────────────────────────────
 
+# 简单任务只需要的核心工具集（导航/截图/提取/下载类任务）
+CORE_TOOL_NAMES = {
+    "navigate", "click", "type_text", "scroll", "screenshot",
+    "done", "wait", "wait_for_text", "extract", "press_key", "ask_user",
+}
+
 # 标记哪些 tool 会导致页面跳转（执行后需要中断剩余 action 队列）
 TERMINATES_SEQUENCE = {
     "navigate",      # 导航到新 URL

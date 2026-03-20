@@ -1,21 +1,23 @@
 import { api } from './client';
 import type { TaskTrace } from '../types/task';
+import { useTaskStore } from '@/hooks/useTaskStore';
 
 export function submitTasks(tasks: string[], browserMode = 'builtin', cdpUrl?: string, chromeProfile?: string) {
   return api.post<{ task_ids: string[] }>('/run', {
     tasks,
     browser_mode: browserMode,
-    cdp_url: cdpUrl,
-    chrome_profile: chromeProfile,
+    ...(cdpUrl ? { cdp_url: cdpUrl } : {}),
+    ...(chromeProfile ? { chrome_profile: chromeProfile } : {}),
   });
 }
 
 export function cancelTask(taskId: string) {
-  return api.post<{ status: string }>(`/tasks/${taskId}/cancel`);
+  useTaskStore.getState().updateStatus(taskId, 'cancelled');
+  return api.post<{ status?: string }>(`/tasks/${taskId}/cancel`, {});
 }
 
 export function deleteTask(taskId: string) {
-  return api.del<{ status: string }>(`/tasks/${taskId}`);
+  return api.del<{ deleted: boolean }>(`/tasks/${taskId}`);
 }
 
 export function replyToTask(taskId: string, answer: string) {
@@ -46,8 +48,8 @@ export function cleanup(keepLast = 20) {
   return api.post<{ deleted_tasks: number }>('/cleanup', { keep_last: keepLast });
 }
 
-export function retryTask(taskId: string) {
-  return api.post<{ task_id: string; retry_of: string }>(`/tasks/${taskId}/retry`);
+export function retryTask(taskId: string): Promise<{ task_id: string; retry_of: string }> {
+  return api.post<{ task_id: string; retry_of: string }>(`/tasks/${taskId}/retry`, {});
 }
 
 export function getPool() {

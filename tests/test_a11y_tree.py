@@ -26,8 +26,12 @@ class TestShouldUseScreenshot:
         assert should_use_screenshot(step=3, last_tool="click", page_summary={"has_dialog": True}, consecutive_dom_steps=1) is True
 
     def test_consecutive_dom_steps_triggers_screenshot(self):
-        """After 4 consecutive DOM-only steps, force a screenshot."""
-        assert should_use_screenshot(step=5, last_tool="click", page_summary={}, consecutive_dom_steps=4) is True
+        """After 6 consecutive DOM-only steps, force a screenshot."""
+        assert should_use_screenshot(step=7, last_tool="click", page_summary={}, consecutive_dom_steps=6) is True
+
+    def test_consecutive_dom_steps_below_threshold(self):
+        """4 consecutive DOM steps should NOT trigger screenshot (threshold is 6)."""
+        assert should_use_screenshot(step=5, last_tool="click", page_summary={}, consecutive_dom_steps=4) is False
 
     def test_visual_tools_trigger_screenshot(self):
         for tool in ("find_element", "save_element", "solve_captcha", "screenshot", "drag_drop"):
