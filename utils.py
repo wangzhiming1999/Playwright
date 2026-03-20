@@ -80,45 +80,43 @@ def _resolve_model(model: str) -> tuple[str, str]:
 
 # ── Client factories (cached) ───────────────────────────────────────────────
 
-_openai_client = None
-_anthropic_client = None
+import threading
+_thread_local = threading.local()
 
 
 def get_openai_client():
-    """Create or return cached OpenAI client with optional proxy."""
-    global _openai_client
-    if _openai_client is not None:
-        return _openai_client
+    """Create or return thread-local cached OpenAI client with optional proxy."""
+    if getattr(_thread_local, "openai_client", None) is not None:
+        return _thread_local.openai_client
 
     import httpx
     from openai import OpenAI
 
     proxy = os.getenv("USE_PROXY") and "http://127.0.0.1:7897"
     http_client = httpx.Client(proxy=proxy, timeout=120.0) if proxy else httpx.Client(timeout=120.0)
-    _openai_client = OpenAI(
+    _thread_local.openai_client = OpenAI(
         api_key=os.getenv("OPENAI_API_KEY"),
         http_client=http_client,
     )
-    return _openai_client
+    return _thread_local.openai_client
 
 
 def get_anthropic_client():
-    """Create or return cached Anthropic client with optional proxy."""
-    global _anthropic_client
-    if _anthropic_client is not None:
-        return _anthropic_client
+    """Create or return thread-local cached Anthropic client with optional proxy."""
+    if getattr(_thread_local, "anthropic_client", None) is not None:
+        return _thread_local.anthropic_client
 
     import httpx
     from anthropic import Anthropic
 
     proxy = os.getenv("USE_PROXY") and "http://127.0.0.1:7897"
     http_client = httpx.Client(proxy=proxy, timeout=120.0) if proxy else httpx.Client(timeout=120.0)
-    _anthropic_client = Anthropic(
+    _thread_local.anthropic_client = Anthropic(
         api_key=os.getenv("ANTHROPIC_API_KEY"),
         base_url="https://api.anthropic.com",
         http_client=http_client,
     )
-    return _anthropic_client
+    return _thread_local.anthropic_client
 
 
 # ── Response wrapper (unified format) ────────────────────────────────────────
