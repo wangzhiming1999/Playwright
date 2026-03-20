@@ -39,3 +39,20 @@ export const convertRecording = (id: string, data?: { title?: string; parameters
 
 export const replayRecording = (id: string, parameters?: Record<string, unknown>) =>
   api.post<{ run_id: string; workflow_id: string }>(`/recordings/${id}/replay`, { parameters: parameters || {} });
+
+export const deleteRecordingAction = (id: string, index: number) =>
+  api.del<{ ok: boolean; actions_count: number }>(`/recordings/${id}/actions/${index}`);
+
+export const updateRecordingAction = (id: string, index: number, data: { text?: string; selector?: string }) =>
+  api.put<{ ok: boolean }>(`/recordings/${id}/actions/${index}`, data);
+
+export const replaceRecordingActions = (id: string, actions: RecordedAction[]) =>
+  api.put<{ ok: boolean; actions_count: number }>(`/recordings/${id}/actions`, { actions });
+
+export const previewRecordingConvert = (id: string) =>
+  api.post<{
+    original_count: number;
+    cleaned_count: number;
+    parameters: Recording['parameters'];
+    yaml_preview: string;
+  }>(`/recordings/${id}/preview`, {});

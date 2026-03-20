@@ -209,8 +209,8 @@ class TestE2ERunnerScenarioExecution:
         async def mock_agent(**kwargs):
             cb = kwargs.get("log_callback")
             if cb:
-                await cb("step 1")
-                await cb("step 2")
+                await cb("e2e_test_logs", "step 1")
+                await cb("e2e_test_logs", "step 2")
             return {"success": True, "steps": 2, "cost": {}}
 
         with patch("agent.runner.run_agent", side_effect=mock_agent):

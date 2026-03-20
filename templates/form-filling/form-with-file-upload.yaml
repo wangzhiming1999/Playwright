@@ -1,0 +1,41 @@
+template:
+  id: form-with-file-upload
+  category: form-filling
+  tags: [form, upload, file]
+  icon: upload
+  difficulty: intermediate
+  estimated_time: "2-5 分钟"
+
+title: 表单填写并上传文件
+description: 填写在线表单并上传附件，适合简历投递、文件提交、报名表等场景
+
+parameters:
+  - key: form_url
+    type: string
+    description: 表单页面 URL
+    required: true
+  - key: form_fields
+    type: json
+    description: '表单字段映射，格式：{"姓名": "张三", "邮箱": "test@example.com"}'
+    required: true
+  - key: file_path
+    type: string
+    description: 要上传的本地文件路径���绝对路径）
+    required: true
+  - key: file_field_label
+    type: string
+    description: 文件上传字段的标签文字（如"附件"、"简历"）
+    default: "文件"
+    required: false
+
+blocks:
+  - block_type: navigation
+    label: open_form
+    url: "{{ form_url }}"
+
+  - block_type: task
+    label: fill_and_upload
+    task: |
+      填写表单字段：{{ form_fields }}
+      然后找到标签为"{{ file_field_label }}"的文件上传控件，上传文件：{{ file_path }}
+      最后提交表单，等待提交成功的确认信息。

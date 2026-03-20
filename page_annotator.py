@@ -57,6 +57,7 @@ _ANNOTATE_JS = """() => {
     }
 
     function isInteractable(el) {
+        if (!el || !el.tagName) return false;  // 防御 SVG/shadow DOM 节点
         const tag = el.tagName.toLowerCase();
 
         // 排除 hidden input 和 script/style

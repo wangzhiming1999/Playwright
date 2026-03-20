@@ -37,12 +37,12 @@ from utils import llm_chat
 from page_annotator import annotate_page
 
 
-async def _verify_done(agent, task: str, summary: str, _log, llm_chat_fn, task_type: str = "") -> bool:
+async def _verify_done(agent, task: str, summary: str, _log, llm_chat_fn, task_type: str = "") -> tuple[bool, str]:
     """
     完成前验证：截图 + GPT 判断是否真正满足用户需求。
     自适应等待间隔：3s → 8s → 15s（总计最多 26s，vs 旧版 45s）。
     简单任务（导航/截图/提取）第1轮通过即返回。
-    返回 True 表示验证通过。
+    返回 (True/False, reason_str)。
     """
     _WAIT_INTERVALS = [3, 8, 15]  # 递增等待间隔
     _SIMPLE_TASK_TYPES = {"navigate", "screenshot", "extract", "download"}
@@ -112,37 +112,35 @@ async def _verify_done(agent, task: str, summary: str, _log, llm_chat_fn, task_t
             )
             if not verify_resp.choices:
                 await _log(f"  ⚠ 验证 API 返回空，视为通过")
-                return True
+                return True, ""
 
             try:
                 verify_data = json.loads(verify_resp.choices[0].message.content)
             except json.JSONDecodeError:
                 await _log(f"  ⚠ 验证结果 JSON 解析失败，视为通过")
-                return True
+                return True, ""
 
             is_done = verify_data.get("done", True)
             reason = verify_data.get("reason", "")
             await _log(f"  [完成验证] {'✅ 已完成' if is_done else '⏳ 未完成'} — {reason}")
 
             if is_done:
-                return True
+                return True, reason
             else:
                 # 简单任务第1轮未通过也继续检查，但等待时间更短
                 if check_round < 3:
                     wait_sec = _WAIT_INTERVALS[check_round - 1]
-                    # 简单任务类型：如果第1轮就通过了直接返回（上面已处理），
-                    # 未通过时用更短的等待
                     if task_type in _SIMPLE_TASK_TYPES and check_round >= 2:
                         await _log(f"  [快速路径] 简单任务第{check_round}轮未通过，不再等待")
-                        return False
+                        return False, reason
                     await _log(f"  等待 {wait_sec} 秒后重新检查...")
                     await asyncio.sleep(wait_sec)
 
         except Exception as e:
             await _log(f"  ⚠ 验证异常: {e}，视为通过")
-            return True
+            return True, ""
 
-    return False
+    return False, reason if 'reason' in dir() else ""
 
 
 def _normalize_url(url: str) -> str:
@@ -198,6 +196,7 @@ async def run_agent(
     pool=None,                   # browser_mode="pool" 时传入 BrowserPool 实例
     site_understanding: bool = True,  # 首步自动分析站点结构
     max_steps: int = 35,         # 最大执行步数
+    cancel_event=None,           # threading.Event：用于“停止任务”时尽快退出（可选）
 ) -> dict:
     """
     运行 agent 执行任务。
@@ -518,6 +517,17 @@ async def run_agent(
         agent._active_requests = active_requests  # 注入到 agent，供 wait 工具使用
 
         for step in range(max_steps):
+            # 支持外部取消：尽快退出循环，保证会走到最后的 cleanup（含 BrowserPool.release）
+            if cancel_event is not None:
+                try:
+                    if cancel_event.is_set():
+                        task_reason = "用户已取消"
+                        steps_executed = step
+                        await _log("  ⚠️ [取消] 收到取消信号，终止任务执行")
+                        break
+                except Exception:
+                    # cancel_event 不是标准 threading.Event 时忽略
+                    pass
             # ── 追踪：开始新步骤 ──────────────────────────────────────
             try:
                 _step_url = agent.page.url
@@ -765,6 +775,44 @@ async def run_agent(
             _LLM_RETRY_DELAYS = [1.0, 3.0]  # 2 次重试: 1s, 3s
             response = None
             _llm_last_error = None
+            class _UserCancelled(RuntimeError):
+                """内部取消信号：用于让 LLM 阻塞时也能尽快退出。"""
+                pass
+
+            async def _run_llm_chat_with_cancel(fn):
+                """
+                把同步 llm_chat 放到线程池，避免阻塞 event loop。
+                同时监听 cancel_event，取消时尽快抛出 _UserCancelled。
+                """
+                loop = asyncio.get_running_loop()
+                llm_task = loop.run_in_executor(None, fn)
+
+                if cancel_event is None:
+                    return await llm_task
+
+                async def _watch_cancel():
+                    # 轮询短间隔，保证取消能快速打断等待
+                    while True:
+                        try:
+                            if cancel_event.is_set():
+                                raise _UserCancelled("用户已取消")
+                        except Exception:
+                            # cancel_event 非预期类型时忽略
+                            pass
+                        await asyncio.sleep(0.2)
+
+                cancel_task = asyncio.create_task(_watch_cancel())
+                try:
+                    done, _pending = await asyncio.wait(
+                        {llm_task, cancel_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    # 如果取消先触发，则抛出
+                    if cancel_task in done:
+                        raise _UserCancelled("用户已取消")
+                    return await llm_task
+                finally:
+                    cancel_task.cancel()
 
             for _retry_idx in range(len(_LLM_RETRY_DELAYS) + 1):  # 0, 1, 2 = 初始 + 2 次重试
                 if not llm_breaker.check():
@@ -772,13 +820,16 @@ async def run_agent(
                     await asyncio.sleep(llm_breaker.cooldown)
 
                 try:
-                    response = llm_chat(
-                        model=model_tier,
-                        messages=messages,
-                        tools=all_tools,
-                        tool_choice="required",
-                        max_tokens=2000,  # 增大以支持多 action 返回
-                    )
+                    def _call():
+                        return llm_chat(
+                            model=model_tier,
+                            messages=messages,
+                            tools=all_tools,
+                            tool_choice="required",
+                            max_tokens=2000,  # 增大以支持多 action 返回
+                        )
+
+                    response = await _run_llm_chat_with_cancel(_call)
                     llm_breaker.record_success()
                     # 记录 token 消耗
                     if response and hasattr(response, 'usage') and response.usage:
@@ -786,6 +837,11 @@ async def run_agent(
                         _actual_model, _ = _rm(model_tier)
                         cost_tracker.record(model=_actual_model, usage=response.usage, purpose="main_loop")
                     break  # 成功
+                except _UserCancelled:
+                    task_reason = "用户已取消"
+                    steps_executed = step
+                    await _log("  ⚠️ [取消] LLM 阻塞中检测到取消，退出任务")
+                    break
                 except Exception as e:
                     _llm_last_error = e
                     if _retry_idx < len(_LLM_RETRY_DELAYS):
@@ -799,6 +855,10 @@ async def run_agent(
                         if llm_breaker.state.value == "open":
                             await _log(f"  ⚠ LLM API 熔断，等待 {llm_breaker.cooldown}s 后重试")
                             await asyncio.sleep(llm_breaker.cooldown)
+
+            # 取消后直接跳出外层 step loop（由 finally 释放资源）
+            if task_reason == "用户已取消":
+                break
 
             if response is None:
                 continue  # 跳到下一步
@@ -943,7 +1003,7 @@ async def run_agent(
                 # ── 处理 __DONE__ ──────────────────────────────────────
                 if result == "__DONE__":
                     summary = tool_args.get("summary", "任务完成")
-                    done_verified = await _verify_done(agent, task, summary, _log, llm_chat,
+                    done_verified, _verify_reason_raw = await _verify_done(agent, task, summary, _log, llm_chat,
                                                         task_type=_inferred_task_type)
                     if done_verified:
                         await _log(f"\n✅ {summary}")
@@ -958,7 +1018,7 @@ async def run_agent(
                     else:
                         await _log(f"  ⚠ 验证未通过，要求 agent 继续执行")
                         # P2-3: 根据验证失败原因给出具体指导
-                        _verify_reason = reason.lower() if reason else ""
+                        _verify_reason = _verify_reason_raw.lower() if _verify_reason_raw else ""
                         if any(kw in _verify_reason for kw in ("loading", "spinner", "加载", "骨架")):
                             result = (
                                 "Page is still loading. Call wait(wait_for_content_change=true, timeout=30) "
@@ -971,13 +1031,13 @@ async def run_agent(
                             )
                         elif any(kw in _verify_reason for kw in ("不符", "mismatch", "不匹配", "incomplete", "截断")):
                             result = (
-                                f"Verification failed: {reason}. "
+                                f"Verification failed: {_verify_reason_raw}. "
                                 "Review the task requirements and current page state. "
                                 "The page content may not match what was requested."
                             )
                         else:
                             result = (
-                                f"Task not yet complete: {reason}. "
+                                f"Task not yet complete: {_verify_reason_raw}. "
                                 "Continue working — check current page state, wait if loading, "
                                 "then try done again. Do NOT call done immediately."
                             )
@@ -1117,6 +1177,13 @@ async def run_agent(
             if is_loop:
                 await _log(f"  [循环检测] {loop_nudge}")
                 _pending_nudges.append(loop_nudge)
+                # 最高阈值（9次）触发后，如果 agent 仍未跳出，强制终止
+                if loop_detector._last_nudge_count >= loop_detector._nudge_thresholds[2]:
+                    await _log(f"\n⚠️ [循环检测] 已达最高阈值 {loop_detector._last_nudge_count} 次，强制终止任务")
+                    task_reason = f"循环检测：重复操作 {loop_detector._last_nudge_count} 次无进展"
+                    steps_executed = step + 1
+                    trace_collector.end_step()
+                    break
 
             # ── 计划停滞检测 ──────────────────────────────────────────
             stall_nudge = plan_manager.check_stall(step)
@@ -1181,7 +1248,7 @@ async def run_agent(
                 await _log("  🌐 浏览器保持打开，可手动查看结果。关闭浏览器窗口即可释放资源。")
 
         # 兜底：如果 AI 没调 done 但截图目录里有非调试截图，也算成功
-        if not task_success:
+        if not task_success and task_reason != "用户已取消":
             user_screenshots = [
                 f for f in screenshots_dir.glob("*.*")
                 if f.suffix.lower() in (".png", ".jpg", ".jpeg")

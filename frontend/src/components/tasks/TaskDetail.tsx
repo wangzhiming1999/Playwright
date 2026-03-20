@@ -7,6 +7,7 @@ import { CurationView } from '@/components/CurationView';
 import { GeneratedView } from '@/components/GeneratedView';
 import { LogViewer } from '@/components/LogViewer';
 import { ScreenshotReplay } from '@/components/ScreenshotReplay';
+import TraceView from '@/components/tasks/TraceView';
 import './TaskDetail.css';
 
 export function TaskDetail() {
@@ -15,7 +16,7 @@ export function TaskDetail() {
   const removeTask = useTaskStore((s) => s.removeTask);
   const setCuration = useTaskStore((s) => s.setCuration);
   const setGenerated = useTaskStore((s) => s.setGenerated);
-  const [tab, setTab] = useState<'logs' | 'screenshots' | 'curation' | 'generated'>('logs');
+  const [tab, setTab] = useState<'logs' | 'screenshots' | 'curation' | 'generated' | 'trace'>('logs');
   const [reply, setReply] = useState('');
   const [replying, setReplying] = useState(false);
   const [curating, setCurating] = useState(false);
@@ -118,6 +119,7 @@ export function TaskDetail() {
           策展 {task.curation && `(${task.curation.cards.length})`}
         </button>
         <button className={`tab-btn ${tab === 'generated' ? 'active' : ''}`} onClick={() => setTab('generated')}>生成内容</button>
+        <button className={`tab-btn ${tab === 'trace' ? 'active' : ''}`} onClick={() => setTab('trace')}>追踪</button>
       </div>
 
       <div className="tab-content">
@@ -159,6 +161,10 @@ export function TaskDetail() {
           ) : (
             <div className="empty-state">请先运行策展</div>
           )
+        )}
+
+        {tab === 'trace' && (
+          <TraceView taskId={task.id} />
         )}
       </div>
     </div>

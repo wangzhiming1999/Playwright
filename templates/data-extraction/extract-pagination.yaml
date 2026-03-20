@@ -1,0 +1,38 @@
+template:
+  id: extract-pagination
+  category: data-extraction
+  tags: [pagination, scraping, list]
+  icon: layers
+  difficulty: intermediate
+  estimated_time: "3-8 分钟"
+
+title: 分页数据提取
+description: 自动翻页提取多页列表数据，支持指定最大页数，适合商品列表、新闻列表等分页场景
+
+parameters:
+  - key: start_url
+    type: string
+    description: 第一页的 URL
+    required: true
+  - key: data_goal
+    type: string
+    description: 每页要提取的数据描述（如"提取所有商品名称和价格"）
+    required: true
+  - key: max_pages
+    type: integer
+    description: 最多翻页数量
+    default: 3
+    required: false
+
+blocks:
+  - block_type: navigation
+    label: open_first_page
+    url: "{{ start_url }}"
+
+  - block_type: task
+    label: extract_all_pages
+    task: |
+      从当前页面开始，提取数据：{{ data_goal }}
+      然后查找"下一页"按钮，最多翻 {{ max_pages }} 页，每页都提取相同数据。
+      将所有页面的数据汇总后返回完整列表。
+      如果没有下一页按钮或已达到最大页数，停止翻页。

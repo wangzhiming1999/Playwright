@@ -239,11 +239,16 @@ class Watchdog:
                 const iframes = document.querySelectorAll('iframe');
                 for (const iframe of iframes) {
                     const src = (iframe.src || '').toLowerCase();
-                    if (src.includes('captcha') || src.includes('recaptcha') ||
-                        src.includes('hcaptcha') || src.includes('turnstile') ||
-                        src.includes('challenge')) {
-                        return src;
+                    if (!src.includes('captcha') && !src.includes('recaptcha') &&
+                        !src.includes('hcaptcha') && !src.includes('turnstile') &&
+                        !src.includes('challenge')) {
+                        continue;
                     }
+                    // 不可见的 iframe 是后台验证（如 reCAPTCHA v3），不是用户需要解决的
+                    const style = window.getComputedStyle(iframe);
+                    if (style.display === 'none' || style.visibility === 'hidden') continue;
+                    if (iframe.offsetWidth === 0 && iframe.offsetHeight === 0) continue;
+                    return src;
                 }
                 // 检查页面中的验证码相关元素
                 const selectors = [
@@ -252,7 +257,12 @@ class Watchdog:
                     'img[src*="captcha"]', 'img[alt*="验证码"]',
                 ];
                 for (const sel of selectors) {
-                    if (document.querySelector(sel)) return sel;
+                    const el = document.querySelector(sel);
+                    if (!el) continue;
+                    const style = window.getComputedStyle(el);
+                    if (style.display === 'none' || style.visibility === 'hidden') continue;
+                    if (el.offsetWidth === 0 && el.offsetHeight === 0) continue;
+                    return sel;
                 }
                 return null;
             }""")

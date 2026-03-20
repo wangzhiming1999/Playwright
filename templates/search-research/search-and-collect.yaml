@@ -1,0 +1,38 @@
+template:
+  id: search-and-collect
+  category: search-research
+  tags: [search, collect, research]
+  icon: search
+  difficulty: intermediate
+  estimated_time: "3-8 分钟"
+
+title: 搜索并收集结果
+description: 在搜索引擎或网站内搜索关键词，收集前 N 条结果的标题、链接和摘要，适合竞品调研、信息收集
+
+parameters:
+  - key: search_url
+    type: string
+    description: 搜索页面 URL（如 https://www.google.com 或网站内搜索页）
+    required: true
+  - key: keyword
+    type: string
+    description: 搜索关键词
+    required: true
+  - key: result_count
+    type: integer
+    description: 要收集的结果数量
+    default: 10
+    required: false
+
+blocks:
+  - block_type: navigation
+    label: open_search
+    url: "{{ search_url }}"
+
+  - block_type: task
+    label: search_and_collect
+    task: |
+      在搜索框中输入"{{ keyword }}"并提交搜索。
+      等待搜索结果加载完成后，提取前 {{ result_count }} 条结果，
+      每条结果包含：标题、链接URL、摘要描述。
+      以结构化列表形式返回所有结果。

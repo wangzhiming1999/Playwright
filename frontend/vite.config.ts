@@ -15,7 +15,9 @@ export default defineConfig({
     port: 5173,
     proxy: {
       '/run': 'http://127.0.0.1:8000',
+      '/pool': 'http://127.0.0.1:8000',
       '/tasks': 'http://127.0.0.1:8000',
+      '/browser-pool': 'http://127.0.0.1:8000',
       '/screenshots': 'http://127.0.0.1:8000',
       '/curate': 'http://127.0.0.1:8000',
       '/generate': 'http://127.0.0.1:8000',

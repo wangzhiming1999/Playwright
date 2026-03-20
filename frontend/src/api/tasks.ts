@@ -1,4 +1,5 @@
 import { api } from './client';
+import type { TaskTrace } from '../types/task';
 
 export function submitTasks(tasks: string[], browserMode = 'builtin', cdpUrl?: string, chromeProfile?: string) {
   return api.post<{ task_ids: string[] }>('/run', {
@@ -92,4 +93,8 @@ export function warmupBrowserPool() {
 
 export function batchDeleteTasks(taskIds: string[]) {
   return api.post<{ deleted: number; deleted_ids: string[] }>('/tasks/batch-delete', { task_ids: taskIds });
+}
+
+export function getTaskTrace(taskId: string) {
+  return api.get<TaskTrace>(`/tasks/${taskId}/trace`);
 }

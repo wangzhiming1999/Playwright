@@ -200,8 +200,10 @@ async def _wait_for_page_ready(page, log_fn=None, timeout_ms: int = 15000, check
             continue
 
         delta = abs(curr_len - prev_len)
-        # 有 spinner 或高 mutation 率时强制不算稳定
-        if has_spinner or mutation_rate > 5:
+        elapsed_s = asyncio.get_event_loop().time() - start_time
+        # 超过 5s 后 spinner 可能是装饰性 skeleton，不再阻塞稳定计数
+        spinner_blocks = has_spinner and elapsed_s < 5.0
+        if spinner_blocks or mutation_rate > 5:
             content_stable_count = 0
             has_seen_activity = True
         elif delta < 10:
@@ -219,15 +221,21 @@ async def _wait_for_page_ready(page, log_fn=None, timeout_ms: int = 15000, check
 
         # 判断就绪条件
         # 如果从未观察到活动（页面本来就是静态的），快速返回
-        if not has_seen_activity and content_stable_count >= 3 and network_idle_count >= 3:
+        # 放宽条件：content_stable_count >= 3 即可（不要求 >= 3 同时满足网络）
+        if not has_seen_activity and content_stable_count >= 3:
             elapsed = asyncio.get_event_loop().time() - start_time
             return f"页面就绪 ({elapsed:.1f}s)"
 
         # 如果观察到过活动，需要更严格的稳定条件：
-        # 网络空闲 >= 1.5 秒 且 内容稳定 >= 2 秒
-        if has_seen_activity and network_idle_count >= 15 and content_stable_count >= 20:
+        # 网络空闲 >= 1.5 秒 且 内容稳定 >= 1.5 秒
+        if has_seen_activity and network_idle_count >= 15 and content_stable_count >= 15:
             elapsed = asyncio.get_event_loop().time() - start_time
             return f"页面就绪 ({elapsed:.1f}s)"
+
+        # 兜底：网络空闲超过 5 秒，不管内容是否稳定都返回（防止 Bing 等 SPA 死锁）
+        if network_idle_count >= 50:
+            elapsed = asyncio.get_event_loop().time() - start_time
+            return f"页面就绪 ({elapsed:.1f}s，网络已空闲)"
 
     elapsed = asyncio.get_event_loop().time() - start_time
     return f"页面基本就绪 ({elapsed:.1f}s，内容可能仍在变化)"

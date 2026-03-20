@@ -1,5 +1,45 @@
 export type TaskStatus = 'pending' | 'running' | 'done' | 'failed' | 'waiting_input' | 'cancelled';
 
+export interface StepTrace {
+  step: number;
+  input_mode: 'screenshot' | 'dom' | 'unknown';
+  elements_count: number;
+  page_url: string;
+  page_title: string;
+  tool_name: string;
+  tool_args: Record<string, unknown>;
+  is_multi_action: boolean;
+  action_count: number;
+  result: string;
+  result_is_error: boolean;
+  duration_ms: number;
+  verify_changed: boolean;
+  verify_type: string;
+  verify_nudge: string;
+  url_before: string;
+  url_after: string;
+  page_changed: boolean;
+  input_tokens: number;
+  output_tokens: number;
+  cached_tokens: number;
+  cost_usd: number;
+  model: string;
+  nudges: string[];
+  events: string[];
+}
+
+export interface TaskTrace {
+  task_id: string;
+  task: string;
+  started_at: string;
+  finished_at: string;
+  success: boolean;
+  reason: string;
+  total_steps: number;
+  total_cost_usd: number;
+  steps: StepTrace[];
+}
+
 export interface Task {
   id: string;
   task: string;

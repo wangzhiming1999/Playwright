@@ -1271,17 +1271,32 @@ class BrowserAgent:
                 elif to_x is None or to_y is None:
                     return "操作失败: 需要提供 to_index 或 (to_x, to_y)"
 
-                # 执行拖拽
+                # 执行拖拽（多阶段慢速，兼容 HTML5 drag 和 pointer 事件）
                 try:
                     await self._log(f"  [拖拽] ({from_x}, {from_y}) → ({to_x}, {to_y})")
+                    # 阶段1：移到起点，按下
                     await page.mouse.move(from_x, from_y)
+                    await asyncio.sleep(0.05)
                     await page.mouse.down()
-                    await asyncio.sleep(0.1)
-                    await page.mouse.move(to_x, to_y, steps=10)
+                    await asyncio.sleep(0.15)
+                    # 阶段2：慢速移动（分 20 步，给 dragover 事件足够时间触发）
+                    steps = 20
+                    for step in range(1, steps + 1):
+                        ix = from_x + (to_x - from_x) * step / steps
+                        iy = from_y + (to_y - from_y) * step / steps
+                        await page.mouse.move(ix, iy)
+                        await asyncio.sleep(0.02)
                     await asyncio.sleep(0.1)
                     await page.mouse.up()
                     await _wait_for_page_ready(page, log_fn=self._log, timeout_ms=3000, check_network=False)
-                    return f"拖拽完成: ({from_x}, {from_y}) → ({to_x}, {to_y})"
+                    result_msg = f"拖拽完成: ({from_x}, {from_y}) → ({to_x}, {to_y})"
+                    # 验证拖拽是否生效（检查页面是否有变化）
+                    try:
+                        new_text_len = await page.evaluate("() => document.body?.innerText?.length || 0")
+                        result_msg += f"，页面内容长度={new_text_len}"
+                    except Exception:
+                        pass
+                    return result_msg
                 except Exception as e:
                     return f"操作失败: 拖拽失败 — {e}"
 

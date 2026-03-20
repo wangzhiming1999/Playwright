@@ -1,0 +1,32 @@
+template:
+  id: screenshot-report
+  category: monitoring
+  tags: [screenshot, report, visual]
+  icon: camera
+  difficulty: beginner
+  estimated_time: "1-3 分钟"
+
+title: 多页面截图报告
+description: 批量访问多个 URL，对每个页面截图，生成可视化报告，适合定期检查页面外观
+
+parameters:
+  - key: urls
+    type: json
+    description: 要截图的 URL 列表，格式：["https://...", "https://..."]
+    required: true
+  - key: wait_seconds
+    type: integer
+    description: 每个页面加载后等待秒数
+    default: 2
+    required: false
+
+blocks:
+  - block_type: task
+    label: capture_pages
+    task: |
+      依次访问以下 URL 列表：{{ urls }}
+      对每个页面：
+      1. 等待 {{ wait_seconds }} 秒让页面完全加载
+      2. 截图保存
+      3. 记录页面标题和截图时间
+      完成后汇总所有页面的截图结果。

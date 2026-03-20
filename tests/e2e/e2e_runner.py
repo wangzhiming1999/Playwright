@@ -71,6 +71,11 @@ class E2ERunner:
         async def _log_collector(task_id: str, msg: str):
             collected_logs.append(msg)
 
+        async def _auto_reply(question: str, reason: str = "") -> str:
+            # E2E 测试无法人工回答，返回空字符串让 Agent 自行决策继续
+            collected_logs.append(f"  [E2E] ask_user 自动跳过: {question[:80]}")
+            return ""
+
         start = time.monotonic()
         try:
             agent_result = await asyncio.wait_for(
@@ -81,6 +86,7 @@ class E2ERunner:
                     screenshots_dir=str(screenshots_dir),
                     log_callback=_log_collector,
                     max_steps=scenario.max_steps,
+                    ask_user_callback=_auto_reply,
                 ),
                 timeout=scenario.timeout_seconds,
             )

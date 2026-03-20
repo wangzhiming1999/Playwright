@@ -271,6 +271,7 @@ def _run_agent_in_thread(
     task_id: str,
     task: str,
     main_loop: asyncio.AbstractEventLoop,
+    cancel_event: threading.Event,
 ) -> tuple[bool, list[str] | str]:
     """
     在独立线程中运行 run_agent，使用本线程的 ProactorEventLoop。
@@ -302,7 +303,18 @@ def _run_agent_in_thread(
             main_loop,
         ).result(timeout=_BROADCAST_TIMEOUT)
 
-        answered = ev.wait(timeout=_USER_REPLY_TIMEOUT)
+        # 分段等待：允许在“取消任务”时尽快退出，从而释放 BrowserPool 槽位
+        answered = False
+        start_ts = time.monotonic()
+        while time.monotonic() - start_ts < _USER_REPLY_TIMEOUT:
+            if cancel_event.is_set():
+                with _PENDING_LOCK:
+                    _PENDING_QUESTIONS.pop(tid, None)
+                raise TimeoutError("用户已取消")
+            answered = ev.wait(timeout=1.0)
+            if answered:
+                break
+
         with _PENDING_LOCK:
             entry = _PENDING_QUESTIONS.pop(tid, {})
 
@@ -342,6 +354,7 @@ def _run_agent_in_thread(
                 cdp_url=t.get("cdp_url", "http://localhost:9222"),
                 chrome_profile=t.get("chrome_profile", "Default"),
                 pool=_browser_pool if _use_pool else None,
+                cancel_event=cancel_event,
             )
         )
 
@@ -392,6 +405,7 @@ async def _run_task(task_id: str, task: str):
             task_id,
             task,
             main_loop,
+            cancel_event,
         )
 
         # 超时控制
@@ -1901,6 +1915,22 @@ async def update_recording_action(recording_id: str, action_index: int, req: Rec
         action["meta"] = req.meta
     save_recording(r)
     return {"ok": True}
+
+
+@app.put("/recordings/{recording_id}/actions")
+async def replace_recording_actions(recording_id: str, req: dict, _=Depends(_verify_api_key)):
+    """批量替换录制的操作列表（用于拖拽排序后保存）。"""
+    r = get_recording(recording_id)
+    if not r:
+        raise HTTPException(404, "Recording not found")
+    if r.get("status") == "recording":
+        raise HTTPException(400, "Cannot edit active recording")
+    actions = req.get("actions")
+    if not isinstance(actions, list):
+        raise HTTPException(400, "actions must be a list")
+    r["actions"] = actions
+    save_recording(r)
+    return {"ok": True, "actions_count": len(actions)}
 
 
 @app.post("/recordings/{recording_id}/convert")

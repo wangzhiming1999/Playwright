@@ -1,0 +1,47 @@
+template:
+  id: login-and-extract
+  category: login-session
+  tags: [login, authenticated, extraction]
+  icon: lock
+  difficulty: intermediate
+  estimated_time: "3-6 分钟"
+
+title: 登录后提取数据
+description: 先完成网站登录，再访问需要认证的页面提取数据，适合后台数据、个人账户信息等场景
+
+parameters:
+  - key: login_url
+    type: string
+    description: 登录页面 URL
+    required: true
+  - key: username
+    type: string
+    description: 用户名或邮箱
+    required: true
+  - key: password
+    type: string
+    description: 密码
+    required: true
+  - key: target_url
+    type: string
+    description: 登录后要访问的目标页面 URL
+    required: true
+  - key: data_goal
+    type: string
+    description: 在目标页面要提取的数据描述
+    required: true
+
+blocks:
+  - block_type: login
+    label: do_login
+    url: "{{ login_url }}"
+    username: "{{ username }}"
+    password: "{{ password }}"
+
+  - block_type: navigation
+    label: go_to_target
+    url: "{{ target_url }}"
+
+  - block_type: extraction
+    label: extract_data
+    data_extraction_goal: "{{ data_goal }}"

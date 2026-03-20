@@ -1,22 +1,25 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useRef } from 'react';
 import { useRecordingStore } from '@/hooks/useRecordingStore';
-import { startRecording, stopRecording, convertRecording, replayRecording } from '@/api/recordings';
-import type { Recording } from '@/api/recordings';
+import {
+  startRecording, stopRecording, convertRecording, replayRecording,
+  deleteRecordingAction, updateRecordingAction, replaceRecordingActions, previewRecordingConvert,
+} from '@/api/recordings';
+import type { Recording, RecordedAction } from '@/api/recordings';
 import './RecordingsPage.css';
 
 const ACTION_ICONS: Record<string, string> = {
-  click: '\uD83D\uDC46',
-  type_text: '\u2328\uFE0F',
-  navigate: '\uD83D\uDD17',
-  scroll: '\u2B07\uFE0F',
-  select_option: '\uD83D\uDCCB',
-  press_key: '\u2B50',
+  click: '👆',
+  type_text: '⌨️',
+  navigate: '🔗',
+  scroll: '⬇️',
+  select_option: '📋',
+  press_key: '⭐',
 };
 
 const STATUS_LABELS: Record<string, string> = {
-  recording: '\uD83D\uDD34 录制中',
-  completed: '\u2705 已完成',
-  converted: '\uD83D\uDD04 已转换',
+  recording: '🔴 录制中',
+  completed: '✅ 已完成',
+  converted: '🔄 已转换',
 };
 
 function RecordingCard({ recording, onSelect, onDelete }: {
@@ -40,14 +43,86 @@ function RecordingCard({ recording, onSelect, onDelete }: {
   );
 }
 
-// PLACEHOLDER_DETAIL
+interface PreviewResult {
+  original_count: number;
+  cleaned_count: number;
+  parameters: Recording['parameters'];
+  yaml_preview: string;
+}
+
+function ActionRow({
+  action, index, editable, onDelete, onEdit, onDragStart, onDragOver, onDrop,
+}: {
+  action: RecordedAction;
+  index: number;
+  editable: boolean;
+  onDelete: (i: number) => void;
+  onEdit: (i: number, text: string) => void;
+  onDragStart: (i: number) => void;
+  onDragOver: (e: React.DragEvent, i: number) => void;
+  onDrop: (i: number) => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [editVal, setEditVal] = useState(action.text || '');
+
+  function commitEdit() {
+    setEditing(false);
+    if (editVal !== action.text) onEdit(index, editVal);
+  }
+
+  return (
+    <div
+      className="timeline-item"
+      draggable={editable}
+      onDragStart={() => onDragStart(index)}
+      onDragOver={e => { e.preventDefault(); onDragOver(e, index); }}
+      onDrop={() => onDrop(index)}
+      style={{ cursor: editable ? 'grab' : 'default' }}
+    >
+      {editable && <span className="drag-handle" title="拖拽排序">⠿</span>}
+      <span className="timeline-step">{index + 1}</span>
+      <span className="timeline-icon">{ACTION_ICONS[action.type] || '❓'}</span>
+      <span className="timeline-type">{action.type}</span>
+      {editing ? (
+        <input
+          className="timeline-edit-input"
+          value={editVal}
+          onChange={e => setEditVal(e.target.value)}
+          onBlur={commitEdit}
+          onKeyDown={e => { if (e.key === 'Enter') commitEdit(); if (e.key === 'Escape') setEditing(false); }}
+          autoFocus
+        />
+      ) : (
+        <span
+          className="timeline-text"
+          onClick={() => editable && action.type === 'type_text' && setEditing(true)}
+          title={editable && action.type === 'type_text' ? '点击编辑' : undefined}
+          style={{ cursor: editable && action.type === 'type_text' ? 'text' : 'default' }}
+        >
+          {action.text?.slice(0, 80) || action.selector?.slice(0, 80) || ''}
+        </span>
+      )}
+      <span className="timeline-url">{action.url ? (() => { try { return new URL(action.url).pathname; } catch { return ''; } })() : ''}</span>
+      {editable && (
+        <button
+          className="btn-sm btn-danger timeline-delete"
+          onClick={e => { e.stopPropagation(); onDelete(index); }}
+          title="删除此操作"
+        >✕</button>
+      )}
+    </div>
+  );
+}
 
 export function RecordingsPage() {
-  const { recordings, loading, fetch: fetchRecordings, remove, setActive, activeRecordingId } = useRecordingStore();
+  const { recordings, loading, fetch: fetchRecordings, remove, setActive, activeRecordingId, updateRecording } = useRecordingStore();
   const [startForm, setStartForm] = useState({ title: '', start_url: '', browser_mode: 'builtin' });
   const [isStarting, setIsStarting] = useState(false);
   const [activeSession, setActiveSession] = useState<string | null>(null);
   const [yamlPreview, setYamlPreview] = useState<string | null>(null);
+  const [previewResult, setPreviewResult] = useState<PreviewResult | null>(null);
+  const [previewing, setPreviewing] = useState(false);
+  const dragIndexRef = useRef<number | null>(null);
 
   useEffect(() => { fetchRecordings(); }, []);
 
@@ -96,6 +171,51 @@ export function RecordingsPage() {
     }
   };
 
+  const handlePreview = async (id: string) => {
+    setPreviewing(true);
+    try {
+      const res = await previewRecordingConvert(id);
+      setPreviewResult(res);
+    } catch (e) {
+      alert('预览失败: ' + (e as Error).message);
+    } finally {
+      setPreviewing(false);
+    }
+  };
+
+  const handleDeleteAction = async (recordingId: string, index: number) => {
+    try {
+      await deleteRecordingAction(recordingId, index);
+      fetchRecordings();
+    } catch (e) {
+      alert('删除失败: ' + (e as Error).message);
+    }
+  };
+
+  const handleEditAction = async (recordingId: string, index: number, text: string) => {
+    try {
+      await updateRecordingAction(recordingId, index, { text });
+      fetchRecordings();
+    } catch (e) {
+      alert('编辑失败: ' + (e as Error).message);
+    }
+  };
+
+  const handleDrop = async (recording: Recording, fromIndex: number, toIndex: number) => {
+    if (fromIndex === toIndex) return;
+    const newActions = [...recording.actions];
+    const [moved] = newActions.splice(fromIndex, 1);
+    newActions.splice(toIndex, 0, moved);
+    // 乐观更新
+    updateRecording(recording.id, { actions: newActions });
+    try {
+      await replaceRecordingActions(recording.id, newActions);
+    } catch (e) {
+      alert('排序保存失败: ' + (e as Error).message);
+      fetchRecordings(); // 回滚
+    }
+  };
+
   return (
     <div className="recordings-page">
       <div className="recordings-header">
@@ -120,14 +240,14 @@ export function RecordingsPage() {
               <option value="cdp">CDP 远程</option>
             </select>
             <button className="btn-primary" onClick={handleStart} disabled={isStarting}>
-              {isStarting ? '启动中...' : '\uD83D\uDD34 开始录制'}
+              {isStarting ? '启动中...' : '🔴 开始录制'}
             </button>
           </div>
         ) : (
           <div className="recording-active">
-            <span className="recording-indicator">\uD83D\uDD34 录制中...</span>
+            <span className="recording-indicator">🔴 录制中...</span>
             {activeRecording && <span>{activeRecording.actions.length} 步操作</span>}
-            <button className="btn-stop" onClick={handleStop}>\u23F9 停止录制</button>
+            <button className="btn-stop" onClick={handleStop}>⏹ 停止录制</button>
           </div>
         )}
       </div>
@@ -138,7 +258,7 @@ export function RecordingsPage() {
           <h3>操作记录</h3>
           {activeRecording.actions.map((a, i) => (
             <div key={i} className="timeline-item">
-              <span className="timeline-icon">{ACTION_ICONS[a.type] || '\u2753'}</span>
+              <span className="timeline-icon">{ACTION_ICONS[a.type] || '❓'}</span>
               <span className="timeline-type">{a.type}</span>
               <span className="timeline-text">{a.text?.slice(0, 60) || a.selector?.slice(0, 60) || ''}</span>
             </div>
@@ -152,6 +272,11 @@ export function RecordingsPage() {
           <div className="recording-detail-header">
             <h3>{activeRecording.title || '未命名录制'}</h3>
             <div className="recording-detail-actions">
+              {activeRecording.status !== 'recording' && (
+                <button className="btn-secondary" onClick={() => handlePreview(activeRecording.id)} disabled={previewing}>
+                  {previewing ? '预览中...' : '🔍 预览转换'}
+                </button>
+              )}
               {activeRecording.status === 'completed' && (
                 <button className="btn-primary" onClick={() => handleConvert(activeRecording.id)}>转为工作流</button>
               )}
@@ -177,23 +302,69 @@ export function RecordingsPage() {
             </div>
           )}
 
-          {/* 操作时间线 */}
+          {/* 操作时间线（可编辑） */}
           <div className="recording-timeline">
-            <h4>操作步骤 ({activeRecording.actions.length})</h4>
+            <h4>
+              操作步骤 ({activeRecording.actions.length})
+              {activeRecording.status !== 'recording' && (
+                <span className="timeline-hint"> — 可拖拽排序，点击文字编辑，✕ 删除</span>
+              )}
+            </h4>
             {activeRecording.actions.map((a, i) => (
-              <div key={i} className="timeline-item">
-                <span className="timeline-step">{i + 1}</span>
-                <span className="timeline-icon">{ACTION_ICONS[a.type] || '\u2753'}</span>
-                <span className="timeline-type">{a.type}</span>
-                <span className="timeline-text">{a.text?.slice(0, 80) || a.selector?.slice(0, 80) || ''}</span>
-                <span className="timeline-url">{a.url ? new URL(a.url).pathname : ''}</span>
-              </div>
+              <ActionRow
+                key={`${i}-${a.timestamp}`}
+                action={a}
+                index={i}
+                editable={activeRecording.status !== 'recording'}
+                onDelete={idx => handleDeleteAction(activeRecording.id, idx)}
+                onEdit={(idx, text) => handleEditAction(activeRecording.id, idx, text)}
+                onDragStart={idx => { dragIndexRef.current = idx; }}
+                onDragOver={(e, _idx) => e.preventDefault()}
+                onDrop={toIdx => {
+                  if (dragIndexRef.current !== null) {
+                    handleDrop(activeRecording, dragIndexRef.current, toIdx);
+                    dragIndexRef.current = null;
+                  }
+                }}
+              />
             ))}
           </div>
         </div>
       )}
 
-      {/* YAML 预览 */}
+      {/* 转换预览模态框 */}
+      {previewResult && (
+        <div className="modal-overlay" onClick={() => setPreviewResult(null)}>
+          <div className="modal-content yaml-modal" onClick={e => e.stopPropagation()}>
+            <h3>转换预览</h3>
+            <div className="preview-stats">
+              <span>原始操作：<strong>{previewResult.original_count}</strong></span>
+              <span>清洗后：<strong>{previewResult.cleaned_count}</strong></span>
+              <span>减少：<strong>{previewResult.original_count - previewResult.cleaned_count}</strong> 步</span>
+            </div>
+            {previewResult.parameters.length > 0 && (
+              <div className="preview-params">
+                <h4>检测到的参数</h4>
+                {previewResult.parameters.map((p, i) => (
+                  <div key={i} className="param-item">
+                    <span className="param-key">{p.key}</span>
+                    <span className="param-type">{p.type}</span>
+                    <span className="param-desc">{p.description}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+            <h4>YAML 预览</h4>
+            <pre className="yaml-preview">{previewResult.yaml_preview}</pre>
+            <div className="modal-actions">
+              <button onClick={() => { navigator.clipboard.writeText(previewResult.yaml_preview); }}>复制 YAML</button>
+              <button onClick={() => setPreviewResult(null)}>关闭</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* YAML 预览（转换后） */}
       {yamlPreview && (
         <div className="modal-overlay" onClick={() => setYamlPreview(null)}>
           <div className="modal-content yaml-modal" onClick={e => e.stopPropagation()}>
