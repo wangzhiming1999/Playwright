@@ -222,18 +222,18 @@ async def _wait_for_page_ready(page, log_fn=None, timeout_ms: int = 15000, check
         # 判断就绪条件
         # 如果从未观察到活动（页面本来就是静态的），快速返回
         # 放宽条件：content_stable_count >= 3 即可（不要求 >= 3 同时满足网络）
-        if not has_seen_activity and content_stable_count >= 3:
+        if not has_seen_activity and content_stable_count >= 2:
             elapsed = asyncio.get_event_loop().time() - start_time
             return f"页面就绪 ({elapsed:.1f}s)"
 
         # 如果观察到过活动，需要更严格的稳定条件：
-        # 网络空闲 >= 1.5 秒 且 内容稳定 >= 1.5 秒
-        if has_seen_activity and network_idle_count >= 15 and content_stable_count >= 15:
+        # 网络空闲 >= 0.5 秒 且 内容稳定 >= 0.5 秒
+        if has_seen_activity and network_idle_count >= 5 and content_stable_count >= 5:
             elapsed = asyncio.get_event_loop().time() - start_time
             return f"页面就绪 ({elapsed:.1f}s)"
 
-        # 兜底：网络空闲超过 5 秒，不管内容是否稳定都返回（防止 Bing 等 SPA 死锁）
-        if network_idle_count >= 50:
+        # 兜底：网络空闲超过 3 秒，不管内容是否稳定都返回（防止 Bing 等 SPA 死锁）
+        if network_idle_count >= 30:
             elapsed = asyncio.get_event_loop().time() - start_time
             return f"页面就绪 ({elapsed:.1f}s，网络已空闲)"
 

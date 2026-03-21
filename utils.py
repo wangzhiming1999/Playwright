@@ -10,6 +10,7 @@ Backend selection:
 Model override:
   - LLM_MODEL=gpt-4o              → override default model
   - LLM_MINI_MODEL=gpt-4o-mini    → override mini model
+  - VISION_MODEL=gpt-4o-mini      → override vision/screenshot model (always uses OpenAI)
 """
 
 import json
@@ -49,6 +50,11 @@ def get_mini_model() -> str:
     if env_model:
         return env_model
     return _BUILTIN_MODELS.get(get_backend(), _BUILTIN_MODELS["openai"])["mini"]
+
+
+def get_vision_model() -> str:
+    """Return the model used for screenshot/vision tasks. Always OpenAI-compatible."""
+    return os.getenv("VISION_MODEL", "gpt-4o-mini").strip()
 
 
 def _resolve_backend(model: str) -> str:
@@ -540,6 +546,29 @@ def llm_call(fn: Callable[..., T], *args, max_retries: int = 3, base_delay: floa
                            attempt + 1, max_retries, delay, e)
             time.sleep(delay)
     raise RuntimeError(f"LLM call failed after {max_retries} attempts: {last_exc}") from last_exc
+
+
+# ── Vision-specific LLM call (always OpenAI, for screenshot analysis) ────────
+
+def llm_chat_vision(messages: list, max_tokens: int = 1000,
+                    tools: list = None, tool_choice: str = None,
+                    response_format: dict = None, **kwargs) -> _WrappedResponse:
+    """
+    LLM call specifically for vision/screenshot tasks.
+    Always uses OpenAI backend with VISION_MODEL (default: gpt-4o-mini).
+    This allows using a different model for image recognition while keeping
+    the main reasoning model (e.g., Anthropic Claude) for text-only steps.
+    """
+    vision_model = get_vision_model()
+    return _call_openai(
+        messages=messages,
+        model=vision_model,
+        max_tokens=max_tokens,
+        tools=tools,
+        tool_choice=tool_choice,
+        response_format=response_format,
+        **kwargs,
+    )
 
 
 # ── URL validation ───────────────────────────────────────────────────────────

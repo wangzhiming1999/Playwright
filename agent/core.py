@@ -484,7 +484,7 @@ class BrowserAgent:
                                         if (el) el.scrollIntoView({{block: {_scroll_block}, behavior: 'instant'}});
                                     }}"""
                                 )
-                                await asyncio.sleep(0.3)
+                                await asyncio.sleep(0.1)
 
                                 # 检查是否仍被遮挡
                                 _still_covered = await self._safe_evaluate(
@@ -510,7 +510,7 @@ class BrowserAgent:
                                             }}
                                         }}"""
                                     )
-                                    await asyncio.sleep(0.3)
+                                    await asyncio.sleep(0.1)
 
                                     # 再次检查
                                     _still_covered2 = await self._safe_evaluate(
@@ -735,14 +735,14 @@ class BrowserAgent:
                         default={"len": 0, "children": 0}
                     )
                     await page.evaluate("(px) => window.scrollBy(0, px)", direction * amount)
-                    await asyncio.sleep(0.3)
+                    await asyncio.sleep(0.1)
                     scroll_after = await self._safe_evaluate("() => window.scrollY", default=0)
 
                     if scroll_before == scroll_after:
                         # 到达边界，但检查是否有新内容在加载
                         boundary = "底部" if direction_str == "down" else "顶部"
-                        for _ in range(6):  # 最多再等 3s (6 × 0.5s)
-                            await asyncio.sleep(0.5)
+                        for _ in range(6):  # 最多再等 1.5s (6 × 0.25s)
+                            await asyncio.sleep(0.25)
                             content_after = await self._safe_evaluate(
                                 "() => ({ len: (document.body.innerText || '').length, children: document.body.querySelectorAll('*').length })",
                                 default={"len": 0, "children": 0}
@@ -930,7 +930,7 @@ class BrowserAgent:
                         for i in range(parts_count):
                             y = i * vp_h
                             await self._safe_evaluate(f"window.scrollTo(0, {y})")
-                            await asyncio.sleep(0.3)
+                            await asyncio.sleep(0.1)
                             part_path = self.screenshots_dir / f"final_part_{i+1}.png"
                             try:
                                 await page.screenshot(path=str(part_path), timeout=10000)
@@ -962,7 +962,7 @@ class BrowserAgent:
                             method = el_info.get("method", "skyvern-id")
                             await self._log(f"  [悬停] #{index} → ({x}, {y}) method={method}")
                             await page.mouse.move(x, y)
-                            await asyncio.sleep(0.5)
+                            await asyncio.sleep(0.2)
                             return f"已悬停在 #{index} ({x}, {y})"
                         elif not text:
                             return f"操作失败: index={index} 定位失败且未提供 text"
@@ -978,7 +978,7 @@ class BrowserAgent:
                             x = int(bbox["x"] + bbox["width"] / 2)
                             y = int(bbox["y"] + bbox["height"] / 2)
                             await page.mouse.move(x, y)
-                            await asyncio.sleep(0.5)
+                            await asyncio.sleep(0.2)
                             return f"已悬停在 '{text}'"
                         else:
                             await el.hover(timeout=10000)
@@ -1003,7 +1003,7 @@ class BrowserAgent:
                             method = el_info.get("method", "skyvern-id")
                             await self._log(f"  [右键] #{index} → ({x}, {y}) method={method}")
                             await page.mouse.click(x, y, button="right")
-                            await asyncio.sleep(0.3)
+                            await asyncio.sleep(0.1)
                             return f"右键点击成功 #{index} ({x}, {y})"
                         elif not text:
                             return f"操作失败: index={index} 定位失败且未提供 text"
@@ -1019,7 +1019,7 @@ class BrowserAgent:
                             x = int(bbox["x"] + bbox["width"] / 2)
                             y = int(bbox["y"] + bbox["height"] / 2)
                             await page.mouse.click(x, y, button="right")
-                            await asyncio.sleep(0.3)
+                            await asyncio.sleep(0.1)
                             return f"右键点击成功 '{text}'"
                         else:
                             return f"操作失败: 元素 '{text}' 无法获取位置"
@@ -1102,7 +1102,7 @@ class BrowserAgent:
                     if not selected:
                         x, y = el_info["x"], el_info["y"]
                         await self._click_and_wait(x, y, check_navigation=False)
-                        await asyncio.sleep(0.3)
+                        await asyncio.sleep(0.1)
                         try:
                             option_el = page.get_by_text(value, exact=False).first
                             await option_el.click(timeout=5000)
@@ -1628,7 +1628,7 @@ class BrowserAgent:
                     }}""", text)
 
                     if found and found.get("found"):
-                        await asyncio.sleep(0.5)  # 等待平滑滚动完成
+                        await asyncio.sleep(0.1)
                         await self._log(f"  [scroll_to_text] 找到并滚动到: {found.get('text', '')[:50]}")
                         return f"已滚动到包含 '{text}' 的元素（{found.get('tag', '')}）"
                     else:
@@ -1675,7 +1675,7 @@ class BrowserAgent:
                             return true;
                         }}""", selector)
                         if set_ok:
-                            await asyncio.sleep(0.3)
+                            await asyncio.sleep(0.1)
                             return f"已设置日期 '{date_str}'"
                     except Exception:
                         pass
@@ -1683,12 +1683,12 @@ class BrowserAgent:
                     # 方法2: 点击 + 清空 + 键盘输入
                     x, y = el_info["x"], el_info["y"]
                     await page.mouse.click(x, y)
-                    await asyncio.sleep(0.2)
+                    await asyncio.sleep(0.1)
                     await page.keyboard.press("Control+a")
                     await page.keyboard.press("Backspace")
                     await page.keyboard.type(date_str, delay=50)
                     await page.keyboard.press("Escape")  # 关闭可能弹出的日期选择器面板
-                    await asyncio.sleep(0.3)
+                    await asyncio.sleep(0.1)
                     return f"已输入日期 '{date_str}'"
 
                 except Exception as e:

@@ -529,8 +529,6 @@ async def annotate_page(page):
     elements_info = await page.evaluate(_ANNOTATE_JS)
     _last_elements = elements_info or []
 
-    await asyncio.sleep(0.3)
-
     try:
         screenshot = await page.screenshot(type="jpeg", quality=60, timeout=10000)
     except Exception:

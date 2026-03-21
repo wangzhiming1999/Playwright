@@ -33,18 +33,18 @@ from .visual_verify import take_snapshot, verify_action, ActionVerifier, SKIP_VE
 from .trace import TraceCollector
 from .stealth import get_stealth_fingerprint, get_proxy_config, apply_stealth
 
-from utils import llm_chat
+from utils import llm_chat, llm_chat_vision
 from page_annotator import annotate_page
 
 
-async def _verify_done(agent, task: str, summary: str, _log, llm_chat_fn, task_type: str = "") -> tuple[bool, str]:
+async def _verify_done(agent, task: str, summary: str, _log, task_type: str = "") -> tuple[bool, str]:
     """
     完成前验证：截图 + GPT 判断是否真正满足用户需求。
     自适应等待间隔：3s → 8s → 15s（总计最多 26s，vs 旧版 45s）。
     简单任务（导航/截图/提取）第1轮通过即返回。
     返回 (True/False, reason_str)。
     """
-    _WAIT_INTERVALS = [3, 8, 15]  # 递增等待间隔
+    _WAIT_INTERVALS = [2, 5, 10]  # 递增等待间隔（原 3/8/15，缩短约 40%）
     _SIMPLE_TASK_TYPES = {"navigate", "screenshot", "extract", "download"}
 
     for check_round in range(1, 4):
@@ -64,7 +64,7 @@ async def _verify_done(agent, task: str, summary: str, _log, llm_chat_fn, task_t
                 vp_h = agent.page.viewport_size.get("height", 1080) if agent.page.viewport_size else 1080
                 if scroll_h > vp_h * 1.2:
                     await agent.page.evaluate(f"window.scrollTo(0, {scroll_h})")
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.1)
                     bottom_img = await agent.screenshot_base64(quality=60)
                     await agent.page.evaluate("window.scrollTo(0, 0)")
             except Exception:
@@ -85,7 +85,7 @@ async def _verify_done(agent, task: str, summary: str, _log, llm_chat_fn, task_t
             if task_type:
                 completion_criteria += f"\nTask type: {task_type}"
 
-            verify_resp = llm_chat_fn(
+            verify_resp = llm_chat_vision(
                 messages=[{
                     "role": "user",
                     "content": [
@@ -830,6 +830,15 @@ async def run_agent(
 
                 try:
                     def _call():
+                        # 截图模式：走专用视觉模型（VISION_MODEL，默认 gpt-4o-mini）
+                        # DOM 模式：走主推理模型（LLM_MODEL，当前 anthropic claude）
+                        if use_screenshot:
+                            return llm_chat_vision(
+                                messages=messages,
+                                tools=all_tools,
+                                tool_choice="required",
+                                max_tokens=2000,
+                            )
                         return llm_chat(
                             model=model_tier,
                             messages=messages,
@@ -955,7 +964,7 @@ async def run_agent(
                 # done/screenshot 前强制等待内容稳定（主循环层面兜底）
                 if tool_name in ("done", "screenshot"):
                     await _log("  [wait_stable] 执行前等待内容稳定...")
-                    wait_result = await _wait_for_page_ready(agent.page, log_fn=_log, timeout_ms=120000, check_network=True, active_requests=active_requests)
+                    wait_result = await _wait_for_page_ready(agent.page, log_fn=_log, timeout_ms=30000, check_network=True, active_requests=active_requests)
                     await _log(f"  [wait_stable] 结果: {wait_result}")
 
                 # ── 视觉验证：action 前快照 ──────────────────────────────
@@ -1012,7 +1021,7 @@ async def run_agent(
                 # ── 处理 __DONE__ ──────────────────────────────────────
                 if result == "__DONE__":
                     summary = tool_args.get("summary", "任务完成")
-                    done_verified, _verify_reason_raw = await _verify_done(agent, task, summary, _log, llm_chat,
+                    done_verified, _verify_reason_raw = await _verify_done(agent, task, summary, _log,
                                                         task_type=_inferred_task_type)
                     if done_verified:
                         await _log(f"\n✅ {summary}")
